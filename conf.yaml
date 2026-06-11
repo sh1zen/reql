@@ -1,0 +1,50 @@
+project:
+  id: default
+
+scan:
+  max_file_size_mb: 10
+  include: []
+  exclude:
+    - "__pycache__/"
+    - ".reql/"
+    - ".tmp/"
+    - ".idea/"
+    - ".git"
+    - "*.html"
+    - "*.json"
+    - "LICENSE"
+    - ".tmp-tests/"
+    - "*.egg-info/"
+
+compile:
+  ingest_documents: true
+  documents:
+    - {"format": "markdown", "extensions": [".md", ".markdown"], "ingest": true}
+    - {"format": "plain_text", "extensions": [".txt"], "filenames": ["LICENSE", "NOTICE"], "ingest": false}
+    - {"format": "restructured_text", "extensions": [".rst"], "ingest": true}
+    - {"format": "html", "extensions": [".html", ".htm"], "ingest": true}
+    - {"format": "log", "extensions": [".log"], "ingest": false}
+    - {"format": "pdf", "extensions": [".pdf"], "ingest": false}
+    - {"format": "json", "extensions": [".json"], "ingest": true}
+    - {"format": "toml", "extensions": [".toml"], "ingest": true}
+    - {"format": "yaml", "extensions": [".yaml", ".yml"], "ingest": true}
+    - {"format": "ini", "extensions": [".ini", ".cfg", ".conf"], "ingest": true}
+    - {"format": "csv", "extensions": [".csv"], "ingest": true}
+    - {"format": "tsv", "extensions": [".tsv"], "ingest": true}
+    - {"format": "xml", "extensions": [".xml"], "ingest": true}
+    - {"format": "ndjson", "extensions": [".ndjson"], "ingest": true}
+
+cache:
+  enabled: true
+  fingerprint_strategy: sha256
+
+analysis:
+  enable_hubs: true
+  enable_communities: true
+
+reporting:
+  output_dir: reports
+
+diagnostics:
+  enabled: false
+  path: ""

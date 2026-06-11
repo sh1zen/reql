@@ -1,0 +1,132 @@
+name: Release REQL assets
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-release-assets:
+    name: Build release assets
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Validate release version
+        env:
+          RELEASE_REF: ${{ github.event.release.tag_name || github.ref_name }}
+        run: |
+          if [[ ! "$RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tag must match vMAJOR.MINOR.PATCH, for example v0.0.1. Got '$RELEASE_REF'."
+            exit 1
+          fi
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          repository: sh1zen/reql
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install REQL and release tools
+        run: |
+          python -m pip install --upgrade pip build twine
+          python -m pip install -e .
+
+      - name: Generate CHANGELOG.md
+        run: |
+          python - <<'PY'
+          from __future__ import annotations
+
+          import json
+          import os
+          import subprocess
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+
+          def git(*args: str) -> str:
+              return subprocess.check_output(["git", *args], text=True, encoding="utf-8").strip()
+
+
+          event_path = Path(os.environ["GITHUB_EVENT_PATH"])
+          event = json.loads(event_path.read_text(encoding="utf-8"))
+          release = event.get("release") or {}
+          tag = release.get("tag_name") or os.environ.get("GITHUB_REF_NAME", "")
+          title = release.get("name") or tag or "Manual workflow run"
+          body = (release.get("body") or "").strip()
+          sha = os.environ.get("GITHUB_SHA", "")
+
+          try:
+              tags = [item for item in git("tag", "--sort=-creatordate").splitlines() if item]
+          except subprocess.CalledProcessError:
+              tags = []
+          previous_tag = next((item for item in tags if item != tag), "")
+          range_spec = f"{previous_tag}..HEAD" if previous_tag else "HEAD"
+          try:
+              commits = git("log", "--pretty=format:- %s (%h)", range_spec)
+          except subprocess.CalledProcessError:
+              commits = ""
+
+          lines = [
+              "# Changelog",
+              "",
+              f"## {title}",
+              "",
+              "- Repository: https://github.com/sh1zen/reql",
+              f"- Ref: {tag or os.environ.get('GITHUB_REF_NAME', '')}",
+              f"- Commit: {sha}",
+              f"- Generated: {datetime.now(timezone.utc).isoformat(timespec='seconds')}",
+              "",
+          ]
+          if body:
+              lines.extend(["### Release notes", "", body, ""])
+          if previous_tag:
+              lines.extend([f"### Changes since {previous_tag}", ""])
+          else:
+              lines.extend(["### Changes", ""])
+          lines.extend([commits or "- No commit entries found.", ""])
+
+          Path("CHANGELOG.md").write_text("\n".join(lines), encoding="utf-8")
+          PY
+
+      - name: Run tests
+        run: PYTHONPATH=src python -m unittest discover -s tests -v
+
+      - name: Build Python distributions
+        run: |
+          python -m build
+          python -m twine check dist/*
+
+      - name: Bundle release asset
+        run: |
+          mkdir -p dist-release/package
+          cp CHANGELOG.md dist-release/
+          cp dist/* dist-release/package/
+          tar -czf reql-release-assets.tar.gz -C dist-release .
+          echo "Asset contents:"
+          tar -tzf reql-release-assets.tar.gz
+
+      - name: Upload to GitHub release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: reql-release-assets.tar.gz
+
+      - name: Upload as workflow artifact
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: reql-release-assets
+          path: reql-release-assets.tar.gz
+          retention-days: 7

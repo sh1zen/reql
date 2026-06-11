@@ -1,0 +1,104 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "reql"
+version = "0.3.0"
+description = "Relational Entities Query Language: a graph-native deterministic memory engine."
+readme = {file = "README.md", content-type = "text/markdown"}
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "REQL contributors"}]
+keywords = [
+  "agents",
+  "graph",
+  "knowledge-graph",
+  "memory",
+  "property-graph",
+  "query-language",
+  "reql",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3 :: Only",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+  "Topic :: Database",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Topic :: Software Development :: Libraries :: Python Modules",
+  "Typing :: Typed",
+]
+dependencies = [
+  "tree-sitter>=0.25,<0.26",
+  "tree-sitter-bash>=0.25",
+  "tree-sitter-c>=0.24",
+  "tree-sitter-c-sharp>=0.23",
+  "tree-sitter-cpp>=0.23",
+  "tree-sitter-elixir>=0.3",
+  "tree-sitter-fortran>=0.6",
+  "tree-sitter-go>=0.25",
+  "tree-sitter-hcl>=1.2",
+  "tree-sitter-java>=0.23",
+  "tree-sitter-javascript>=0.25",
+  "tree-sitter-julia>=0.23",
+  "tree-sitter-kotlin>=1.1",
+  "tree-sitter-language-pack>=1.8",
+  "tree-sitter-lua>=0.5",
+  "tree-sitter-make>=1.1",
+  "tree-sitter-php>=0.24",
+  "tree-sitter-powershell>=0.26",
+  "tree-sitter-python>=0.25",
+  "tree-sitter-ruby>=0.23",
+  "tree-sitter-rust>=0.24",
+  "tree-sitter-scala>=0.26",
+  "tree-sitter-sql>=0.3",
+  "tree-sitter-swift>=0.7",
+  "tree-sitter-typescript>=0.23",
+  "tree-sitter-verilog>=1.0",
+  "tree-sitter-zig>=1.1",
+]
+
+[project.optional-dependencies]
+nlp = ["spacy>=3.7"]
+watch = ["watchdog>=4.0"]
+pdf = ["pypdf>=4.0"]
+code = []
+all = [
+  "pypdf>=4.0",
+  "spacy>=3.7",
+  "watchdog>=4.0",
+]
+dev = [
+  "pypdf>=4.0",
+  "spacy>=3.7",
+  "watchdog>=4.0",
+]
+
+[project.urls]
+Documentation = "https://github.com/sh1zen/Reql#readme"
+Issues = "https://github.com/sh1zen/Reql/issues"
+Source = "https://github.com/sh1zen/Reql"
+
+[project.scripts]
+reql = "memory.cli:main"
+reql-mcp = "mcp.server:main"
+
+[tool.setuptools]
+license-files = ["LICENSE"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+agents = ["py.typed", "gen-skill.py"]
+api = ["py.typed"]
+memory = ["py.typed"]
+mcp = ["py.typed"]
+reql = ["py.typed"]
