@@ -17,7 +17,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.10", "3.12"]
+        python-version: ["3.10", "3.12", "3.14"]
 
     steps:
       - name: Check out repository
@@ -40,7 +40,7 @@ jobs:
         run: |
           python cli.py --help
           reql config show
-          reql install codex --project --dry-run
+          reql install codex --dry-run
 
   package-check:
     name: Package check
@@ -53,7 +53,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
 
       - name: Build distributions
         run: |
@@ -72,7 +72,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
 
       - name: Install package
         run: |
@@ -110,7 +110,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: "3.14"
 
       - name: Install security tools
         run: |

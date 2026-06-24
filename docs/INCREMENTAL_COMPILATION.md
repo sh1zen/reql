@@ -104,9 +104,9 @@ Supported code artifacts produce deterministic technical nodes such as
 `Module`, `Package`, `Class`, `Interface`, `Function`, `Method`, meaningful
 `Variable`, `Import`, `Dependency`, `Endpoint`, `Schema`, `Config`, and `Test`.
 Technical relations include `CONTAINS`, `DEFINES`, `IMPORTS`, `CALLS`,
-`REFERENCES`, `INHERITS`, `IMPLEMENTS`, `OVERRIDES`, `INSTANTIATES`, `READS`,
-`WRITES`, `RETURNS`, `RAISES`, `DECORATED_BY`, `HANDLES_ROUTE`, `TESTS`,
-`CONFIGURES`, and `DEPENDS_ON`.
+`REFERENCES`, `INHERITS`, `IMPLEMENTS`, `INSTANTIATES`, `READS`, `WRITES`,
+`RETURNS`, `RAISES`, `DECORATED_BY`, `HANDLES_ROUTE`, `TESTS`, `CONFIGURES`,
+and `DEPENDS_ON`.
 
 Every deterministic compile edge has `confidence=1.0` and provenance fields in
 edge properties: `source_id`, `target_id`, `type`, `confidence`,

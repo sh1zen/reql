@@ -182,7 +182,7 @@ Example after installation:
   "arguments": {
     "storage_path": ".reql/memory.reql",
     "path": ".",
-      "cache_enabled": true,
+    "cache_enabled": true,
     "config_overrides": {"scan.max_file_size_mb": 2}
   }
 }
@@ -200,7 +200,7 @@ monitor is responsible for updates.
   "arguments": {
     "storage_path": ".reql/memory.reql",
     "path": ".",
-      "max_iterations": 1,
+    "max_iterations": 1,
     "config_path": "conf.yaml"
   }
 }
@@ -214,7 +214,7 @@ monitor is responsible for updates.
   "arguments": {
     "storage_path": ".reql/memory.reql",
     "query": "how does incremental compilation handle deleted files?",
-      "top_k": 12,
+    "top_k": 12,
     "max_depth": 3,
     "max_items": 12,
     "config_path": "conf.yaml"
@@ -231,7 +231,7 @@ relevant memory/source texts:
   "arguments": {
     "storage_path": ".reql/memory.reql",
     "query": "how does incremental compilation handle deleted files?",
-      "top_k": 12,
+    "top_k": 12,
     "max_depth": 2,
     "limit": 8,
     "config_path": "conf.yaml"
@@ -271,7 +271,7 @@ the `code` view includes usage guidance, snippets, and targeted reads:
   "arguments": {
     "storage_path": ".reql/memory.reql",
     "query": "how does incremental compilation handle deleted files?",
-      "top_k": 12,
+    "top_k": 12,
     "max_depth": 2,
     "config_path": "conf.yaml"
   }
@@ -286,7 +286,7 @@ the `code` view includes usage guidance, snippets, and targeted reads:
   "arguments": {
     "storage_path": ".reql/memory.reql",
     "statement": "FRAGMENTS WHERE relative_path CONTAINS 'compiler' LIMIT 20",
-      "limit": 20,
+    "limit": 20,
     "config_overrides": {"project": {"id": "default"}}
   }
 }

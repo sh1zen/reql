@@ -372,8 +372,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     install.add_argument("--platform", action="append", default=[], help="Platform name; may be repeated or comma-separated")
     install.add_argument("--all", action="store_true", help="Install all supported assistant integrations instead of auto-detecting installed agents")
-    install.add_argument("--project", action="store_true", help="Install into the current project instead of the user profile")
-    install.add_argument("--project-dir", default=".", help="Project root for --project installs")
+    install.add_argument("--user", action="store_true", help="Install into the user assistant profile instead of the current project")
+    install.add_argument("--project-dir", default=".", help="Project root for project installs")
     install.add_argument("--command-dir", default=None, help="Directory where the REQL command shim is installed")
     install.add_argument("--no-hooks", action="store_true", help="Do not install automatic assistant hooks")
     install.add_argument("--dry-run", action="store_true", help="Print planned files without writing them")
@@ -387,8 +387,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     uninstall.add_argument("--platform", action="append", default=[], help="Platform name; may be repeated or comma-separated")
     uninstall.add_argument("--all", action="store_true", help="Uninstall all supported assistant integrations")
-    uninstall.add_argument("--project", action="store_true", help="Remove from the current project instead of the user profile")
-    uninstall.add_argument("--project-dir", default=".", help="Project root for --project uninstalls")
+    uninstall.add_argument("--user", action="store_true", help="Remove from the user assistant profile instead of the current project")
+    uninstall.add_argument("--project-dir", default=".", help="Project root for project uninstalls")
     uninstall.add_argument("--command-dir", default=None, help="Directory where the REQL command shim was installed")
     uninstall.add_argument("--dry-run", action="store_true", help="Print planned removals without writing them")
     uninstall.add_argument("--json", action="store_true", help="Print structured JSON result")
@@ -654,11 +654,12 @@ def main(argv: list[str] | None = None) -> int:
 
         try:
             requested_platforms = [*args.platforms, *args.platform]
+            project_install = not args.user
             platforms = resolve_platforms(
                 requested_platforms,
                 install_all=args.all,
                 auto_detect=not requested_platforms and not args.all,
-                project=args.project,
+                project=project_install,
                 project_dir=Path(args.project_dir),
             )
             if not platforms:
@@ -670,7 +671,7 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             result = install_agent_files(
                 platforms,
-                project=args.project,
+                project=project_install,
                 project_dir=Path(args.project_dir),
                 command_dir=Path(args.command_dir) if args.command_dir else None,
                 dry_run=args.dry_run,
@@ -691,10 +692,11 @@ def main(argv: list[str] | None = None) -> int:
         from agents.install import available_platforms_text, resolve_platforms, uninstall_agent_files
 
         try:
+            project_uninstall = not args.user
             platforms = resolve_platforms([*args.platforms, *args.platform], install_all=args.all)
             result = uninstall_agent_files(
                 platforms,
-                project=args.project,
+                project=project_uninstall,
                 project_dir=Path(args.project_dir),
                 command_dir=Path(args.command_dir) if args.command_dir else None,
                 dry_run=args.dry_run,

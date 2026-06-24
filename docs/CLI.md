@@ -1,45 +1,190 @@
 # CLI
 
+This page is the command reference for the installed `reql` command, the
+repository-local `python cli.py ...` entry point, the guided `launcher.py`, and
+the optional `reql-mcp` server.
+
+## Quick Reference
+
 ```bash
-python launcher.py
-reql query_context --query "..."
-reql query_explore --query "..." --view owners --view callers --json
-reql query_explore --query "..." --serialization-paths-only
-reql query_graph --query "..." --max-depth 2
-reql query_graph --query "..." --json
-reql query_memories --query "..." --limit 8 --json
+# Build or refresh the graph
+reql project compile .
+reql project update .
+reql project compile . --watch
+reql cache status .
+
+# Retrieve context
+reql query_context --query "payment service"
+reql query_explore --query "payment service serialization" --view owners --view code
+reql query_graph --query "payment service" --max-depth 2 --json
+reql query_memories --query "payment service" --limit 8 --json
 reql inspect --node-id NODE_ID --json
+
+# Query, inspect, report, and export
+reql query "DELTAS LIMIT 10"
+reql query "HUBS LIMIT 20"
+reql query "EXPLAIN HUB 'NODE_ID'" --json
+reql stats
+reql storage inspect --json
+reql project report . --output reports/
+reql export --html --json --out reql-graph-out
+
+# Configuration and integrations
+reql config show
+reql --set project.id=team-a config show
+reql install codex
+reql install codex --user
+reql uninstall codex,claude
+reql-mcp --read-only
+```
+
+## Entry Points
+
+Use `reql ...` for normal command-line automation. From a source checkout,
+`python cli.py ...` exposes the same command surface and adds `src` to Python's
+import path automatically, so it does not require an editable install or manual
+`PYTHONPATH` changes.
+
+Use `python launcher.py` for an interactive menu that can open graph storage,
+compile projects, retrieve context, run REQL queries, generate reports, export
+graphs, and print MCP configuration snippets. `launcher.py` intentionally does
+not mirror every CLI flag; use `reql`, `python cli.py`, or `reql-mcp` for
+scripts and agent-facing command execution.
+
+## Storage, Output, and Help
+
+Project and cache commands default to `<build path>/.reql/memory.reql`.
+Other commands default to `./.reql/memory.reql` from the current working
+directory. Pass `--storage` to override the graph store path.
+
+Use `--json` on supported commands for machine-readable output. Top-level help
+lists canonical commands alphabetically, and nested command groups summarize
+their subcommands:
+
+```bash
+reql --help
+reql project --help
+reql query_context --help
+```
+
+## Retrieval Commands
+
+`query_context` composes a deterministic agent-ready context block:
+
+```bash
+reql query_context --query "payment service"
+reql query_context --query "payment service" --code --json
+reql query_context --query "unused imports" --cleanup
+```
+
+It is informative by default and returns matching nodes, file/line references,
+source links, owner candidates, cleanup candidates, working-set records, and
+targeted reads. Use `--code`, `--docs`, or `--test` to limit context to a
+scope. Use `--cleanup` for dead-code and unused-symbol cleanup; cleanup output
+shows matching `StaticAnalysisFinding` candidates before removals.
+
+`query_explore` returns dependency slices for concrete code targets:
+
+```bash
+reql query_explore --query "payment service serialization" --view owners --view callers --json
+reql query_explore --query "payment service serialization" --serialization-paths-only
+```
+
+Views include `owners`, `callers`, `public_surface`, `serialization_paths`,
+`docs_mentions`, and `code`. Use repeated `--view` flags or shortcut flags to
+keep output small.
+
+`query_graph` returns a structured query-centered subgraph:
+
+```bash
+reql query_graph --query "payment service" --max-depth 2
+reql query_graph --query "payment service" --json
+```
+
+The JSON payload includes seed nodes, ranked nodes, edges, edge directions,
+linked sources, filtered-node diagnostics, and counts. Use
+`--no-filter-generic` when debugging why a generic node was filtered.
+
+`query_memories` returns compact ranked text rows:
+
+```bash
+reql query_memories --query "payment service" --limit 8 --json
+reql query_memories --query "payment service" --no-sources
+```
+
+It uses the same seed search and bounded graph expansion as the retrieval
+pipeline. JSON output includes trace id, seed ids, ranked nodes, nodes, edges,
+sources, parameters, and counts.
+
+Use `inspect --node-id NODE_ID --json` to resolve a node id printed by
+retrieval or REQL statements and inspect its location, adjacent records, and
+source hints.
+
+Query/retrieval commands write usage events to an append-only journal rather
+than rewriting canonical graph records. Read/query commands open the graph
+read-only, so parallel readers can run together. Compile/update writers wait
+for existing readers and block new readers while opening the write session.
+
+## Inspection and Export
+
+```bash
 reql stats
 reql storage inspect
 reql storage inspect --json
 reql storage compact
-reql project compile PATH
-reql project update PATH
-reql project compile . --watch
-reql project exclude ".tmp/" "generated/*.json"
-reql project status PATH
-reql project report PATH --output reports/
-reql cache status [PATH]
-reql cache clear [PATH]
-reql query "DELTAS LIMIT 10"
-reql query "COMMUNITIES LIMIT 20"
-reql query "HUBS LIMIT 20"
-reql query "EXPLAIN HUB 'NODE_ID'" --json
-reql inspect --node-id NODE_ID
 reql export --out graph.json
 reql export --json --out reql-json
 reql export --html --out graph.html
 reql export --html --json --out reql-graph-out
-reql config show
-reql config init
-reql --set project.id=team-a config show
-reql install codex --project
-reql install claude --project
-reql install --project
+```
+
+`storage inspect` prints block-file diagnostics such as block counts, record
+counts, compression ratio, dense-node count, manifest fields, WAL status, and
+logical index sizes. `storage compact` rewrites the current logical graph into a
+new compact storage generation.
+
+`export --html` writes a standalone browser view of the graph. If `--out`
+points to a directory or to a path without an `.html` suffix, the command writes
+`graph.html` inside that path. Add `--json` to also write `graph.json` next to
+the HTML file. Use `export --json` without `--html` to write JSON graph data to
+disk instead of stdout.
+
+## Assistant Installs
+
+```bash
+reql install codex
+reql install claude
+reql install
 reql install codex,claude --dry-run
-reql install claude --project --no-hooks
-reql install codex --project --command-dir ~/.local/bin
-reql uninstall codex,claude --project
+reql install claude --no-hooks
+reql install codex --command-dir ~/.local/bin
+reql install codex --user
+reql uninstall codex,claude
+```
+
+`reql install` auto-detects supported coding-agent profiles by default and
+writes assistant-facing REQL instructions for deterministic project memory.
+Supported platforms are `codex`, `claude`, `opencode`, `kilo`, `cursor`,
+`gemini`, `copilot`, `openclaw`, `hermes`, `kimi`, `antigravity`, and
+`agents`; use explicit canonical platform names, `all`, or `--all` to override
+auto-detection.
+
+By default, installs write project-local files such as
+`.codex/skills/reql-project/SKILL.md`, `.claude/CLAUDE.md`, `AGENTS.md`,
+`GEMINI.md`, `.cursor/rules/reql.mdc`, `.kilocode/rules/reql.md`, and
+agent-specific skill/rule directories. Pass `--project-dir` to target another
+project root. Pass `--user` to write to matching assistant profiles under the
+home directory.
+
+The installer also writes a REQL-owned `reql` command shim; use `--command-dir`
+to select the shim directory. Claude and Gemini hooks are installed by default
+and can be skipped with `--no-hooks`. `reql uninstall` removes REQL-owned skill
+files, version stamps, managed instruction sections, owned command shims, and
+automatic hooks while preserving unrelated content in shared files.
+
+## MCP Server
+
+```bash
 reql-mcp
 reql-mcp --read-only
 reql-mcp --config conf.yaml --set project.id=team-a --read-only
@@ -47,199 +192,20 @@ reql-mcp --transport http --host 127.0.0.1 --port 8765 --api-key "change-this-ke
 reql-mcp --transport http --host 0.0.0.0 --port 8765 --api-key "change-this-key" --read-only
 ```
 
-From a source checkout, use `python cli.py ...` as the repository-local CLI
-entry point. It adds `src` to Python's import path automatically, so it does not
-require an editable install or a manual `PYTHONPATH` change.
+`reql-mcp` starts the optional dependency-free MCP server for agent clients. The
+default transport is stdio. Use `--transport http` with `--host`, `--port`, and
+an API key from `--api-key` or `REQL_MCP_API_KEY` to share the server over HTTP.
+See [MCP.md](MCP.md) for tools, endpoint details, and client configuration.
 
-Use `python launcher.py` when you want the guided terminal menu for common
-operations, project workflows, graph analysis, exports, and MCP setup. Use
-`python cli.py ...` or `reql ...` for command-line workflows and automation.
-
-The menu can create or open graph storage, retrieve graph context, compose a
-context block, execute REQL, show stats, generate reports, compile projects,
-list/open/delete managed graph files under `.reql/`, switch the active storage
-file, and print Codex/Claude MCP connection snippets.
-
-`launcher.py` intentionally does not mirror the CLI command surface. It is an
-interactive guided menu. Use `cli.py`, `reql`, and `reql-mcp` for scripted or
-agent-facing command execution.
-
-Use `--json` on supported commands to get machine-readable output.
-By default, project and cache commands store data in
-`<build path>/.reql/memory.reql`; other commands use `./.reql/memory.reql`
-from the current working directory. Pass `--storage` to override this.
-Top-level help lists canonical commands alphabetically. Nested command groups
-summarize their subcommands in the main command list, for example `project`
-shows `compile`, `update`, `status`, and `report`. Use `query_context`,
-`query_explore`, `query_graph`, `query_memories`, and `query` as the supported
-command names for those workflows.
-
-`query_context` composes a deterministic agent-ready context block. It is
-informative by default and renders one compact block with matching nodes, file
-and line references, source links, and raw-query references for extended
-research. Pass `--code`, `--docs`, or `--test` to limit the same query to code,
-documentation/imported documents, or tests. Pass `--cleanup` for dead-code and
-unused-symbol cleanup context; cleanup output shows only matching
-`StaticAnalysisFinding` candidates. Add `--json` to get compact structured data
-without duplicated rendered Markdown, including `query_mode`, `scopes`,
-`owner_candidates`, `cleanup_candidates`, `working_set`, and `targeted_reads`.
-
-`query_explore` is a codebase exploration mode for coding agents that need the
-dependency chain before editing. It returns focused views for `owners`,
-`callers`, `public_surface`, `serialization_paths`, `docs_mentions`, and `code`;
-pass `--view owners --view code` for a tight function-level edit slice, pass
-`--view` more than once to include a subset, or use shortcuts such as
-`--owners-only`, `--code-only`, `--callers-only`, `--public-surface-only`,
-`--serialization-paths-only`, `--docs-mentions-only`, and `--code-only`. Use
-`--json` when another tool needs structured records with node ids, locations,
-edge provenance, and the rendered `context`.
-
-`query_graph` is the agent-oriented structured retrieval command. It finds
-seed nodes from the query, expands the graph up to `--max-depth`, gathers
-neighbor nodes, edges, and textual source fragments, filters isolated generic
-nodes by default, and renders a compact
-context block. Use `--json` to receive the full payload with `seed_nodes`,
-`ranked_nodes`, `nodes`, `edges`, `edge_directions`, `sources`,
-`filtered_node_ids`, and `counts`. Edge records preserve `from_id -> to_id`
-and also include `source_id`, `target_id`, `directed`, and `direction`; the
-`edge_directions` index groups each node's incoming and outgoing links for
-context construction.
-Use `--no-filter-generic` when debugging why a generic node was filtered.
-
-`query_memories` is the unified compact retrieval command for agents. It uses
-the same seed search and bounded graph expansion as the internal retrieval
-pipeline, optionally includes connected source texts, deduplicates repeated text, and returns compact
-memory rows with `id`, `type`, `label`, `text`, `score`, `rank`, `location`,
-`source_for`, `source_for_label`, `relation`, `direction`, `edge_id`, and
-`reasons`. With `--json`, the payload also includes retrieval metadata that
-previously required separate lookup calls: `trace_id`, `seed_node_ids`,
-`ranked_nodes`, `nodes`, `edges`, `edge_directions`, `sources`, `parameters`,
-and `counts`. Use `--limit`, `--max-depth`, and `--max-text-chars` to keep
-prompt input small; pass `--no-sources` when only ranked graph node text is
-needed.
-
-Use `query "RETRIEVE ... RETURN ..."` when you need explicit custom columns,
-and prefer `query_context` for synthesized context with owner targets, snippets,
-source evidence, or cleanup/edit sections.
-
-`inspect --node-id NODE_ID --json` resolves an id printed by `query_memories`,
-`query_graph`, or a REQL statement. It returns the node payload, a
-normalized `location` object when file/source metadata is available,
-source/location hints gathered from adjacent nodes and edges, and bounded
-incoming/outgoing neighbor records. This is the preferred next step when an
-agent needs to verify where a compact memory result came from.
-
-Query and retrieval commands record usage in an append-only usage journal, not
-as canonical graph rewrites. They do not persist `RetrievalTrace` nodes or
-`USED_IN_CONTEXT` edges, but ranking can use the usage overlay immediately.
-Read/query commands open the graph read-only directly, so multiple queries can
-run concurrently. A compile/update writer waits for existing readers and blocks
-new readers while it owns or is waiting on the writer lock.
-Hub explanations are available through REQL statements such as
-`reql query "EXPLAIN HUB 'node_id'" --json`.
-
-`storage inspect` prints block-file diagnostics: block counts, record counts by
-kind, compression ratio, dense-node count, manifest fields, WAL status, and
-logical index sizes after replay. Use `--json` for exact values in scripts.
-`storage compact` explicitly rewrites the current logical graph into a new
-compact storage generation and reports blocks, records, bytes, and generation
-id before and after the rewrite.
+## Diagnostics
 
 Set `diagnostics.enabled = true` and
 `diagnostics.path: ".reql/profile.jsonl"` in `conf.yaml` to append structured
-performance events for commands that run compile or retrieval work. The log is
-JSONL and includes phase names such as `compile.scan`, `compile.plan`,
+performance events for commands that run compile or retrieval work. The JSONL
+log includes phases such as `compile.scan`, `compile.plan`,
 `compile.artifact`, `compile.transaction`, `retrieval.lexical_search`,
-`retrieval.expand`, and `query.parse`, `query.evaluate`, and `graph.close`,
-with durations and relevant counters.
-
-`reql install` auto-detects supported coding-agent profiles by default and
-writes assistant-facing REQL instructions for deterministic project memory.
-Supported platforms are `codex`, `claude`, `opencode`, `kilo`, `cursor`, `gemini`,
-`copilot`, `openclaw`, `hermes`, `kimi`, `antigravity`, and `agents`; use
-explicit canonical platform names, `all`, or `--all` to override auto-detection.
-`--project` writes project-local files such as `.codex/skills/reql-project/SKILL.md`,
-`.claude/CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `.cursor/rules/reql.mdc`,
-`.kilocode/rules/reql.md`, `.github/copilot-instructions.md`,
-`.github/instructions/reql.instructions.md`, and agent-specific skill/rule
-directories for OpenCode, OpenClaw, Hermes, Kimi Code, and Google Antigravity.
-Without `--project`, the installer writes to the matching assistant profile under
-the home directory. User-scope installs also add always-on profile instructions
-where the agent supports them, such as `~/AGENTS.md` for Codex,
-`~/.claude/CLAUDE.md` for Claude Code, `~/GEMINI.md` for Gemini CLI, and
-agent-profile `AGENTS.md` or rule files for OpenCode, Kilo Code, OpenClaw,
-Hermes, Kimi Code, Google Antigravity, Cursor, GitHub Copilot, and generic
-AGENTS-compatible clients.
-The command is idempotent and supports `--dry-run` and `--json`.
-It also writes a REQL-owned `reql` command shim that points back to the current
-checkout or installed package; pass `--command-dir` to select the shim
-directory. Generated skills tell agents to prefer `reql`, then fall back to the
-absolute shim path, then to the Python launcher command, so agents are not
-dependent on a single discovery mechanism.
-Skill-capable clients receive the generated project context skill
-(`reql-project`). The generated skill includes `SKILL.md`, optional UI metadata
-under `agents/openai.yaml`, and focused `references/` for bootstrap/query,
-updates/watch mode, reports/exports/MCP, and optional document semantics.
-Agents run `reql project status .`; if that reports `Project not found`, they
-must immediately run `reql project compile .` before broad raw file exploration.
-Generated project guidance treats REQL as the repository context index: agents
-should not duplicate `query_context`, `query_memories`, or `query_graph` with
-broad `rg`, recursive directory listings, custom scanners, or other
-repository-wide discovery commands. Targeted file reads remain for exact edits,
-debugging, and tests.
-For unused-code cleanup, generated guidance tells agents to query deterministic
-`FINDINGS` and `StaticAnalysisFinding` rows first, then validate candidates with
-targeted source inspection or symbol searches before recommending removals.
-This keeps direct cleanup such as unused imports or variables separate from
-public/API-risk candidates such as functions, methods, classes, entry points,
-callbacks, and dynamically referenced hooks. `FINDINGS` defaults to
-`cleanup_rank` ordering, so high-priority product-code candidates are listed
-before test-local or low-confidence findings.
-Generated profile guidance also tells agents that `/reql` should load the
-REQL workflow first, dirty `.reql/` files are expected after updates, and
-`reports/GRAPH_REPORT.md` is for broad review when bounded queries are not
-enough.
-`reql project compile . --watch` is monitor mode for continuous updates during
-active editing, not a reason to skip the one-shot bootstrap when no graph
-exists. A running watcher performs an initial cache check, then monitors
-filesystem changes and compiles only dirty or deleted artifacts, so agents
-should query the maintained graph instead of starting repeated compile loops.
-If no watcher is running, generated guidance tells agents to run
-`reql project compile .` once after modifying project files before finishing, so
-the graph reflects the completed edits.
-Each platform install writes a `.reql_agent_version` stamp next to the installed
-skill or integration files so future installs can update the generated content
-cleanly. `reql uninstall` removes REQL-owned skill files, version stamps,
-managed instruction sections, owned command shims, and automatic hooks while
-preserving unrelated content in shared files. It does not overwrite or delete a
-pre-existing `reql` command that was not generated by this installer. Claude
-and Gemini installs register JSON settings hooks by default; pass `--no-hooks`
-to install only the skill/instruction files.
-
-`reql-mcp` starts the optional dependency-free MCP server for agent clients.
-The default transport is stdio. Use `--transport http` with `--host`, `--port`,
-and an API key from `--api-key` or `REQL_MCP_API_KEY` to share the server over
-HTTP. See `docs/MCP.md` for the tool list, HTTP endpoint details, and Codex or
-Claude Desktop configuration examples.
-
-`export --html` writes a standalone browser view of the graph already stored in
-memory. Use it to explore nodes, relations, neighbors, clusters, and source
-paths without running a server. Large stores render a bounded connected visual
-core for a dense, responsive browser view with no automatic movement. If `--out` points to a directory or
-to a path without an `.html` suffix, the command writes `graph.html` inside that path.
-Add `--json` to also write `graph.json` next to the HTML file.
-Use `export --json` without `--html` to write `graph.json` to disk instead of
-printing the JSON payload to stdout.
-
-Use `--config path/to/conf.yaml` to load project settings, or set
-`REQL_CONFIG` for agent wrappers. Use repeated global `--set
-section.option=value` flags for generic overrides after the config file is
-loaded. CLI flags such as `--max-file-size-mb` and `--output`
-override matching config values for the command being run.
-For project and cache commands that receive a `PATH`, REQL searches for
-`conf.yaml` from that path upward, so each project can define its own config.
-If none is found, it falls back to the canonical `conf.yaml` at the REQL code
-root. Explicit `--config`, `REQL_CONFIG`, and `--set` still take precedence.
+`retrieval.expand`, `query.parse`, `query.evaluate`, and `graph.close`, with
+durations and relevant counters.
 
 ## Configuration
 
@@ -318,7 +284,7 @@ source/framework roots needed for the task.
 `project report` writes `GRAPH_REPORT.md`, `GRAPH_DELTAS.md`, and
 `CACHE_REPORT.md` to the selected output directory. The reports summarize
 project structure, compilation cache, graph deltas, artifact ingestion, code
-symbols, communities, hubs, bridge signals, and memory health.
+symbols, communities, hubs, and memory health.
 
 ## Incremental compilation
 
