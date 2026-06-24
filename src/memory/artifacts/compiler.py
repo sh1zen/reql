@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 from typing import Any
 
-from ..code_analysis.language_detection import detect_code_language
+from ..code_analysis.extraction.catalog import detect_code_language
 from ..code_analysis.models import CodeImport, CodeModule, CodeParseResult, CodeSymbol, CodeText
 from ..code_analysis.parser_base import CodeParserRegistry, default_code_parser_registry
 from ..code_analysis.symbol_table import SymbolTable
@@ -83,7 +83,12 @@ MAX_DOCUMENT_CODE_LINKS_PER_RUN = 1000
 LANGUAGE_BUILTIN_GLOBALS = {
     "AbortController",
     "AbortSignal",
+    "abi",
+    "addmod",
     "Array",
+    "assert",
+    "block",
+    "blockhash",
     "Blob",
     "Boolean",
     "Date",
@@ -99,16 +104,22 @@ LANGUAGE_BUILTIN_GLOBALS = {
     "None",
     "Number",
     "Object",
+    "payable",
     "Promise",
     "Proxy",
     "RangeError",
     "Reflect",
     "RegExp",
+    "require",
     "Request",
     "Response",
+    "revert",
     "Set",
+    "selfdestruct",
+    "sha256",
     "String",
     "Symbol",
+    "tx",
     "TextDecoder",
     "TextEncoder",
     "True",
@@ -141,6 +152,7 @@ LANGUAGE_BUILTIN_GLOBALS = {
     "map",
     "max",
     "min",
+    "msg",
     "next",
     "object",
     "open",
@@ -188,6 +200,7 @@ CODE_GRAPH_EDGE_TYPES = {
     "IMPORTS_FROM",
     "RE_EXPORTS",
     "CALLS",
+    "USES",
     "REFERENCES",
     "READS",
     "WRITES",
@@ -201,6 +214,7 @@ CODE_GRAPH_EDGE_TYPES = {
     "IMPLEMENTS",
     "OVERRIDES",
     "INSTANTIATES",
+    "EMITS",
     "DECORATED_BY",
     "HANDLES_ROUTE",
     "TESTS",
@@ -673,7 +687,7 @@ class ArtifactCompiler:
                 if target is None:
                     continue
                 current_ids.add(target.id)
-                relation_type = "IMPLEMENTS" if node.type == "Interface" or symbol_resolver.is_interface(base) else "INHERITS"
+                relation_type = "IMPLEMENTS" if node.type == "Interface" or symbol_resolver.is_interface(base) or _solidity_base_is_interface(code_result, base, target) else "INHERITS"
                 pending_edges.append(_typed_edge(node.id, target.id, relation_type, {"project_id": artifact.project_id, "artifact_id": artifact.id, "base": base}, source_file=artifact.relative_path, line_start=symbol.start_line, line_end=symbol.start_line, extractor=code_result.parser_name, evidence=base))
             target = upsert_external(symbol.returns, "external")
             if target is not None:
@@ -703,6 +717,12 @@ class ArtifactCompiler:
             _track_node(result, node.id, node_created)
             pending_edges.append(_typed_edge(module_node.id, node.id, "IMPORTS", {"project_id": artifact.project_id, "artifact_id": artifact.id, "module": item.module, "name": item.name}, source_file=artifact.relative_path, line_start=item.line, line_end=item.line, extractor=code_result.parser_name, evidence=item.raw or item.module or item.name or ""))
             pending_edges.append(_typed_edge(file_id, node.id, "IMPORTS", {"project_id": artifact.project_id, "artifact_id": artifact.id, "module": item.module, "name": item.name}, source_file=artifact.relative_path, line_start=item.line, line_end=item.line, extractor=code_result.parser_name, evidence=item.raw or item.module or item.name or ""))
+            resolved_file = _resolved_import_file_node(store, artifact, item)
+            if resolved_file is not None:
+                current_ids.add(resolved_file.id)
+                properties = {"project_id": artifact.project_id, "artifact_id": artifact.id, "module": item.module, "name": item.name, "resolved_relative_path": resolved_file.properties.get("relative_path")}
+                pending_edges.append(_typed_edge(file_id, resolved_file.id, "IMPORTS", properties, source_file=artifact.relative_path, line_start=item.line, line_end=item.line, extractor=code_result.parser_name, evidence=item.raw or item.module or item.name or ""))
+                pending_edges.append(_typed_edge(module_node.id, resolved_file.id, "IMPORTS", properties, source_file=artifact.relative_path, line_start=item.line, line_end=item.line, extractor=code_result.parser_name, evidence=item.raw or item.module or item.name or ""))
             if _is_package_init_artifact(artifact):
                 pending_edges.append(_typed_edge(module_node.id, node.id, "RE_EXPORTS", {"project_id": artifact.project_id, "artifact_id": artifact.id, "module": item.module, "name": item.name, "alias": item.alias}, source_file=artifact.relative_path, line_start=item.line, line_end=item.line, extractor=code_result.parser_name, evidence=item.raw or item.module or item.name or ""))
         for (item, _), (dependency, dep_created) in zip(dependency_nodes, store.batch_upsert_nodes([node for _, node in dependency_nodes])):
@@ -710,6 +730,12 @@ class ArtifactCompiler:
             _track_node(result, dependency.id, dep_created)
             pending_edges.append(_typed_edge(file_id, dependency.id, "DEPENDS_ON", {"project_id": artifact.project_id, "artifact_id": artifact.id, "module": item.module, "name": item.name}, source_file=artifact.relative_path, line_start=item.line, line_end=item.line, extractor=code_result.parser_name, evidence=item.raw or item.module or item.name or ""))
             pending_edges.append(_typed_edge(module_node.id, dependency.id, "IMPORTS_FROM", {"project_id": artifact.project_id, "artifact_id": artifact.id, "module": item.module, "name": item.name}, source_file=artifact.relative_path, line_start=item.line, line_end=item.line, extractor=code_result.parser_name, evidence=item.raw or item.module or item.name or ""))
+            resolved_file = _resolved_import_file_node(store, artifact, item)
+            if resolved_file is not None:
+                current_ids.add(resolved_file.id)
+                properties = {"project_id": artifact.project_id, "artifact_id": artifact.id, "module": item.module, "name": item.name, "resolved_relative_path": resolved_file.properties.get("relative_path")}
+                pending_edges.append(_typed_edge(file_id, resolved_file.id, "DEPENDS_ON", properties, source_file=artifact.relative_path, line_start=item.line, line_end=item.line, extractor=code_result.parser_name, evidence=item.raw or item.module or item.name or ""))
+                pending_edges.append(_typed_edge(module_node.id, resolved_file.id, "IMPORTS_FROM", properties, source_file=artifact.relative_path, line_start=item.line, line_end=item.line, extractor=code_result.parser_name, evidence=item.raw or item.module or item.name or ""))
 
         table = SymbolTable(code_result)
         unresolved_calls_by_owner: dict[str, list[dict[str, Any]]] = {}
@@ -720,7 +746,7 @@ class ArtifactCompiler:
             if caller_node is None:
                 continue
             if target_node is not None:
-                relation_type = "INSTANTIATES" if target_node.type in {"Class", "Interface"} else "CALLS"
+                relation_type = _call_relation_type(call, target_node)
                 pending_edges.append(_typed_edge(caller_node.id, target_node.id, relation_type, {"project_id": artifact.project_id, "artifact_id": artifact.id, "target": call.target, "line": call.line}, source_file=artifact.relative_path, line_start=call.line, line_end=call.line, extractor=code_result.parser_name, evidence=call.target))
                 continue
             if _should_record_unresolved_call(call.target, imported_names=imported_names):
@@ -1846,6 +1872,9 @@ def _symbol_node(artifact: SourceArtifact, symbol: CodeSymbol, code_result: Code
             "is_semantic": False,
         }
     )
+    for key in ("language", "solidity_kind", "visibility", "state_mutability", "is_interface"):
+        if key in symbol.metadata:
+            properties[key] = symbol.metadata[key]
     return MemoryNode(
         id=symbol.id,
 
@@ -1956,6 +1985,20 @@ def _file_id(artifact: SourceArtifact) -> str:
     return stable_id("file", artifact.project_id, artifact.relative_path)
 
 
+def _file_id_for_relative_path(project_id: str, relative_path: str) -> str:
+    return stable_id("file", project_id, relative_path)
+
+
+def _resolved_import_file_node(store: GraphStore, artifact: SourceArtifact, item: CodeImport) -> MemoryNode | None:
+    resolved = item.metadata.get("resolved_relative_path") if isinstance(item.metadata, dict) else None
+    if not resolved:
+        return None
+    node = store.get_node(_file_id_for_relative_path(artifact.project_id, str(resolved)))
+    if node is None or node.type != "File" or node.status == "archived":
+        return None
+    return node
+
+
 def _config_node(artifact: SourceArtifact) -> MemoryNode:
     return MemoryNode(
         id=stable_id("config", artifact.project_id, artifact.relative_path),
@@ -2043,6 +2086,8 @@ def _dependency_node(artifact: SourceArtifact, item: CodeImport) -> MemoryNode:
             "name": name,
             "module": item.module,
             "import_name": item.name,
+            "metadata": dict(item.metadata),
+            "resolved_relative_path": item.metadata.get("resolved_relative_path") if isinstance(item.metadata, dict) else None,
             "external": True,
             "mode": "compile",
             "is_technical": True,
@@ -2153,6 +2198,28 @@ def _should_persist_variable(symbol: CodeSymbol, read_references: list[Any]) -> 
     if symbol.name.isupper():
         return True
     return not _variable_has_read_reference(symbol, read_references)
+
+
+def _call_relation_type(call: Any, target_node: MemoryNode) -> str:
+    metadata = getattr(call, "metadata", {}) or {}
+    kind = metadata.get("kind") if isinstance(metadata, dict) else None
+    if kind == "emit":
+        return "EMITS"
+    if kind == "using_directive":
+        return "USES"
+    if kind == "instantiates":
+        return "INSTANTIATES"
+    return "INSTANTIATES" if target_node.type in {"Class", "Interface"} else "CALLS"
+
+
+def _solidity_base_is_interface(code_result: CodeParseResult, base: str, target: MemoryNode) -> bool:
+    if str(code_result.module.language).casefold() != "solidity":
+        return False
+    if target.properties.get("solidity_kind") == "interface":
+        return True
+    if target.properties.get("synthetic") and base.split(".")[-1].startswith("I"):
+        return True
+    return False
 
 
 def _should_record_unresolved_call(target: str | None, *, imported_names: set[str] | None = None) -> bool:
@@ -2512,6 +2579,8 @@ def _reference_owner_can_see_symbol(owner: str | None, symbol: CodeSymbol) -> bo
 
 
 def _should_skip_unused_symbol(symbol: CodeSymbol) -> bool:
+    if symbol.metadata.get("language") == "solidity":
+        return True
     if symbol.name.startswith("_"):
         return True
     if symbol.name.startswith("__") and symbol.name.endswith("__"):

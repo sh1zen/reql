@@ -5,11 +5,85 @@ import unittest
 from pathlib import Path
 
 from api import MemoryGraph
+from memory.artifacts.models import SourceArtifact
+from memory.code_analysis import TreeSitterCodeParser
+from memory.code_analysis.extraction.base import TreeSitterCodeParser as ExtractionTreeSitterCodeParser, TreeSitterExtractorBase
+from memory.code_analysis.extraction.languages.generic import GenericProfileTreeSitterExtractor
+from memory.code_analysis.extraction.languages.java import JavaTreeSitterExtractor
+from memory.code_analysis.extraction.languages.javascript import JavaScriptTreeSitterExtractor
+from memory.code_analysis.extraction.languages.php import PhpTreeSitterExtractor
+from memory.code_analysis.extraction.languages.python import PythonTreeSitterExtractor
+from memory.code_analysis.extraction.languages.solidity import SolidityTreeSitterExtractor
+from memory.code_analysis.extraction.languages.tsx import TsxTreeSitterExtractor
+from memory.code_analysis.extraction.languages.typescript import TypeScriptTreeSitterExtractor
+from memory.code_analysis.extraction.factory import EXTRACTOR_BY_LANGUAGE, extractor_for
+from memory.code_analysis.extraction.catalog import CODE_LANGUAGE_CATALOG
 from memory.artifacts.fingerprint import artifact_id, normalize_path, project_id
 from memory.domain.models import MemoryNode
 
 
 class CodeGraphCompilationTests(unittest.TestCase):
+    def test_tree_sitter_extractor_factory_uses_registered_language_classes(self) -> None:
+        artifact = SourceArtifact(
+            id="artifact:demo",
+            project_id="project:demo",
+            uri="file:///demo.py",
+            path="/demo.py",
+            relative_path="demo.py",
+            artifact_type="code",
+            language="python",
+            size_bytes=0,
+            sha256="",
+            mtime=0.0,
+        )
+
+        python = extractor_for(artifact, b"", "Python", "python")
+        javascript = extractor_for(artifact, b"", "JavaScript", "javascript")
+        typescript = extractor_for(artifact, b"", "TypeScript", "typescript")
+        solidity = extractor_for(artifact, b"", "Solidity", "solidity")
+        java = extractor_for(artifact, b"", "Java", "java")
+
+        self.assertIsInstance(python, PythonTreeSitterExtractor)
+        self.assertIsInstance(javascript, JavaScriptTreeSitterExtractor)
+        self.assertIsInstance(typescript, TypeScriptTreeSitterExtractor)
+        self.assertIsInstance(solidity, SolidityTreeSitterExtractor)
+        self.assertIsInstance(java, JavaTreeSitterExtractor)
+        with self.assertRaises(ValueError):
+            extractor_for(artifact, b"", "Unknown", "unknown")
+
+    def test_javascript_and_typescript_extractors_are_split(self) -> None:
+        self.assertIs(JavaScriptTreeSitterExtractor.__bases__[0], TreeSitterExtractorBase)
+        self.assertIs(TypeScriptTreeSitterExtractor.__bases__[0], TreeSitterExtractorBase)
+        self.assertNotEqual(JavaScriptTreeSitterExtractor.__module__, TypeScriptTreeSitterExtractor.__module__)
+        self.assertTrue(issubclass(TsxTreeSitterExtractor, TypeScriptTreeSitterExtractor))
+
+    def test_tree_sitter_internals_live_in_extraction_layer(self) -> None:
+        self.assertIs(TreeSitterCodeParser, ExtractionTreeSitterCodeParser)
+        self.assertFalse((Path(__file__).parents[1] / "src" / "memory" / "code_analysis" / "tree_sitter_parser.py").exists())
+        self.assertFalse((Path(__file__).parents[1] / "src" / "memory" / "code_analysis" / "ast_profiles.py").exists())
+        self.assertFalse((Path(__file__).parents[1] / "src" / "memory" / "code_analysis" / "language_detection.py").exists())
+        self.assertFalse((Path(__file__).parents[1] / "src" / "memory" / "code_analysis" / "languages.py").exists())
+        self.assertFalse((Path(__file__).parents[1] / "src" / "memory" / "code_analysis" / "tree_sitter_languages.py").exists())
+        self.assertFalse(hasattr(TreeSitterExtractorBase, "profile"))
+
+    def test_each_supported_language_has_registered_extractor_class(self) -> None:
+        self.assertEqual(set(CODE_LANGUAGE_CATALOG), set(EXTRACTOR_BY_LANGUAGE))
+        for language, extractor_cls in EXTRACTOR_BY_LANGUAGE.items():
+            self.assertTrue(extractor_cls.__name__.endswith("TreeSitterExtractor"), language)
+            self.assertEqual(getattr(extractor_cls, "language_key", language), language)
+            if issubclass(extractor_cls, GenericProfileTreeSitterExtractor):
+                profile = getattr(extractor_cls, "profile", None)
+                self.assertIsNotNone(profile, language)
+                self.assertIn(language, profile.languages)
+                self.assertNotEqual(profile.name, "default")
+            if getattr(extractor_cls, "tree_sitter_module", None):
+                self.assertIsInstance(getattr(extractor_cls, "tree_sitter_module"), str)
+
+    def test_tree_sitter_loader_metadata_lives_on_language_classes(self) -> None:
+        self.assertEqual(TypeScriptTreeSitterExtractor.tree_sitter_function, "language_typescript")
+        self.assertEqual(TsxTreeSitterExtractor.tree_sitter_function, "language_tsx")
+        self.assertEqual(PhpTreeSitterExtractor.tree_sitter_function, "language_php")
+
     def test_compile_project_runs_without_external_extraction_pipeline(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "project"
@@ -388,6 +462,245 @@ class CodeGraphCompilationTests(unittest.TestCase):
                 methods = [node for node in graph.store.all_nodes() if node.type == "Method"]
                 self.assertIn("Main", {node.properties.get("name") for node in classes})
                 self.assertIn("run", {node.properties.get("name") for node in methods})
+            finally:
+                graph.close()
+
+    def test_generic_tree_sitter_profiles_extract_useful_language_graphs(self) -> None:
+        samples = {
+            "java": (
+                "Main.java",
+                "package demo; import java.util.List; class Main extends Base { void run(){ helper(); } void helper(){} }\n",
+                {"Main", "run", "helper"},
+                {"java.util.List"},
+                {"helper"},
+            ),
+            "go": (
+                "main.go",
+                'package main\nimport "fmt"\ntype Runner struct{}\nfunc helper(){}\nfunc (r Runner) Run(){ value := helper(); fmt.Println(value) }\n',
+                {"Runner", "helper", "Run", "value"},
+                {"fmt"},
+                {"helper", "fmt.Println"},
+            ),
+            "rust": (
+                "lib.rs",
+                "use std::fmt; struct Runner; impl Runner { fn run(&self){ helper(); } } fn helper(){}\n",
+                {"Runner", "run", "helper"},
+                {"std::fmt"},
+                {"helper"},
+            ),
+            "ruby": (
+                "app.rb",
+                'require "json"\nclass Runner < Base\n def run(x)\n  helper(x)\n end\n def helper(x); x; end\nend\n',
+                {"Runner", "run", "helper"},
+                {"json"},
+                {"helper"},
+            ),
+            "lua": (
+                "app.lua",
+                'local json = require("json")\nfunction helper(x) return x end\nlocal function run() helper(1) end\n',
+                {"helper", "run"},
+                {"json"},
+                {"helper"},
+            ),
+            "elixir": (
+                "demo.ex",
+                "defmodule Demo do\n import Enum\n def run(x) do helper(x) end\n defp helper(x), do: x\nend\n",
+                {"Demo", "run", "helper"},
+                {"Enum"},
+                {"helper"},
+            ),
+            "powershell": (
+                "demo.ps1",
+                "Import-Module Pester\nfunction Invoke-Run { Invoke-Helper }\nfunction Invoke-Helper { return 1 }\n",
+                {"Invoke-Run", "Invoke-Helper"},
+                {"Pester"},
+                {"Invoke-Helper"},
+            ),
+            "fortran": (
+                "demo.f90",
+                "module demo\ncontains\nsubroutine run()\ncall helper()\nend subroutine\nsubroutine helper()\nend subroutine\nend module\n",
+                {"demo", "run", "helper"},
+                set(),
+                {"helper"},
+            ),
+            "zig": (
+                "demo.zig",
+                'const std = @import("std"); pub const Point = struct { x: i32 }; pub fn run() void { helper(); } fn helper() void {}\n',
+                {"Point", "run", "helper"},
+                {"std"},
+                {"helper"},
+            ),
+        }
+        parser = TreeSitterCodeParser()
+        for language, (relative_path, source, expected_symbols, expected_imports, expected_calls) in samples.items():
+            with self.subTest(language=language):
+                artifact = SourceArtifact(
+                    id=f"artifact:{language}",
+                    project_id="project:generic",
+                    uri=f"file:///{relative_path}",
+                    path=relative_path,
+                    relative_path=relative_path,
+                    artifact_type="code",
+                    language=language,
+                    size_bytes=len(source),
+                    sha256="",
+                    mtime=0.0,
+                )
+                result = parser.parse_artifact(artifact, source)
+                self.assertFalse(result.errors)
+                self.assertTrue(expected_symbols.issubset({symbol.name for symbol in result.symbols}))
+                self.assertTrue(expected_imports.issubset({item.module for item in result.imports}))
+                self.assertTrue(expected_calls.issubset({call.target for call in result.calls}))
+                self.assertTrue(all(call.caller for call in result.calls if call.target in expected_calls))
+
+    def test_compile_project_supports_multiple_languages_in_one_project(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "project"
+            root.mkdir()
+            (root / "app.py").write_text("def py_entry():\n    return 'py'\n", encoding="utf-8")
+            (root / "web.js").write_text("export function jsEntry() { return py_entry(); }\n", encoding="utf-8")
+            (root / "types.ts").write_text("export function tsEntry(value: string): string { return value; }\n", encoding="utf-8")
+            (root / "Token.sol").write_text(
+                "pragma solidity ^0.8.0;\ncontract Token { function mint() public {} }\n",
+                encoding="utf-8",
+            )
+            graph = MemoryGraph.open(Path(td) / "memory.reql")
+            try:
+                result = graph.compile_project(root)
+                self.assertFalse(result.run.errors)
+
+                artifacts = [node for node in graph.store.all_nodes() if node.type == "SourceArtifact"]
+                languages_by_path = {node.properties.get("relative_path"): node.properties.get("language") for node in artifacts}
+                self.assertEqual(languages_by_path.get("app.py"), "Python")
+                self.assertEqual(languages_by_path.get("web.js"), "JavaScript")
+                self.assertEqual(languages_by_path.get("types.ts"), "TypeScript")
+                self.assertEqual(languages_by_path.get("Token.sol"), "Solidity")
+
+                modules = [node for node in graph.store.all_nodes() if node.type == "Module"]
+                module_languages = {node.properties.get("relative_path"): node.properties.get("language") for node in modules}
+                self.assertEqual(module_languages.get("app.py"), "Python")
+                self.assertEqual(module_languages.get("web.js"), "JavaScript")
+                self.assertEqual(module_languages.get("types.ts"), "TypeScript")
+                self.assertEqual(module_languages.get("Token.sol"), "Solidity")
+
+                function_names = {node.properties.get("name") for node in graph.store.all_nodes() if node.type in {"Function", "Method"}}
+                class_names = {node.properties.get("name") for node in graph.store.all_nodes() if node.type == "Class"}
+                self.assertIn("py_entry", function_names)
+                self.assertIn("jsEntry", function_names)
+                self.assertIn("tsEntry", function_names)
+                self.assertIn("mint", function_names)
+                self.assertIn("Token", class_names)
+            finally:
+                graph.close()
+
+    def test_solidity_tree_sitter_builds_contract_graph_imports_and_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "project"
+            contracts = root / "contracts"
+            interfaces = contracts / "interfaces"
+            openzeppelin = root / "lib" / "openzeppelin-contracts" / "contracts" / "token" / "ERC721"
+            interfaces.mkdir(parents=True)
+            openzeppelin.mkdir(parents=True)
+            (root / "remappings.txt").write_text("@openzeppelin/=lib/openzeppelin-contracts/\n", encoding="utf-8")
+            (interfaces / "IERC20.sol").write_text(
+                "pragma solidity ^0.8.0;\ninterface IERC20 { function balanceOf(address owner) external returns (uint256); }\n",
+                encoding="utf-8",
+            )
+            (openzeppelin / "IERC721.sol").write_text(
+                "pragma solidity ^0.8.0;\ninterface IERC721 {}\n",
+                encoding="utf-8",
+            )
+            (contracts / "Token.sol").write_text(
+                "\n".join(
+                    [
+                        "pragma solidity ^0.8.0;",
+                        'import "./interfaces/IERC20.sol";',
+                        'import {IERC721 as Token721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";',
+                        "library SafeMath {",
+                        "    function add(uint a, uint b) internal pure returns (uint) { return a + b; }",
+                        "}",
+                        "interface IToken { function ping() external; }",
+                        "contract Base {}",
+                        "contract Token is Base, IToken, IExternal {",
+                        "    using SafeMath for uint256;",
+                        "    struct Point { uint x; uint y; }",
+                        "    enum Status { Pending, Done }",
+                        "    event Transfer(address indexed from, address indexed to, uint256 value);",
+                        "    modifier onlyOwner() { _; }",
+                        "    constructor() {}",
+                        "    receive() external payable {}",
+                        "    fallback() external {}",
+                        "    function transfer(address to, uint256 amount) public onlyOwner returns (bool) {",
+                        "        emit Transfer(msg.sender, to, amount);",
+                        "        SafeMath.add(amount, 1);",
+                        "        Token t = new Token();",
+                        "        require(true);",
+                        "        return true;",
+                        "    }",
+                        "}",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            graph = MemoryGraph.open(Path(td) / "memory.reql")
+            try:
+                result = graph.compile_project(root)
+                self.assertFalse(result.run.errors)
+
+                nodes = graph.store.all_nodes()
+                edges = graph.store.all_edges()
+
+                def node(type_: str, name: str):
+                    return next(item for item in nodes if item.type == type_ and item.properties.get("name") == name)
+
+                token = node("Class", "Token")
+                base = node("Class", "Base")
+                safe_math = node("Class", "SafeMath")
+                transfer = node("Method", "transfer")
+                event = node("Class", "Transfer")
+                itoken = node("Interface", "IToken")
+
+                self.assertEqual(token.properties.get("solidity_kind"), "contract")
+                self.assertEqual(safe_math.properties.get("solidity_kind"), "library")
+                self.assertEqual(node("Class", "Point").properties.get("solidity_kind"), "struct")
+                self.assertEqual(node("Class", "Status").properties.get("solidity_kind"), "enum")
+                self.assertEqual(event.properties.get("solidity_kind"), "event")
+                for method_name in {"transfer", "constructor", "onlyOwner", "receive", "fallback"}:
+                    self.assertIsNotNone(node("Method", method_name))
+
+                method_edges = {(edge.from_id, edge.to_id) for edge in edges if edge.type == "METHOD"}
+                self.assertIn((token.id, transfer.id), method_edges)
+                self.assertIn((token.id, node("Method", "onlyOwner").id), method_edges)
+
+                self.assertTrue(any(edge.type == "INHERITS" and edge.from_id == token.id and edge.to_id == base.id for edge in edges))
+                self.assertTrue(any(edge.type == "IMPLEMENTS" and edge.from_id == token.id and edge.to_id == itoken.id for edge in edges))
+                self.assertTrue(
+                    any(
+                        edge.type == "IMPLEMENTS"
+                        and edge.from_id == token.id
+                        and graph.get_node(edge.to_id)
+                        and graph.get_node(edge.to_id).properties.get("name") == "IExternal"
+                        for edge in edges
+                    )
+                )
+                self.assertTrue(any(edge.type == "EMITS" and edge.from_id == transfer.id and edge.to_id == event.id for edge in edges))
+                self.assertTrue(any(edge.type == "USES" and edge.from_id == token.id and edge.to_id == safe_math.id for edge in edges))
+                self.assertTrue(any(edge.type == "INSTANTIATES" and edge.from_id == transfer.id and edge.to_id == token.id for edge in edges))
+                self.assertTrue(any(edge.type == "CALLS" and edge.from_id == transfer.id and edge.to_id == node("Method", "add").id for edge in edges))
+
+                file_targets = {
+                    graph.get_node(edge.to_id).properties.get("relative_path")
+                    for edge in edges
+                    if edge.type == "IMPORTS" and graph.get_node(edge.to_id) and graph.get_node(edge.to_id).type == "File"
+                }
+                self.assertIn("contracts/interfaces/IERC20.sol", file_targets)
+                self.assertIn("lib/openzeppelin-contracts/contracts/token/ERC721/IERC721.sol", file_targets)
+
+                imports = [item for item in nodes if item.type == "Import"]
+                self.assertTrue(any(item.properties.get("name") == "IERC721" and item.properties.get("alias") == "Token721" for item in imports))
+                self.assertFalse(any("require" in str(item.properties.get("unresolved_calls", [])) for item in nodes))
+                self.assertFalse(any("msg" in str(item.properties.get("unresolved_calls", [])) for item in nodes))
             finally:
                 graph.close()
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 from typing import Protocol
 
 from ..artifacts.models import SourceArtifact
-from .language_detection import detect_code_language
+from .extraction.catalog import detect_code_language
 from .models import CodeParseResult
 
 
@@ -31,6 +31,6 @@ class CodeParserRegistry:
 
 
 def default_code_parser_registry() -> CodeParserRegistry:
-    from .tree_sitter_parser import TreeSitterCodeParser
+    from .extraction.base import TreeSitterCodeParser
 
     return CodeParserRegistry([TreeSitterCodeParser()])

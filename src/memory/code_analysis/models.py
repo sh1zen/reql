@@ -54,6 +54,7 @@ class CodeImport:
     level: int = 0
     line: int | None = None
     raw: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

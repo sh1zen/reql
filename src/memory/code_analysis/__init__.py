@@ -1,9 +1,9 @@
 """Code parsing and graph extraction."""
 from __future__ import annotations
 
+from typing import Any
+
 from .models import CodeCall, CodeImport, CodeModule, CodeParseResult, CodeSymbol, CodeText
-from .parser_base import CodeParser, CodeParserRegistry, default_code_parser_registry
-from .tree_sitter_parser import TreeSitterCodeParser
 
 __all__ = [
     "CodeCall",
@@ -17,3 +17,15 @@ __all__ = [
     "TreeSitterCodeParser",
     "default_code_parser_registry",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    if name in {"CodeParser", "CodeParserRegistry", "default_code_parser_registry"}:
+        from . import parser_base
+
+        return getattr(parser_base, name)
+    if name == "TreeSitterCodeParser":
+        from .extraction.base import TreeSitterCodeParser
+
+        return TreeSitterCodeParser
+    raise AttributeError(name)

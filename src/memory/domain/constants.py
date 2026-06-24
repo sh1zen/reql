@@ -96,6 +96,7 @@ EDGE_TYPES = {
     "INHERITS",
     "IMPLEMENTS",
     "INSTANTIATES",
+    "EMITS",
     "READS",
     "WRITES",
     "RETURNS",
