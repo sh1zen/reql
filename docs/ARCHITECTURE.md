@@ -19,27 +19,25 @@ Application Services
 Engines
   Activation / Salience / Static Analysis
 
-Ports
-  GraphStore
-
-Infrastructure
-  BlockGraphStore
+Storage
+  GraphStore / SemanticExtractor / BlockGraphStore
 
 Domain
   MemoryNode / MemoryEdge / Queries / Results / Exceptions
 ```
 
 The public facade lives in `src/api`. Agent-facing installer integrations live
-in `src/agents`. Deterministic graph services live in `src/memory`. The MCP
-transport and tool handlers live in `src/mcp`.
+in `src/agents`. Deterministic graph services live in `src/memory`. The bundled
+local graph adapter lives in `memory.storage.adapters`. The MCP transport and tool
+handlers live in `src/mcp`.
 
-## Storage Port
+## Storage Boundary
 
-`GraphStore` is the storage boundary. Services operate on graph operations such
-as node/edge upsert, property lookup, bounded neighborhoods, transactions, and
-batch writes. The bundled block adapter implements that port as a local
-fixed-size page store; the architecture does not depend on Neo4j or any external
-graph service.
+`memory.storage.GraphStore` is the storage boundary. Services operate on graph
+operations such as node/edge upsert, property lookup, bounded neighborhoods,
+transactions, and batch writes. The bundled block adapter implements that
+contract as a local fixed-size page store; the architecture does not depend on
+Neo4j or any external graph service.
 
 Routine operations should prefer bounded or indexed port methods:
 

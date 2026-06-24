@@ -1,7 +1,7 @@
 """Factory for language-specific Tree-sitter extractors."""
 from __future__ import annotations
 
-from ...artifacts.models import SourceArtifact
+from ..artifacts.models import SourceArtifact
 from .base import TreeSitterExtractorBase
 from .languages.apex import ApexTreeSitterExtractor
 from .languages.bash import BashTreeSitterExtractor

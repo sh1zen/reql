@@ -126,6 +126,7 @@ class DocumentProcessor:
 
         raw_events: list[DocumentRawEvent] = []
         event_map: dict[str, list[DocumentRawEvent]] = defaultdict(list)
+        fragment_by_id = {item["fragment"].id: item["fragment"] for item in indexed}
         for term in ranked_terms:
             fragment_counts = [
                 (count, fragment_id)
@@ -134,7 +135,7 @@ class DocumentProcessor:
             ]
             fragment_counts.sort(key=lambda item: (-item[0], item[1]))
             for count, fragment_id in fragment_counts[: self.max_events_per_term]:
-                fragment = next((item["fragment"] for item in indexed if item["fragment"].id == fragment_id), None)
+                fragment = fragment_by_id.get(fragment_id)
                 if fragment is None:
                     continue
                 event = DocumentRawEvent(

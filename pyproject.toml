@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +8,8 @@ version = "0.1.0"
 description = "Relational Entities Query Language: a graph-native deterministic memory engine."
 readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{name = "sh1zen"}]
 keywords = [
   "agents",
@@ -21,7 +22,7 @@ keywords = [
   "llm"
 ]
 classifiers = [
-  "Development Status :: 1 - Alpha",
+  "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
@@ -30,7 +31,6 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
   "Programming Language :: Python :: 3 :: Only",
-  "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
   "Topic :: Database",
   "Topic :: Scientific/Engineering :: Artificial Intelligence",
@@ -81,16 +81,13 @@ dev = [
 ]
 
 [project.urls]
-Documentation = "https://github.com/sh1zen/Reql#readme"
-Issues = "https://github.com/sh1zen/Reql/issues"
-Source = "https://github.com/sh1zen/Reql"
+Documentation = "https://github.com/sh1zen/reql#readme"
+Issues = "https://github.com/sh1zen/reql/issues"
+Source = "https://github.com/sh1zen/reql"
 
 [project.scripts]
 reql = "memory.cli:main"
 reql-mcp = "mcp.server:main"
-
-[tool.setuptools]
-license-files = ["LICENSE"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

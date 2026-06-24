@@ -14,8 +14,8 @@ from ..domain.ids import stable_id
 from ..domain.models import MemoryEdge, MemoryNode, MemoryQuery, MemorySubgraph, RankedNode
 from ..extraction.normalization import canonicalize, clamp, token_signal_score, tokenize
 from ..domain.timeutils import utcnow_iso
-from ..ports.extractor import SemanticExtractor
-from ..ports.graph_store import GraphStore
+from ..storage.extractor import SemanticExtractor
+from ..storage.graph_store import GraphStore
 
 TECHNICAL_NODE_TYPES = {"RetrievalTrace", "System", "Session", "Debug", "Log", "Comment", "Docstring", "Import"}
 GRAPH_SEED_NODE_TYPES = {"Topic", "Entity", "Fact", "File", "SourceArtifact", "Module", "Function", "Class", "Interface", "Method", "Variable", "Endpoint", "Schema", "StaticAnalysisFinding"}

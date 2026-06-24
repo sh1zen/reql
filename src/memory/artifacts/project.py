@@ -7,7 +7,7 @@ from typing import Any
 from ..domain.ids import stable_id
 from ..domain.models import MemoryEdge, MemoryNode
 from ..domain.timeutils import utcnow_iso
-from ..ports.graph_store import GraphStore
+from ..storage.graph_store import GraphStore
 from .context_scope import artifact_context_scope
 from .fingerprint import normalize_path, project_id
 from .models import GraphRegistrationSummary, Project, ScanResult, SourceArtifact

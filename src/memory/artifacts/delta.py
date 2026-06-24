@@ -7,7 +7,7 @@ from typing import Any
 from ..domain.ids import new_id
 from ..domain.models import MemoryNode
 from ..domain.timeutils import utcnow_iso
-from ..ports.graph_store import GraphStore
+from ..storage.graph_store import GraphStore
 
 
 @dataclass(slots=True)

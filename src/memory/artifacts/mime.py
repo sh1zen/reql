@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..code_analysis.extraction.catalog import display_language_for_path
+from ..code_analysis.catalog import display_language_for_path
 from .models import ArtifactType
 
 TEXT_EXTENSIONS = {

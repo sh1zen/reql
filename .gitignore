@@ -12,5 +12,7 @@ dist/
 .mypy_cache/
 .idea/
 .tmp/
+.tmp-test/
 .reql/
+.pypirc
 AGENTS.md

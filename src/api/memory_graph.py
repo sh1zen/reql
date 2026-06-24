@@ -18,9 +18,7 @@ from memory.domain.models import (
 from memory.engines.activation import ActivationEngine
 from memory.engines.salience import SalienceEngine
 from memory.extraction.deterministic import DeterministicExtractor
-from memory.infrastructure.block import BlockGraphStore
-from memory.ports.extractor import SemanticExtractor
-from memory.ports.graph_store import GraphStore
+from memory.storage import BlockGraphStore, GraphStore, SemanticExtractor
 from memory.reporting.html_graph import write_graph_html
 from memory.reporting.project_report import ProjectReportFiles, ProjectReportGenerator
 from memory.analysis.communities import CommunityResult

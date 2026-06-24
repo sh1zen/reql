@@ -8,7 +8,7 @@ from ..domain.constants import INACTIVE_STATUSES
 from ..domain.models import ActivationOptions, ActivationResult, MemoryEdge, MemoryNode
 from ..extraction.normalization import clamp
 from ..domain.timeutils import utcnow_iso
-from ..ports.graph_store import GraphStore
+from ..storage.graph_store import GraphStore
 
 
 class ActivationEngine:

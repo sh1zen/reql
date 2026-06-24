@@ -27,9 +27,9 @@ from ..base import (
     _text,
     _valid_symbol_name,
 )
-from ....artifacts.models import SourceArtifact
-from ....domain.ids import stable_id
-from ...models import CodeCall, CodeSymbol, SymbolKind
+from ...artifacts.models import SourceArtifact
+from ...domain.ids import stable_id
+from ..models import CodeCall, CodeSymbol, SymbolKind
 
 
 class SolidityTreeSitterExtractor(TreeSitterExtractorBase):

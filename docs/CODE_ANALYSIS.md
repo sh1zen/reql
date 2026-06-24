@@ -45,7 +45,7 @@ Other recognized languages use the reusable Tree-sitter profile extractor with
 a profile declared on each language class. The generic engine owns only the
 traversal and result assembly; language-specific AST node names, import forms,
 call forms, builtins, variables, and macro-style declarations live in the
-corresponding `memory.code_analysis.extraction.languages.<language>` module.
+corresponding `memory.code_analysis.languages.<language>` module.
 These profiles emit modules, classes/types, functions, methods, local variables
 where the grammar exposes clear writes, imports/includes and idiomatic import
 calls such as `require`, `source`, `Import-Module`, and `@import`, comments,
@@ -53,13 +53,14 @@ source fragments, call targets, and read/write/return/raise references. This
 keeps each non-Python/Solidity language independently extensible while sharing
 the common Tree-sitter graph assembly code.
 
-The extraction layer is structured under `memory.code_analysis.extraction`.
-`TreeSitterCodeParser` and shared AST primitives live in `extraction.base`, while
+The Tree-sitter extraction layer is structured directly under
+`memory.code_analysis`. `TreeSitterCodeParser` and shared AST primitives live in
+`memory.code_analysis.base`, while
 language cataloging, extension detection, aliases, and Tree-sitter grammar
-loading live in `extraction.catalog`. `TreeSitterExtractorBase` owns shared state
+loading live in `memory.code_analysis.catalog`. `TreeSitterExtractorBase` owns shared state
 and result assembly, but it does not contain language walkers or fallback AST
 profiles. Language-specific classes live one file per language under
-`memory.code_analysis.extraction.languages` and are registered in the extractor
+`memory.code_analysis.languages` and are registered in the extractor
 factory. Languages without a handwritten walker still have their own class and
 declare a language-specific `AstProfile` in that file while inheriting the
 reusable `GenericProfileTreeSitterExtractor`. Classes for languages with direct

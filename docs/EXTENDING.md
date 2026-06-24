@@ -2,7 +2,7 @@
 
 ## Storage adapters
 
-Implement `GraphStore` in `memory.ports.graph_store`.
+Implement `GraphStore` from `memory.storage.graph_store`.
 
 A backend must support:
 
@@ -18,12 +18,22 @@ The service layer should not assume any database-engine-specific behaviour.
 
 ## Extractors
 
-Implement `SemanticExtractor` in `memory.ports.extractor`.
+Implement `SemanticExtractor` from `memory.storage.extractor`.
 
 The extractor should return `ExtractionResult` objects. Core compile paths use
 deterministic local processing. Document processing lives in
 `memory.extraction.document_processor` and emits ranked terms, raw events,
 co-occurrence relations, and links to code symbols.
+
+## Document parsers
+
+Add document format parsers under `memory/document_ingestion/formats/` and
+inherit `BaseDocumentParser` from `memory.document_ingestion.base`. The common
+base handles format support checks, UTF-8 decoding with replacement, file
+metadata, and path-derived titles. Register new parsers in
+`default_parser_registry()` when they should participate in project
+compilation. Keep optional format dependencies graceful, following the PDF
+parser pattern.
 
 ## New engines
 

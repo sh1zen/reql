@@ -1,28 +1,24 @@
 """Plain text parser."""
 from __future__ import annotations
 
-from pathlib import Path
-
-from ..artifacts.models import SourceArtifact
-from .base import DocumentParser
-from .chunking import paragraph_chunks
-from .metadata import basic_file_metadata, make_fragment
-from .models import DocumentParseResult
+from ...artifacts.models import SourceArtifact
+from ..base import BaseDocumentParser
+from ..chunking import paragraph_chunks
+from ..metadata import make_fragment
+from ..models import DocumentParseResult
 
 
-class PlainTextParser(DocumentParser):
+class PlainTextParser(BaseDocumentParser):
     parser_name = "plain_text"
     parser_version = "text-v1"
+    artifact_types = frozenset({"text", "code", "config", "data", "unknown"})
 
     def __init__(self, *, max_chars: int = 3000) -> None:
         self.max_chars = max_chars
 
-    def supports(self, artifact: SourceArtifact) -> bool:
-        return artifact.artifact_type in {"text", "code", "config", "data", "unknown"}
-
     def parse(self, artifact: SourceArtifact, content: bytes) -> DocumentParseResult:
-        text = content.decode("utf-8", errors="replace")
-        metadata = basic_file_metadata(artifact.path)
+        text = self.decode_text(content)
+        metadata = self.base_metadata(artifact)
         metadata.update({"language": artifact.language, "artifact_type": artifact.artifact_type})
         fragments = [
             make_fragment(
@@ -43,13 +39,13 @@ class PlainTextParser(DocumentParser):
                 make_fragment(
                     artifact_id=artifact.id,
                     fragment_type="metadata",
-                    text=f"Empty text artifact: {Path(artifact.path).name}",
+                    text=f"Empty text artifact: {self.artifact_name(artifact)}",
                     index=0,
                     metadata={"parser": self.parser_name},
                 )
             )
         return DocumentParseResult(
-            title=Path(artifact.path).stem,
+            title=self.title_from_path(artifact),
             metadata=metadata,
             fragments=fragments,
             links=[],

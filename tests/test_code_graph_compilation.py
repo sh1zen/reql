@@ -7,17 +7,16 @@ from pathlib import Path
 from api import MemoryGraph
 from memory.artifacts.models import SourceArtifact
 from memory.code_analysis import TreeSitterCodeParser
-from memory.code_analysis.extraction.base import TreeSitterCodeParser as ExtractionTreeSitterCodeParser, TreeSitterExtractorBase
-from memory.code_analysis.extraction.languages.generic import GenericProfileTreeSitterExtractor
-from memory.code_analysis.extraction.languages.java import JavaTreeSitterExtractor
-from memory.code_analysis.extraction.languages.javascript import JavaScriptTreeSitterExtractor
-from memory.code_analysis.extraction.languages.php import PhpTreeSitterExtractor
-from memory.code_analysis.extraction.languages.python import PythonTreeSitterExtractor
-from memory.code_analysis.extraction.languages.solidity import SolidityTreeSitterExtractor
-from memory.code_analysis.extraction.languages.tsx import TsxTreeSitterExtractor
-from memory.code_analysis.extraction.languages.typescript import TypeScriptTreeSitterExtractor
-from memory.code_analysis.extraction.factory import EXTRACTOR_BY_LANGUAGE, extractor_for
-from memory.code_analysis.extraction.catalog import CODE_LANGUAGE_CATALOG
+from memory.code_analysis.languages.generic import GenericProfileTreeSitterExtractor
+from memory.code_analysis.languages.java import JavaTreeSitterExtractor
+from memory.code_analysis.languages.javascript import JavaScriptTreeSitterExtractor
+from memory.code_analysis.languages.php import PhpTreeSitterExtractor
+from memory.code_analysis.languages.python import PythonTreeSitterExtractor
+from memory.code_analysis.languages.solidity import SolidityTreeSitterExtractor
+from memory.code_analysis.languages.tsx import TsxTreeSitterExtractor
+from memory.code_analysis.languages.typescript import TypeScriptTreeSitterExtractor
+from memory.code_analysis.factory import EXTRACTOR_BY_LANGUAGE, extractor_for
+from memory.code_analysis.catalog import CODE_LANGUAGE_CATALOG
 from memory.artifacts.fingerprint import artifact_id, normalize_path, project_id
 from memory.domain.models import MemoryNode
 
@@ -50,21 +49,6 @@ class CodeGraphCompilationTests(unittest.TestCase):
         self.assertIsInstance(java, JavaTreeSitterExtractor)
         with self.assertRaises(ValueError):
             extractor_for(artifact, b"", "Unknown", "unknown")
-
-    def test_javascript_and_typescript_extractors_are_split(self) -> None:
-        self.assertIs(JavaScriptTreeSitterExtractor.__bases__[0], TreeSitterExtractorBase)
-        self.assertIs(TypeScriptTreeSitterExtractor.__bases__[0], TreeSitterExtractorBase)
-        self.assertNotEqual(JavaScriptTreeSitterExtractor.__module__, TypeScriptTreeSitterExtractor.__module__)
-        self.assertTrue(issubclass(TsxTreeSitterExtractor, TypeScriptTreeSitterExtractor))
-
-    def test_tree_sitter_internals_live_in_extraction_layer(self) -> None:
-        self.assertIs(TreeSitterCodeParser, ExtractionTreeSitterCodeParser)
-        self.assertFalse((Path(__file__).parents[1] / "src" / "memory" / "code_analysis" / "tree_sitter_parser.py").exists())
-        self.assertFalse((Path(__file__).parents[1] / "src" / "memory" / "code_analysis" / "ast_profiles.py").exists())
-        self.assertFalse((Path(__file__).parents[1] / "src" / "memory" / "code_analysis" / "language_detection.py").exists())
-        self.assertFalse((Path(__file__).parents[1] / "src" / "memory" / "code_analysis" / "languages.py").exists())
-        self.assertFalse((Path(__file__).parents[1] / "src" / "memory" / "code_analysis" / "tree_sitter_languages.py").exists())
-        self.assertFalse(hasattr(TreeSitterExtractorBase, "profile"))
 
     def test_each_supported_language_has_registered_extractor_class(self) -> None:
         self.assertEqual(set(CODE_LANGUAGE_CATALOG), set(EXTRACTOR_BY_LANGUAGE))

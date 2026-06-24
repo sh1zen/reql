@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from ..domain.models import MemoryEdge, MemoryNode
-from ..ports.graph_store import GraphStore
+from ..storage.graph_store import GraphStore
 
 
 @dataclass(frozen=True, slots=True)

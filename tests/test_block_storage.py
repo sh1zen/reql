@@ -11,7 +11,7 @@ from pathlib import Path
 from api import MemoryGraph
 from memory.domain.exceptions import StorageError
 from memory.domain.models import MemoryEdge, MemoryNode
-from memory.infrastructure.block import BlockGraphStore
+from memory.storage import BlockGraphStore
 
 _SUPERBLOCK_HEADER_SIZE = struct.calcsize("<8sIIII32s")
 

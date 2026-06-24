@@ -27,7 +27,7 @@ from ..base import (
     _text,
     stable_id,
 )
-from ...models import CodeCall, CodeSymbol, SymbolKind
+from ..models import CodeCall, CodeSymbol, SymbolKind
 
 
 class TypeScriptTreeSitterExtractor(TreeSitterExtractorBase):

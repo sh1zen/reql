@@ -1,8 +1,9 @@
 ﻿# Storage
 
-REQL uses a storage-agnostic `GraphStore` port. The bundled local adapter is
-`BlockGraphStore`, a dependency-light graph store that writes fixed-size block
-files directly instead of using a database engine.
+REQL uses a storage-agnostic `memory.storage.GraphStore` contract. The bundled local adapter is
+`memory.storage.adapters.BlockGraphStore`, re-exported as
+`memory.storage.BlockGraphStore`, a dependency-light graph store that writes
+fixed-size block files directly instead of using a database engine.
 
 ## Block Adapter
 
@@ -150,7 +151,7 @@ missing or empty storage path.
 
 ## Transactions
 
-The adapter exposes `store.transaction()` through the `GraphStore` port.
+The adapter exposes `store.transaction()` through the `GraphStore` contract.
 
 - outer transactions snapshot the current in-memory graph and append WAL once
   on commit;
