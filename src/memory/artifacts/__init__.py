@@ -1,6 +1,8 @@
 """Project artifact scanning and graph registration."""
 from __future__ import annotations
 
+from typing import Any
+
 from .models import (
     ArtifactFingerprint,
     GraphRegistrationSummary,
@@ -10,11 +12,6 @@ from .models import (
     ScanSkippedFile,
     SourceArtifact,
 )
-from .cache import ArtifactCache, ArtifactCacheEntry, DirtySet, artifact_cache_path
-from .compiler import ArtifactCompiler, ArtifactCompilationResult, archive_artifact_fragments
-from .delta import CompilationRun, DeltaRepository, GraphDelta
-from .project import ProjectRegistry
-from .scanner import ProjectScanner
 
 __all__ = [
     "ArtifactFingerprint",
@@ -37,3 +34,27 @@ __all__ = [
     "ScanSkippedFile",
     "SourceArtifact",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    if name in {"ArtifactCache", "ArtifactCacheEntry", "DirtySet", "artifact_cache_path"}:
+        from . import cache
+
+        return getattr(cache, name)
+    if name in {"ArtifactCompiler", "ArtifactCompilationResult", "archive_artifact_fragments"}:
+        from . import compiler
+
+        return getattr(compiler, name)
+    if name in {"CompilationRun", "DeltaRepository", "GraphDelta"}:
+        from . import delta
+
+        return getattr(delta, name)
+    if name == "ProjectRegistry":
+        from .project import ProjectRegistry
+
+        return ProjectRegistry
+    if name == "ProjectScanner":
+        from .scanner import ProjectScanner
+
+        return ProjectScanner
+    raise AttributeError(name)

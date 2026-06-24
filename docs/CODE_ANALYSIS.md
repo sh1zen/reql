@@ -13,6 +13,11 @@ provenance in edge properties: `source_id`, `target_id`, `type`,
 `compile_project` uses the project scanner, parsers, artifact cache, and static
 code/document graph compiler. Non-code text documents remain structural
 `SourceFragment` records for provenance and code-context linking.
+Projects may contain multiple programming languages in the same compile run.
+Language detection, Tree-sitter grammar selection, and extractor dispatch happen
+per `SourceArtifact`, so a Python file, TypeScript file, Solidity contract, and
+JavaScript file in the same project each produce their own language-specific
+module, symbols, imports, and calls.
 
 ## Language Support
 
@@ -36,21 +41,29 @@ remappings from `remappings.txt` and `foundry.toml`; links resolvable imports to
 real `File` nodes; records `EMITS` for events, `USES` for `using` directives,
 `INSTANTIATES` for `new` expressions, and filters Solidity builtins such as
 `require`, `assert`, `revert`, `msg`, `abi`, `block`, and `tx`.
-Other recognized languages
-use Tree-sitter AST profiles. Profiles group languages with equivalent AST
-shapes, such as C-family languages, scripting languages, Go, Rust, Scala,
-Fortran, and declarative/build languages, so shared node representatives are
-declared once while language-specific imports, declarations, methods, and calls
-remain explicit. The profile path emits modules, major declarations,
-imports/includes where exposed by the grammar, comments, and source fragments.
+Other recognized languages use the reusable Tree-sitter profile extractor with
+a profile declared on each language class. The generic engine owns only the
+traversal and result assembly; language-specific AST node names, import forms,
+call forms, builtins, variables, and macro-style declarations live in the
+corresponding `memory.code_analysis.extraction.languages.<language>` module.
+These profiles emit modules, classes/types, functions, methods, local variables
+where the grammar exposes clear writes, imports/includes and idiomatic import
+calls such as `require`, `source`, `Import-Module`, and `@import`, comments,
+source fragments, call targets, and read/write/return/raise references. This
+keeps each non-Python/Solidity language independently extensible while sharing
+the common Tree-sitter graph assembly code.
 
 The extraction layer is structured under `memory.code_analysis.extraction`.
-`TreeSitterExtractorBase` owns shared result assembly and common AST walking
-helpers, while language-specific classes live under
-`memory.code_analysis.extraction.languages`. New language-specific behavior
-should be added as a dedicated class/file in that package and registered in the
-extractor factory; languages without special handling use the generic
-profile-driven extractor.
+`TreeSitterCodeParser` and shared AST primitives live in `extraction.base`, while
+language cataloging, extension detection, aliases, and Tree-sitter grammar
+loading live in `extraction.catalog`. `TreeSitterExtractorBase` owns shared state
+and result assembly, but it does not contain language walkers or fallback AST
+profiles. Language-specific classes live one file per language under
+`memory.code_analysis.extraction.languages` and are registered in the extractor
+factory. Languages without a handwritten walker still have their own class and
+declare a language-specific `AstProfile` in that file while inheriting the
+reusable `GenericProfileTreeSitterExtractor`. Classes for languages with direct
+Tree-sitter wheels declare the corresponding grammar module.
 
 Tree-sitter is a mandatory runtime dependency. REQL does not fall back to the
 standard-library Python `ast` parser, regex parsing, or any other code parser.
