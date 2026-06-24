@@ -8,7 +8,7 @@ from typing import Any
 from ..domain.ids import stable_id
 from ..domain.models import MemoryEdge, MemoryNode
 from ..domain.timeutils import utcnow_iso
-from ..ports.graph_store import GraphStore
+from ..storage.graph_store import GraphStore
 
 
 @dataclass(slots=True)
@@ -71,7 +71,7 @@ class CommunityDetector:
         nodes_by_id = {node.id: node for node in nodes}
         for index, member_ids in enumerate(communities, start=1):
             community_id = stable_id("community", project_id or "global", ",".join(member_ids))
-            member_nodes = [node for node_id in member_ids if (node := nodes_by_id.get(node_id)) is not None]
+            member_nodes = [nodes_by_id[node_id] for node_id in member_ids if node_id in nodes_by_id]
             label = _community_label(member_nodes, index)
             density = _density(member_ids, adjacency)
             salience = sum(node.salience for node in member_nodes) / max(len(member_ids), 1)

@@ -2,28 +2,26 @@
 from __future__ import annotations
 
 from importlib import import_module
-from pathlib import Path
 from typing import Any
 
-from ..artifacts.models import SourceArtifact
-from .base import DocumentParser
-from .metadata import basic_file_metadata, make_fragment
-from .models import DocumentParseResult
+from ...artifacts.models import SourceArtifact
+from ..base import BaseDocumentParser
+from ..metadata import make_fragment
+from ..models import DocumentParseResult
 
 
-class PDFParser(DocumentParser):
+class PDFParser(BaseDocumentParser):
     parser_name = "pdf"
     parser_version = "pdf-v1"
-
-    def supports(self, artifact: SourceArtifact) -> bool:
-        return artifact.artifact_type == "pdf" or (artifact.language or "").casefold() == "pdf"
+    artifact_types = frozenset({"pdf"})
+    languages = frozenset({"pdf"})
 
     def parse(self, artifact: SourceArtifact, content: bytes) -> DocumentParseResult:
-        metadata = basic_file_metadata(artifact.path)
+        metadata = self.base_metadata(artifact)
         errors: list[str] = []
         fragments = []
         pdf_metadata: dict[str, Any] = {}
-        title: str | None = Path(artifact.path).stem
+        title: str | None = self.title_from_path(artifact)
 
         try:
             pdf_module = import_module("pypdf")
@@ -34,7 +32,7 @@ class PDFParser(DocumentParser):
                 make_fragment(
                     artifact_id=artifact.id,
                     fragment_type="metadata",
-                    text=f"PDF artifact metadata only: {Path(artifact.path).name}",
+                    text=f"PDF artifact metadata only: {self.artifact_name(artifact)}",
                     index=0,
                     metadata={"parser": self.parser_name, "status": "needs_parser"},
                     confidence=0.6,
@@ -83,7 +81,7 @@ class PDFParser(DocumentParser):
                 make_fragment(
                     artifact_id=artifact.id,
                     fragment_type="metadata",
-                    text=f"PDF artifact metadata only: {Path(artifact.path).name}",
+                    text=f"PDF artifact metadata only: {self.artifact_name(artifact)}",
                     index=0,
                     metadata={"parser": self.parser_name, "status": "parser_error"},
                     confidence=0.5,

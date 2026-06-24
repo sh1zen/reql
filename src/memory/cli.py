@@ -11,7 +11,7 @@ from typing import Any
 from .config import CONFIG_FILENAME, ConfigError, REQLConfig, load_config, load_effective_config, parse_config_override_assignments, write_sample_config
 from .diagnostics import PerformanceLogger
 from .domain.exceptions import StorageError
-from .infrastructure.block import BlockGraphStore
+from .storage import BlockGraphStore
 from .reporting.html_graph import write_graph_html
 from api.memory_graph import MemoryGraph
 

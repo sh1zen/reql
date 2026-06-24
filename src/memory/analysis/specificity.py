@@ -7,7 +7,7 @@ from collections import Counter
 from dataclasses import dataclass
 
 from ..domain.models import MemoryNode
-from ..ports.graph_store import GraphStore
+from ..storage.graph_store import GraphStore
 
 GENERIC_TYPES = {"GraphDelta", "ArtifactCacheEntry", "SourceFragment", "URI"}
 SPECIFIC_TYPES = {"Function", "Class", "Method", "Module", "SourceArtifact", "Concept", "File", "StaticAnalysisFinding"}

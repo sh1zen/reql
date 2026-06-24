@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from .domain.models import MemoryEdge, MemoryNode, MemoryQuery, MemorySubgraph
-from .infrastructure.block import BlockGraphStore
+from .storage import BlockGraphStore
 from .query import QueryResult, REQLError, REQLEvaluationError, REQLSyntaxError
 from .config import ConfigError, REQLConfig, load_config
 

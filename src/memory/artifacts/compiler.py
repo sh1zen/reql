@@ -7,7 +7,7 @@ from pathlib import Path
 import re
 from typing import Any
 
-from ..code_analysis.extraction.catalog import detect_code_language
+from ..code_analysis.catalog import detect_code_language
 from ..code_analysis.models import CodeImport, CodeModule, CodeParseResult, CodeSymbol, CodeText
 from ..code_analysis.parser_base import CodeParserRegistry, default_code_parser_registry
 from ..code_analysis.symbol_table import SymbolTable
@@ -19,7 +19,7 @@ from ..domain.models import MemoryEdge, MemoryNode
 from ..domain.timeutils import utcnow_iso
 from ..extraction.document_processor import DocumentProcessingResult, DocumentProcessor, DocumentRawEvent, DocumentTerm, DocumentTermRelation
 from ..extraction.normalization import canonicalize
-from ..ports.graph_store import GraphStore
+from ..storage.graph_store import GraphStore
 from .context_scope import artifact_context_scope
 from .models import SourceArtifact
 

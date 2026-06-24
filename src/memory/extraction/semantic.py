@@ -6,6 +6,6 @@ deterministic.
 """
 from __future__ import annotations
 
-from ..ports.extractor import SemanticExtractor
+from ..storage.extractor import SemanticExtractor
 
 __all__ = ["SemanticExtractor"]

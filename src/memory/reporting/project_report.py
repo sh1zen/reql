@@ -14,7 +14,7 @@ from ..artifacts.scanner import ProjectScanner
 from ..domain.constants import ACTIVE_STATUSES
 from ..domain.models import MemoryEdge, MemoryNode
 from ..domain.timeutils import utcnow_iso
-from ..ports.graph_store import GraphStore
+from ..storage.graph_store import GraphStore
 from .cache_report import CacheReportBuilder
 from .delta_report import DeltaReportBuilder
 from .graph_report import GraphReportBuilder

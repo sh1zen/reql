@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from ....artifacts.models import SourceArtifact
+from ...artifacts.models import SourceArtifact
 from ..base import (
     TreeSitterExtractorBase,
     _call_owner,
@@ -26,7 +26,7 @@ from ..base import (
     _valid_symbol_name,
     stable_id,
 )
-from ...models import CodeCall, CodeSymbol, SymbolKind
+from ..models import CodeCall, CodeSymbol, SymbolKind
 
 
 COMMON_IDENTIFIER_NODES = frozenset(

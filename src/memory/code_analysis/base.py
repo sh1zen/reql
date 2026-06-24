@@ -7,9 +7,9 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any
 
-from ...artifacts.models import SourceArtifact
-from ...domain.ids import stable_id
-from ..models import (
+from ..artifacts.models import SourceArtifact
+from ..domain.ids import stable_id
+from .models import (
     CodeCall,
     CodeImport,
     CodeModule,

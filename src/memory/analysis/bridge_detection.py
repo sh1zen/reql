@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 
 from ..domain.constants import ACTIVE_STATUSES
 from ..domain.models import MemoryEdge, MemoryNode
-from ..ports.graph_store import GraphStore
+from ..storage.graph_store import GraphStore
 from .communities import CommunityDetector
 from .specificity import SpecificityScorer
 

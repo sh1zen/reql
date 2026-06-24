@@ -2,12 +2,11 @@
 from __future__ import annotations
 
 import re
-from pathlib import Path
 
-from ..artifacts.models import SourceArtifact
-from .base import DocumentParser
-from .metadata import basic_file_metadata, line_offsets, make_fragment
-from .models import DocumentFragment, DocumentParseResult
+from ...artifacts.models import SourceArtifact
+from ..base import BaseDocumentParser
+from ..metadata import line_offsets, make_fragment
+from ..models import DocumentFragment, DocumentParseResult
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 FENCE_RE = re.compile(r"^(```+|~~~+)\s*([A-Za-z0-9_+.-]+)?\s*$")
@@ -15,23 +14,22 @@ LIST_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
 LINK_RE = re.compile(r"(?<!!)\[([^\]]+)\]\(([^)]+)\)")
 
 
-class MarkdownParser(DocumentParser):
+class MarkdownParser(BaseDocumentParser):
     parser_name = "markdown"
     parser_version = "markdown-v1"
-
-    def supports(self, artifact: SourceArtifact) -> bool:
-        return artifact.artifact_type == "markdown" or (artifact.language or "").casefold() == "markdown"
+    artifact_types = frozenset({"markdown"})
+    languages = frozenset({"markdown"})
 
     def parse(self, artifact: SourceArtifact, content: bytes) -> DocumentParseResult:
-        text = content.decode("utf-8", errors="replace")
+        text = self.decode_text(content)
         lines = text.splitlines()
         offsets = line_offsets(text)
-        metadata = basic_file_metadata(artifact.path)
+        metadata = self.base_metadata(artifact)
         fragments: list[DocumentFragment] = []
         links: list[dict[str, object]] = []
         tables: list[dict[str, object]] = []
         heading_stack: list[tuple[int, str, str]] = []
-        title = Path(artifact.path).stem
+        title = self.title_from_path(artifact)
         current_heading_id: str | None = None
         index = 0
         i = 0
@@ -47,7 +45,7 @@ class MarkdownParser(DocumentParser):
             if heading:
                 level = len(heading.group(1))
                 heading_text = heading.group(2).strip().strip("#").strip()
-                if level == 1 and title == Path(artifact.path).stem:
+                if level == 1 and title == self.title_from_path(artifact):
                     title = heading_text
                 heading_stack = [item for item in heading_stack if item[0] < level]
                 section_path = _section_path(title, heading_stack, heading_text)

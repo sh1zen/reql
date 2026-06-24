@@ -9,7 +9,7 @@ from typing import Any
 from ..domain.ids import stable_id
 from ..domain.models import MemoryNode
 from ..domain.timeutils import utcnow_iso
-from ..ports.graph_store import GraphStore
+from ..storage.graph_store import GraphStore
 from .fingerprint import DEFAULT_CHUNKING_VERSION, DEFAULT_PARSER_VERSION, options_hash
 from .models import ScanResult, SourceArtifact
 

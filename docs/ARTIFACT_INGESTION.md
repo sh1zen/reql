@@ -24,6 +24,11 @@ Artifact ingestion turns registered `SourceArtifact` files into parsed
 
 ## Parser Interface
 
+Concrete parsers live under `memory.document_ingestion.formats` and inherit
+`BaseDocumentParser`, the common document parser layer. Format-specific modules
+are organized by parser name, for example
+`memory.document_ingestion.formats.markdown.MarkdownParser`.
+
 Parsers implement:
 
 ```text
