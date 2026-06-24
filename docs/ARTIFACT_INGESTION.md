@@ -14,7 +14,7 @@ Artifact ingestion turns registered `SourceArtifact` files into parsed
   metadata is recorded and the artifact is marked as needing a parser.
 - Code: source files are recognized across Python, TS/JS, Go, Rust, Java,
   C/C++, Ruby, C#, Kotlin, Scala, PHP, Swift, Lua, Zig, PowerShell, Elixir,
-  Julia, Verilog, Fortran, Bash, SQL, Terraform, Apex, Pascal, Razor, and
+  Julia, Verilog, Solidity, Fortran, Bash, SQL, Terraform, Apex, Pascal, Razor, and
   related extensions. Mandatory Tree-sitter AST parsing creates module,
   declaration, import/include, comment, and source-fragment graph nodes for
   recognized languages, with richer symbol/call/docstring extraction for

@@ -27,18 +27,23 @@ co-occurrence relations, and links to code symbols.
 
 ## New engines
 
-New engines should be placed under `engines/` if they operate on low-level memory state, for example:
+New engines should be placed under `memory/engines/` when they operate on
+low-level graph state in the same style as the current activation and salience
+engines. Keep project orchestration under `memory/services/`, and keep graph
+analysis algorithms under `memory/analysis/`.
 
-- reward engine;
-- centrality engine;
-- vector index engine;
-- temporal reasoning engine;
-- privacy/redaction engine.
+Existing examples:
 
-Application orchestration should remain under `services/`.
+- `memory.engines.activation.ActivationEngine`
+- `memory.engines.salience.SalienceEngine`
+- `memory.analysis.communities.CommunityDetector`
+- `memory.analysis.hubs.HubAnalyzer`
 
 ## New node or edge types
 
-Add constants in `domain/constants.py`, then update services/engines as needed. The storage layer accepts arbitrary `type` strings, so schema evolution is mainly a domain concern.
+Add constants in `memory/domain/constants.py`, then update compiler, retrieval,
+reporting, services, engines, or analysis code only where the new type needs
+dedicated behavior. The storage layer accepts arbitrary `type` strings, so
+schema evolution is mainly a domain and service concern.
 
 

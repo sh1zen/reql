@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "reql"
-version = "0.3.0"
+version = "0.1.0"
 description = "Relational Entities Query Language: a graph-native deterministic memory engine."
 readme = {file = "README.md", content-type = "text/markdown"}
 requires-python = ">=3.10"
 license = {text = "MIT"}
-authors = [{name = "REQL contributors"}]
+authors = [{name = "sh1zen"}]
 keywords = [
   "agents",
   "graph",
@@ -17,16 +17,18 @@ keywords = [
   "memory",
   "property-graph",
   "query-language",
-  "reql",
+  "skill",
+  "llm"
 ]
 classifiers = [
-  "Development Status :: 3 - Alpha",
+  "Development Status :: 1 - Alpha",
   "Intended Audience :: Developers",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Programming Language :: Python :: 3 :: Only",
   "License :: OSI Approved :: MIT License",
   "Operating System :: OS Independent",
@@ -58,6 +60,7 @@ dependencies = [
   "tree-sitter-ruby>=0.23",
   "tree-sitter-rust>=0.24",
   "tree-sitter-scala>=0.26",
+  "tree-sitter-solidity>=1.2",
   "tree-sitter-sql>=0.3",
   "tree-sitter-swift>=0.7",
   "tree-sitter-typescript>=0.23",
@@ -66,18 +69,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-nlp = ["spacy>=3.7"]
 watch = ["watchdog>=4.0"]
 pdf = ["pypdf>=4.0"]
-code = []
 all = [
   "pypdf>=4.0",
-  "spacy>=3.7",
   "watchdog>=4.0",
 ]
 dev = [
   "pypdf>=4.0",
-  "spacy>=3.7",
   "watchdog>=4.0",
 ]
 

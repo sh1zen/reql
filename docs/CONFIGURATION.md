@@ -1,8 +1,9 @@
 # Configuration
 
 REQL reads project settings from `conf.yaml`. The repository root `conf.yaml`
-is the canonical default configuration and contains every supported project
-config option.
+is the canonical sample copied by `reql config init`; it contains every
+supported project config section. The runtime also has deterministic in-memory
+defaults in `memory.config.models` for callers that construct a config directly.
 
 Create a sample file:
 
@@ -26,16 +27,29 @@ project:
 scan:
   max_file_size_mb: 10
   include: []
-  exclude: []
+  exclude:
+    - "__pycache__/"
+    - ".reql/"
+    - ".tmp/"
+    - ".git"
 
 compile:
   ingest_documents: true
   documents:
     - {"format": "markdown", "extensions": [".md", ".markdown"], "ingest": true}
-    - {"format": "plain_text", "extensions": [".txt"], "filenames": ["LICENSE", "NOTICE"], "ingest": true}
-    - {"format": "pdf", "extensions": [".pdf"], "ingest": true}
+    - {"format": "plain_text", "extensions": [".txt"], "filenames": ["LICENSE", "NOTICE"], "ingest": false}
+    - {"format": "restructured_text", "extensions": [".rst"], "ingest": true}
+    - {"format": "html", "extensions": [".html", ".htm"], "ingest": true}
+    - {"format": "log", "extensions": [".log"], "ingest": false}
+    - {"format": "pdf", "extensions": [".pdf"], "ingest": false}
+    - {"format": "json", "extensions": [".json"], "ingest": true}
+    - {"format": "toml", "extensions": [".toml"], "ingest": true}
     - {"format": "yaml", "extensions": [".yaml", ".yml"], "ingest": true}
+    - {"format": "ini", "extensions": [".ini", ".cfg", ".conf"], "ingest": true}
     - {"format": "csv", "extensions": [".csv"], "ingest": true}
+    - {"format": "tsv", "extensions": [".tsv"], "ingest": true}
+    - {"format": "xml", "extensions": [".xml"], "ingest": true}
+    - {"format": "ndjson", "extensions": [".ndjson"], "ingest": true}
 
 cache:
   enabled: true
@@ -63,12 +77,13 @@ diagnostics:
   supported document policy list; each item names a real `format`, the matching
   `extensions` and optional `filenames`, and whether to `ingest` it
   structurally. Tree-sitter is always used for supported code parsing. PDF
-  parsing is enabled only when the `compile.documents` policy for `pdf` has
-  `ingest: true`. During compile, ingested documents are processed locally by
-  the deterministic document processor. It creates ranked `Concept` nodes,
-  underlying `RawEvent` observations, `CO_OCCURS_WITH` term relations, and
-  `REFERENCES` edges from document terms to code symbols when the same fragment
-  explicitly mentions a compiled symbol.
+  parsing is attempted only when the `compile.documents` policy for `pdf` has
+  `ingest: true`; text extraction requires the optional `pypdf` extra. During
+  compile, ingested documents are processed locally by the deterministic
+  document processor. It creates ranked `Concept` nodes, underlying `RawEvent`
+  observations, `CO_OCCURS_WITH` term relations, and `REFERENCES` edges from
+  document terms to code symbols when the same fragment explicitly mentions a
+  compiled symbol.
 - `cache.enabled = false` disables incremental skip decisions. Compilation
   still runs, but `.reql/artifact-cache.json` is not read or updated.
 - `analysis.enable_hubs` is respected by the MCP `reql_hubs` tool. CLI REQL
@@ -87,8 +102,8 @@ document processing are deterministic local operations.
 When a command receives a project path, for example `reql project compile PATH`
 or `reql cache status [PATH]`, REQL searches upward for `conf.yaml` from that
 project path. Commands with an optional path use the current working directory
-when `PATH` is omitted. If no project config exists, REQL falls back to the canonical
-`conf.yaml` shipped at the root of the REQL checkout.
+when `PATH` is omitted. If no project config exists, REQL falls back to the
+canonical `conf.yaml` shipped with the package or source checkout.
 
 Precedence is:
 

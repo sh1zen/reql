@@ -17,7 +17,7 @@ code/document graph compiler. Non-code text documents remain structural
 ## Language Support
 
 REQL recognizes code artifacts for common programming languages including
-Python, TypeScript/JavaScript, Go, Rust, Java, C/C++, Ruby, C#, Kotlin, Scala,
+Python, TypeScript/JavaScript, Solidity, Go, Rust, Java, C/C++, Ruby, C#, Kotlin, Scala,
 PHP, Swift, Lua, Zig, PowerShell, Elixir, Julia, Verilog, Fortran, Bash, SQL,
 Terraform, Apex, Pascal, Razor, and related file extensions. Recognition means
 the scanner registers the file as a `code` artifact with a normalized language
@@ -26,16 +26,31 @@ instead of treating it as plain text or unknown content.
 ## Parsers
 
 Recognized code languages use Tree-sitter AST grammars exclusively. Python,
-JavaScript, and TypeScript use the richest adapter, extracting imports,
+JavaScript, TypeScript, and Solidity use language-specific adapters, extracting imports,
 class/function/method/meaningful-variable symbols, comments, docstrings for
-Python, decorators, type hints where available, and call targets from the AST,
-including the nearest function or method owner for each call. Other recognized languages
+Python, decorators/modifiers, type hints where available, and call targets from the AST,
+including the nearest function or method owner for each call. Solidity extraction
+emits contract, interface, library, struct, enum, event, constructor, modifier,
+receive/fallback, and function symbols; resolves relative imports and Foundry
+remappings from `remappings.txt` and `foundry.toml`; links resolvable imports to
+real `File` nodes; records `EMITS` for events, `USES` for `using` directives,
+`INSTANTIATES` for `new` expressions, and filters Solidity builtins such as
+`require`, `assert`, `revert`, `msg`, `abi`, `block`, and `tx`.
+Other recognized languages
 use Tree-sitter AST profiles. Profiles group languages with equivalent AST
 shapes, such as C-family languages, scripting languages, Go, Rust, Scala,
 Fortran, and declarative/build languages, so shared node representatives are
 declared once while language-specific imports, declarations, methods, and calls
 remain explicit. The profile path emits modules, major declarations,
 imports/includes where exposed by the grammar, comments, and source fragments.
+
+The extraction layer is structured under `memory.code_analysis.extraction`.
+`TreeSitterExtractorBase` owns shared result assembly and common AST walking
+helpers, while language-specific classes live under
+`memory.code_analysis.extraction.languages`. New language-specific behavior
+should be added as a dedicated class/file in that package and registered in the
+extractor factory; languages without special handling use the generic
+profile-driven extractor.
 
 Tree-sitter is a mandatory runtime dependency. REQL does not fall back to the
 standard-library Python `ast` parser, regex parsing, or any other code parser.
@@ -81,6 +96,8 @@ Primary technical relations:
 - `Module -RE_EXPORTS-> Import` for imports exposed by package `__init__.py`
 - `Function/Method -CALLS-> Function/Method` when locally resolvable
 - `Function/Method -INSTANTIATES-> Class/Interface` for constructor calls
+- `Function/Method -EMITS-> Event symbol` for Solidity event emission
+- `Class/Interface/Module -USES-> Symbol` for Solidity using directives
 - `Function/Method -READS-> Variable`
 - `Function/Method -WRITES-> Variable`
 - `Function/Method -RETURNS-> Symbol`
