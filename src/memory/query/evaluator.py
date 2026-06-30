@@ -30,6 +30,7 @@ from .ast import (
     Stats,
     Statement,
     TypedNodeList,
+    VerifyFinding,
 )
 from .errors import REQLEvaluationError
 from .parser import parse_reql
@@ -45,6 +46,28 @@ DEFAULT_ACTIVATE_COLUMNS = ["id", "type", "label", "text", "activation", "salien
 DEFAULT_PATH_COLUMNS = ["length", "score", "node_ids", "node_labels", "edge_types", "edge_ids"]
 DEFAULT_EXPLAIN_NODE_COLUMNS = ["node_id", "node_type", "direction", "edge_type", "weight", "confidence", "neighbor_id", "neighbor_type", "neighbor_label"]
 DEFAULT_EXPLAIN_SEARCH_COLUMNS = ["rank", "score", "id", "type", "label", "text", "reasons"]
+DEFAULT_VERIFY_FINDING_COLUMNS = ["finding", "minimal_snippet", "uses_found", "scopes_checked", "risks", "recommended_action"]
+_VERIFY_FINDING_USAGE_EDGE_TYPES = {
+    "CALLS",
+    "USES",
+    "REFERENCES",
+    "READS",
+    "RETURNS",
+    "RAISES",
+    "INSTANTIATES",
+    "EMITS",
+    "DECORATED_BY",
+    "HANDLES_ROUTE",
+    "TESTS",
+    "CONFIGURES",
+    "IMPORTS",
+    "IMPORTS_FROM",
+    "RE_EXPORTS",
+    "DEPENDS_ON",
+    "INHERITS",
+    "IMPLEMENTS",
+    "OVERRIDES",
+}
 DEFAULT_LIST_COLUMNS = {
     "PROJECTS": ["id", "name", "root_path", "status", "updated_at"],
     "ARTIFACTS": ["id", "relative_path", "path", "artifact_type", "language", "status", "size_bytes", "sha256"],
@@ -58,6 +81,9 @@ DEFAULT_LIST_COLUMNS = {
         "symbol_name",
         "qualified_name",
         "relative_path",
+        "directory",
+        "file_count",
+        "files",
         "line_start",
         "cleanup_priority",
         "cleanup_rank",
@@ -146,6 +172,8 @@ class QueryEvaluator:
             return self._typed_node_list(source, statement)
         if isinstance(statement, CacheStatus):
             return self._cache_status(source, statement)
+        if isinstance(statement, VerifyFinding):
+            return self._verify_finding(source, statement)
         raise REQLEvaluationError(f"Unsupported statement: {statement!r}")
 
     def _indexed_node_candidates(
@@ -734,6 +762,209 @@ class QueryEvaluator:
         }
         return QueryResult(source, "CACHE STATUS", columns, rows, diagnostics)
 
+    def _verify_finding(self, source: str, statement: VerifyFinding) -> QueryResult:
+        finding = self.store.get_node(statement.finding_id)
+        if finding is None:
+            raise REQLEvaluationError(f"Finding not found: {statement.finding_id}")
+        if finding.type != "StaticAnalysisFinding":
+            raise REQLEvaluationError(f"VERIFY FINDING expects a StaticAnalysisFinding id; got {finding.type}")
+
+        symbol = self._finding_symbol(finding)
+        uses = self._finding_usage_edges(symbol) if symbol is not None else []
+        risks = self._finding_risks(finding, uses)
+        row = {
+            "finding": self._finding_payload(finding, symbol),
+            "minimal_snippet": self._finding_minimal_snippet(finding, symbol),
+            "uses_found": uses,
+            "scopes_checked": self._finding_scopes(finding, symbol, uses),
+            "risks": risks,
+            "recommended_action": self._finding_recommended_action(finding, uses, risks),
+        }
+        diagnostics = {
+            "finding_id": finding.id,
+            "symbol_id": symbol.id if symbol else None,
+            "usage_edges_found": len(uses),
+            "incoming_usage_edges_found": sum(1 for item in uses if item.get("direction") == "incoming"),
+        }
+        return QueryResult(source, "VERIFY FINDING", DEFAULT_VERIFY_FINDING_COLUMNS, [row], diagnostics)
+
+    def _finding_symbol(self, finding: MemoryNode) -> MemoryNode | None:
+        symbol_id = finding.properties.get("symbol_id")
+        if symbol_id:
+            symbol = self.store.get_node(str(symbol_id))
+            if symbol is not None:
+                return symbol
+        candidates: list[MemoryNode] = []
+        for edge in self.store.all_edges():
+            if edge.to_id != finding.id or edge.type != "HAS_FINDING":
+                continue
+            node = self.store.get_node(edge.from_id)
+            if node is not None and node.type not in {"SourceArtifact", "File"}:
+                candidates.append(node)
+        candidates.sort(key=lambda node: (node.type, node.id))
+        return candidates[0] if candidates else None
+
+    def _finding_payload(self, finding: MemoryNode, symbol: MemoryNode | None) -> dict[str, Any]:
+        props = finding.properties
+        return {
+            "id": finding.id,
+            "status": finding.status,
+            "finding_type": props.get("finding_type"),
+            "severity": props.get("severity"),
+            "reason": props.get("reason") or finding.text,
+            "confidence": props.get("confidence", finding.confidence),
+            "cleanup_priority": props.get("cleanup_priority"),
+            "cleanup_rank": props.get("cleanup_rank"),
+            "removal_safety": props.get("removal_safety"),
+            "symbol": {
+                "id": symbol.id if symbol else props.get("symbol_id"),
+                "type": symbol.type if symbol else props.get("symbol_type"),
+                "name": props.get("symbol_name") or (symbol.properties.get("name") if symbol else None),
+                "qualified_name": props.get("qualified_name") or (symbol.properties.get("qualified_name") if symbol else None),
+            },
+            "location": _location_payload(props),
+        }
+
+    def _finding_minimal_snippet(self, finding: MemoryNode, symbol: MemoryNode | None) -> dict[str, Any]:
+        source = self._finding_source_fragment(finding, symbol)
+        if source is None:
+            props = finding.properties
+            return {
+                **_location_payload(props),
+                "source_node_id": None,
+                "text": _compact_text(str(finding.text or props.get("reason") or ""), max_chars=800),
+                "truncated": len(str(finding.text or props.get("reason") or "")) > 800,
+            }
+        text = str(source.text or "")
+        return {
+            **_location_payload(source.properties),
+            "source_node_id": source.id,
+            "text": _compact_text(text, max_chars=800),
+            "truncated": len(text) > 800,
+        }
+
+    def _finding_source_fragment(self, finding: MemoryNode, symbol: MemoryNode | None) -> MemoryNode | None:
+        if symbol is not None:
+            linked: list[MemoryNode] = []
+            for edge in self.store.all_edges():
+                if edge.type != "EVIDENCED_BY" or edge.from_id != symbol.id:
+                    continue
+                node = self.store.get_node(edge.to_id)
+                if node is not None and node.type == "SourceFragment":
+                    linked.append(node)
+            if linked:
+                linked.sort(key=_source_fragment_sort_key)
+                return linked[0]
+
+        props = finding.properties
+        relative_path = props.get("relative_path")
+        artifact_id = props.get("artifact_id")
+        line_start = _safe_int(props.get("line_start"))
+        candidates = []
+        for node in self.store.all_nodes():
+            if node.type != "SourceFragment" or node.status not in ACTIVE_STATUSES:
+                continue
+            node_props = node.properties
+            if artifact_id and node_props.get("artifact_id") != artifact_id:
+                continue
+            if relative_path and node_props.get("relative_path") != relative_path:
+                continue
+            if line_start is not None and not _line_in_span(line_start, node_props):
+                continue
+            candidates.append(node)
+        candidates.sort(key=_source_fragment_sort_key)
+        return candidates[0] if candidates else None
+
+    def _finding_usage_edges(self, symbol: MemoryNode) -> list[dict[str, Any]]:
+        rows: list[dict[str, Any]] = []
+        for edge in self.store.all_edges():
+            if edge.type not in _VERIFY_FINDING_USAGE_EDGE_TYPES:
+                continue
+            if edge.from_id != symbol.id and edge.to_id != symbol.id:
+                continue
+            direction = "outgoing" if edge.from_id == symbol.id else "incoming"
+            other_id = edge.to_id if direction == "outgoing" else edge.from_id
+            other = self.store.get_node(other_id)
+            rows.append(
+                {
+                    "edge_id": edge.id,
+                    "edge_type": edge.type,
+                    "direction": direction,
+                    "meaning": "symbol_uses_target" if direction == "outgoing" else "source_uses_symbol",
+                    "other_id": other_id,
+                    "other_type": other.type if other else None,
+                    "other_label": other.label if other else None,
+                    "location": _location_payload(edge.properties),
+                    "evidence": edge.properties.get("evidence"),
+                }
+            )
+        rows.sort(key=lambda row: (str(row.get("direction")), str(row.get("edge_type")), str(row.get("other_id")), str(row.get("edge_id"))))
+        return rows
+
+    def _finding_scopes(self, finding: MemoryNode, symbol: MemoryNode | None, uses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        props = finding.properties
+        scopes = [
+            {
+                "scope": "finding",
+                "finding_id": finding.id,
+                "status": finding.status,
+                "finding_type": props.get("finding_type"),
+            },
+            {
+                "scope": "artifact",
+                "artifact_id": props.get("artifact_id"),
+                "relative_path": props.get("relative_path"),
+                "context_scope": props.get("context_scope"),
+                "evidence_scope": props.get("evidence_scope"),
+            },
+            {
+                "scope": "symbol",
+                "symbol_id": symbol.id if symbol else props.get("symbol_id"),
+                "symbol_type": symbol.type if symbol else props.get("symbol_type"),
+                "qualified_name": props.get("qualified_name") or (symbol.properties.get("qualified_name") if symbol else None),
+            },
+            {
+                "scope": "usage_edges",
+                "checked_edge_types": sorted({item["edge_type"] for item in uses} | _VERIFY_FINDING_USAGE_EDGE_TYPES),
+                "found": len(uses),
+                "incoming_found": sum(1 for item in uses if item.get("direction") == "incoming"),
+            },
+        ]
+        return scopes
+
+    def _finding_risks(self, finding: MemoryNode, uses: list[dict[str, Any]]) -> list[str]:
+        props = finding.properties
+        risks: list[str] = []
+        if finding.status != "active":
+            risks.append(f"finding_status_{finding.status}")
+        risks.extend(str(item) for item in props.get("blocking_signals") or [])
+        if any(item.get("direction") == "incoming" for item in uses):
+            risks.append("deterministic_incoming_usage_edges_present")
+        removal_safety = str(props.get("removal_safety") or "")
+        if removal_safety in {"validate", "risky"}:
+            risks.append(f"removal_safety_{removal_safety}")
+        validation_reason = props.get("validation_reason")
+        if validation_reason:
+            risks.append(str(validation_reason))
+        return list(dict.fromkeys(risks))
+
+    def _finding_recommended_action(self, finding: MemoryNode, uses: list[dict[str, Any]], risks: list[str]) -> str:
+        props = finding.properties
+        symbol = props.get("symbol_name") or props.get("qualified_name") or finding.label or finding.id
+        path = props.get("relative_path") or "the reported artifact"
+        if finding.status != "active":
+            return f"No cleanup action: `{symbol}` finding is {finding.status}; refresh findings before editing."
+        if any(item.get("direction") == "incoming" for item in uses):
+            return f"Do not remove `{symbol}` automatically; review the deterministic incoming usage edges first."
+        safety = str(props.get("removal_safety") or "validate")
+        if safety == "safe" and not risks:
+            return f"Remove `{symbol}` in `{path}`, then rerun project compile and tests."
+        if safety == "safe":
+            return f"Remove `{symbol}` in `{path}` only after checking the listed risks, then rerun project compile and tests."
+        if safety == "validate":
+            return f"Validate `{symbol}` against the listed scope and risks before removal; if clear, edit `{path}` and rerun project compile and tests."
+        return f"Treat `{symbol}` as a review item; keep it unless manual validation clears the listed risks."
+
 
 # ----------------------------------------------------------------------
 # Condition evaluation and projection helpers
@@ -778,6 +1009,50 @@ def _sort_value(field: str, value: Any) -> Any:
     if _strip_default_alias(field, "node") == "cleanup_priority":
         return {"high": 3, "medium": 2, "low": 1}.get(str(value).casefold(), 0)
     return value
+
+
+def _location_payload(properties: Any) -> dict[str, Any]:
+    if not isinstance(properties, dict):
+        return {"relative_path": None, "line_start": None, "line_end": None, "artifact_id": None}
+    metadata = properties.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    return {
+        "relative_path": properties.get("relative_path") or properties.get("source_file") or metadata.get("relative_path") or metadata.get("source_file") or metadata.get("source_path"),
+        "line_start": properties.get("line_start", properties.get("start_line", metadata.get("line_start", metadata.get("start_line")))),
+        "line_end": properties.get("line_end", properties.get("end_line", metadata.get("line_end", metadata.get("end_line")))),
+        "artifact_id": properties.get("artifact_id") or metadata.get("artifact_id"),
+    }
+
+
+def _safe_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _line_in_span(line: int, properties: dict[str, Any]) -> bool:
+    start = _safe_int(properties.get("line_start", properties.get("start_line")))
+    end = _safe_int(properties.get("line_end", properties.get("end_line")))
+    if start is None:
+        return False
+    if end is None:
+        end = start
+    return start <= line <= end
+
+
+def _source_fragment_sort_key(node: MemoryNode) -> tuple[int, int, str]:
+    props = node.properties
+    start = _safe_int(props.get("line_start", props.get("start_line"))) or 0
+    end = _safe_int(props.get("line_end", props.get("end_line"))) or start
+    return (max(end - start, 0), start, node.id)
+
+
+def _compact_text(text: str, *, max_chars: int) -> str:
+    normalized = text.strip()
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[: max_chars - 3].rstrip() + "..."
 
 
 def evaluate_condition(condition: Condition, row: dict[str, Any], *, default_alias: str | None = None) -> bool:

@@ -1,15 +1,17 @@
 """Block-file backed property graph storage adapter.
 
 The store keeps graph indexes in memory for deterministic local operations and
-persists the graph as fixed-size compressed pages. Records for a node and its
-ordinary neighborhood are packed close together; high-degree nodes spill their
+persists the graph as fixed-size pages. Records for a node and its ordinary
+neighborhood are packed close together; high-degree nodes spill their
 relationships into dedicated dense-edge records so node pages stay small.
 """
 from __future__ import annotations
 
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
+from dataclasses import replace
 import hashlib
+import mmap
 import os
 from pathlib import Path
 import json
@@ -21,13 +23,13 @@ import threading
 import time
 import uuid
 import zlib
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterable, Iterator, Sequence
 
 from ...domain.constants import ACTIVE_STATUSES
 from ...domain.exceptions import StorageError
-from ...domain.models import MemoryEdge, MemoryNode
+from ...domain.models import MemoryEdge, MemoryNode, copy_memory_payload
 from ...domain.timeutils import utcnow_iso
-from ...extraction.normalization import keyword_scores, tokenize
+from ...extraction.normalization import keyword_scores, token_signal_score, tokenize
 
 SCHEMA_VERSION = 2
 DEFAULT_BLOCK_SIZE = 64 * 1024
@@ -64,7 +66,6 @@ _BINARY_KIND_TO_ID = {
 }
 _BINARY_ID_TO_KIND = {value: key for key, value in _BINARY_KIND_TO_ID.items()}
 _NULL_STRING_LENGTH = 0xFFFFFFFF
-_BINARY_COMPRESSION_THRESHOLD = 512
 _WAL_MAGIC = b"RQLWAL02"
 _WAL_FRAME_HEADER = struct.Struct("<I32s")
 _EncodedRecord = tuple[dict[str, Any], bytes]
@@ -683,19 +684,12 @@ def _encode_record(record: dict[str, Any]) -> bytes:
         raise StorageError(f"Unsupported REQL record kind: {kind}")
     value = record.get("value", {})
     if kind == "node":
-        payload = _encode_node_payload(dict(value))
+        payload = _encode_node_payload(value)
     elif kind in {"edge", "dense_edge"}:
-        payload = _encode_edge_payload(dict(value))
+        payload = _encode_edge_payload(value)
     else:
         payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    flags = 0
-    body = payload
-    if len(payload) >= _BINARY_COMPRESSION_THRESHOLD:
-        compressed = zlib.compress(payload)
-        if len(compressed) < len(payload):
-            body = compressed
-            flags |= _BINARY_FLAG_COMPRESSED
-    return _BINARY_RECORD_HEADER.pack(_BINARY_RECORD_MAGIC, _BINARY_RECORD_VERSION, kind_id, flags) + body
+    return _BINARY_RECORD_HEADER.pack(_BINARY_RECORD_MAGIC, _BINARY_RECORD_VERSION, kind_id, 0) + payload
 
 
 def _encode_record_parts(payload: bytes, *, max_payload_size: int) -> list[bytes]:
@@ -733,7 +727,7 @@ def _decode_record_part(payload: bytes) -> dict[str, Any]:
 def _decode_record_parts(parts: Sequence[dict[str, Any]]) -> tuple[dict[str, Any], int, bool]:
     if not parts:
         raise StorageError("Missing REQL record parts")
-    values = [dict(part.get("value", {})) for part in parts]
+    values = [part.get("value", {}) for part in parts]
     total_parts = int(values[0].get("total_parts", 0))
     checksum = values[0].get("checksum")
     if total_parts != len(values):
@@ -784,7 +778,7 @@ class BlockGraphStore:
 
     The file format is intentionally dependency-light: every block is exactly
     ``block_size`` bytes and contains length-prefixed binary records with
-    selective compression. The adapter rebuilds in-memory indexes on open, so
+        binary records. The adapter rebuilds in-memory indexes on open, so
     routine graph operations do not require a database engine.
     """
 
@@ -821,6 +815,8 @@ class BlockGraphStore:
         self._root_index: dict[str, Any] = {}
         self._space_map: dict[str, Any] = {}
         self._pending_wal_records: list[dict[str, Any]] = []
+        self._data_mmap: mmap.mmap | None = None
+        self._data_mmap_file: Any | None = None
 
         self._nodes: dict[str, MemoryNode] = {}
         self._edges: dict[str, MemoryEdge] = {}
@@ -832,6 +828,8 @@ class BlockGraphStore:
         self._out_edges: dict[str, set[str]] = defaultdict(set)
         self._in_edges: dict[str, set[str]] = defaultdict(set)
         self._node_terms: dict[str, dict[str, float]] = defaultdict(dict)
+        self._node_term_index: dict[str, set[str]] = {}
+        self._node_lexical_fingerprints: dict[str, tuple[str, ...]] = {}
         self._node_type_index: dict[tuple[str], set[str]] = defaultdict(set)
         self._node_status_index: dict[tuple[str], set[str]] = defaultdict(set)
         self._edge_type_index: dict[tuple[str], set[str]] = defaultdict(set)
@@ -876,10 +874,12 @@ class BlockGraphStore:
                 self._append_wal_records(self._pending_wal_records)
                 self._pending_wal_records = []
         finally:
+            self._close_mmap()
             self._release_lock()
             self._closed = True
 
     def _release_lock(self) -> None:
+        self._close_mmap()
         if self._lock is not None:
             self._lock.release()
             self._lock = None
@@ -1069,6 +1069,8 @@ class BlockGraphStore:
             "out_edges": {key: set(values) for key, values in self._out_edges.items()},
             "in_edges": {key: set(values) for key, values in self._in_edges.items()},
             "node_terms": {term: dict(postings) for term, postings in self._node_terms.items()},
+            "node_term_index": {node_id: set(terms) for node_id, terms in self._node_term_index.items()},
+            "node_lexical_fingerprints": dict(self._node_lexical_fingerprints),
             "node_type_index": {key: set(values) for key, values in self._node_type_index.items()},
             "node_status_index": {key: set(values) for key, values in self._node_status_index.items()},
             "edge_type_index": {key: set(values) for key, values in self._edge_type_index.items()},
@@ -1098,6 +1100,8 @@ class BlockGraphStore:
         self._out_edges = defaultdict(set, snapshot["out_edges"])
         self._in_edges = defaultdict(set, snapshot["in_edges"])
         self._node_terms = defaultdict(dict, {term: dict(postings) for term, postings in snapshot["node_terms"].items()})
+        self._node_term_index = {node_id: set(terms) for node_id, terms in snapshot["node_term_index"].items()}
+        self._node_lexical_fingerprints = dict(snapshot.get("node_lexical_fingerprints", {}))
         self._node_type_index = defaultdict(set, snapshot["node_type_index"])
         self._node_status_index = defaultdict(set, snapshot["node_status_index"])
         self._edge_type_index = defaultdict(set, snapshot["edge_type_index"])
@@ -1184,11 +1188,11 @@ class BlockGraphStore:
 
     @staticmethod
     def _clone_node(node: MemoryNode) -> MemoryNode:
-        return MemoryNode.from_dict(node.to_dict())
+        return replace(node, properties=copy_memory_payload(node.properties))
 
     @staticmethod
     def _clone_edge(edge: MemoryEdge) -> MemoryEdge:
-        return MemoryEdge.from_dict(edge.to_dict())
+        return replace(edge, properties=copy_memory_payload(edge.properties))
 
     def _load(self) -> None:
         self._nodes.clear()
@@ -1198,6 +1202,7 @@ class BlockGraphStore:
         self._loaded_all_records = False
         self._operation_log.clear()
         self._usage_by_node.clear()
+        self._node_lexical_fingerprints.clear()
         self._root_index = {}
         self._space_map = {}
         self._pending_wal_records = []
@@ -1247,6 +1252,7 @@ class BlockGraphStore:
         self._generation_id = int(manifest["generation_id"])
         self._root_index_offset = int(manifest["root_index_offset"])
         self._data_offset = int(manifest.get("data_offset", self.block_size))
+        self._open_mmap()
         self._load_root_index()
 
     def _validate_manifest(self, manifest: dict[str, Any], file_size: int) -> None:
@@ -1308,6 +1314,20 @@ class BlockGraphStore:
 
     def _validate_data_checksum(self, data_offset: int, expected: str) -> None:
         digest = hashlib.sha256()
+        if self._data_mmap is not None:
+            view = memoryview(self._data_mmap)
+            try:
+                for offset in range(data_offset, len(view), 1024 * 1024):
+                    chunk = view[offset : offset + 1024 * 1024]
+                    try:
+                        digest.update(chunk)
+                    finally:
+                        chunk.release()
+            finally:
+                view.release()
+            if digest.hexdigest() != expected:
+                raise StorageError(f"Invalid REQL data checksum for {self.path}")
+            return
         with self.path.open("rb") as fh:
             fh.seek(data_offset)
             while True:
@@ -1426,13 +1446,15 @@ class BlockGraphStore:
         if not records:
             return
         needs_header = not self._wal_path.exists() or self._wal_path.stat().st_size == 0
+        encode_record = _encode_record
+        frame_header_pack = _WAL_FRAME_HEADER.pack
+        sha256 = hashlib.sha256
         with self._wal_path.open("ab") as fh:
             if needs_header:
                 fh.write(_WAL_MAGIC)
             for record in records:
-                payload = _encode_record(record)
-                fh.write(_WAL_FRAME_HEADER.pack(len(payload), hashlib.sha256(payload).digest()))
-                fh.write(payload)
+                payload = encode_record(record)
+                fh.write(frame_header_pack(len(payload), sha256(payload).digest()) + payload)
             fh.flush()
             os.fsync(fh.fileno())
 
@@ -1606,17 +1628,48 @@ class BlockGraphStore:
                 frames += 1
         return {"path": str(self._wal_path), "exists": True, "frames": frames, "bytes": size, "valid": True}
 
+    def _open_mmap(self) -> None:
+        self._close_mmap()
+        if not self.path.exists():
+            return
+        file_size = self.path.stat().st_size
+        if file_size <= 0:
+            return
+        fh = self.path.open("rb")
+        try:
+            self._data_mmap = mmap.mmap(fh.fileno(), 0, access=mmap.ACCESS_READ)
+        except (OSError, ValueError):
+            fh.close()
+            self._data_mmap = None
+            self._data_mmap_file = None
+            return
+        self._data_mmap_file = fh
+
+    def _close_mmap(self) -> None:
+        mapping = self._data_mmap
+        self._data_mmap = None
+        if mapping is not None:
+            mapping.close()
+        fh = self._data_mmap_file
+        self._data_mmap_file = None
+        if fh is not None:
+            fh.close()
+
     def _read_block(self, block_id: int, *, data_offset: int | None = None) -> bytes:
-        cached = self._page_cache.get(block_id)
+        offset = (data_offset if data_offset is not None else self._data_offset) + (block_id * self.block_size)
+        cache_key = offset // self.block_size
+        cached = self._page_cache.get(cache_key)
         if cached is not None:
             return cached
-        offset = (data_offset if data_offset is not None else self._data_offset) + (block_id * self.block_size)
-        with self.path.open("rb") as fh:
-            fh.seek(offset)
-            page = fh.read(self.block_size)
+        if self._data_mmap is not None and offset >= 0 and offset + self.block_size <= len(self._data_mmap):
+            page = self._data_mmap[offset : offset + self.block_size]
+        else:
+            with self.path.open("rb") as fh:
+                fh.seek(offset)
+                page = fh.read(self.block_size)
         if len(page) != self.block_size:
             raise StorageError(f"Cannot read complete block {block_id} from {self.path}")
-        self._page_cache.put(block_id, page)
+        self._page_cache.put(cache_key, page)
         return page
 
     def _load_root_index(self) -> None:
@@ -1750,18 +1803,20 @@ class BlockGraphStore:
                 "record_codec": "binary-v2",
             }
         )
-        base_records = self._ordered_records()
-        base_encoded = self._encode_records(base_records)
+        base_encoded = self._encode_records(self._ordered_records())
         generation_id = self._generation_id + 1
         blocks, locations, space_map = self._pack_blocks(base_encoded)
         root_index = self._build_root_index(locations=locations, space_map=space_map, generation_id=generation_id)
         root_record = {"kind": "root_index", "value": root_index}
-        records = [*base_encoded, (root_record, _encode_record(root_record))]
+        records = base_encoded
+        records.append((root_record, _encode_record(root_record)))
         blocks, locations, space_map = self._pack_blocks(records)
         root_index = self._build_root_index(locations=locations, space_map=space_map, generation_id=generation_id)
         root_record = {"kind": "root_index", "value": root_index}
-        records[-1] = (root_record, _encode_record(root_record))
-        blocks, locations, space_map = self._pack_blocks(records)
+        root_payload = _encode_record(root_record)
+        if root_payload != records[-1][1]:
+            records[-1] = (root_record, root_payload)
+            blocks, locations, space_map = self._pack_blocks(records)
         root_location = locations.get("root_index", {}).get("root_index")
         root_index_offset = self.block_size
         if root_location:
@@ -1769,7 +1824,8 @@ class BlockGraphStore:
         self._root_index = root_index
         self._space_map = space_map
         self._data_offset = self.block_size
-        data_checksum = self._checksum_data_region(blocks)
+        data_pages = list(self._iter_data_pages(blocks))
+        data_checksum = self._checksum_data_pages(data_pages)
         self._manifest = self._build_manifest(
             data_checksum=data_checksum,
             data_block_count=len(blocks),
@@ -1781,13 +1837,15 @@ class BlockGraphStore:
         self._root_index_offset = root_index_offset
         superblock = self._pack_superblock(self._manifest)
         tmp = self.path.with_name(f"{self.path.name}.tmp")
+        self._close_mmap()
         with tmp.open("wb") as fh:
             fh.write(superblock)
-            self._write_data_region(fh, blocks)
+            self._write_data_pages(fh, data_pages)
         tmp.replace(self.path)
         if self._wal_path.exists():
             self._wal_path.unlink()
         self._page_cache.clear()
+        self._open_mmap()
         self._pending_wal_records = []
         self._dirty = False
 
@@ -1803,14 +1861,14 @@ class BlockGraphStore:
             )
             yield header + body + (b"\x00" * (self.block_size - _HEADER_SIZE - len(body)))
 
-    def _checksum_data_region(self, blocks: Sequence[bytes]) -> str:
+    def _checksum_data_pages(self, pages: Sequence[bytes]) -> str:
         digest = hashlib.sha256()
-        for page in self._iter_data_pages(blocks):
+        for page in pages:
             digest.update(page)
         return digest.hexdigest()
 
-    def _write_data_region(self, fh: Any, blocks: Sequence[bytes]) -> None:
-        for page in self._iter_data_pages(blocks):
+    def _write_data_pages(self, fh: Any, pages: Sequence[bytes]) -> None:
+        for page in pages:
             fh.write(page)
 
     def _build_manifest(
@@ -1852,8 +1910,8 @@ class BlockGraphStore:
         )
         return header + manifest_bytes + (b"\x00" * (self.block_size - len(header) - len(manifest_bytes)))
 
-    def _ordered_records(self) -> list[dict[str, Any]]:
-        records: list[dict[str, Any]] = [{"kind": "meta", "value": dict(self._meta)}]
+    def _ordered_records(self) -> Iterator[dict[str, Any]]:
+        yield {"kind": "meta", "value": dict(self._meta)}
         written_edges: set[str] = set()
         dense_nodes = {
             node_id
@@ -1861,7 +1919,7 @@ class BlockGraphStore:
             if len(self._out_edges.get(node_id, set()) | self._in_edges.get(node_id, set())) >= self.dense_node_threshold
         }
         for node in sorted(self._nodes.values(), key=lambda item: (item.type, item.created_at, item.id)):
-            records.append({"kind": "node", "value": node.to_dict()})
+            yield {"kind": "node", "value": node.to_dict(copy_properties=False)}
             if node.id in dense_nodes:
                 continue
             local_edges = self._out_edges.get(node.id, set()) | self._in_edges.get(node.id, set())
@@ -1873,18 +1931,17 @@ class BlockGraphStore:
                     continue
                 if edge.from_id in dense_nodes or edge.to_id in dense_nodes:
                     continue
-                records.append({"kind": "edge", "value": edge.to_dict()})
+                yield {"kind": "edge", "value": edge.to_dict(copy_properties=False)}
                 written_edges.add(edge_id)
         for edge in sorted(self._edges.values(), key=lambda item: (item.from_id, item.to_id, item.type, item.id)):
             if edge.id in written_edges:
                 continue
-            records.append({"kind": "dense_edge", "value": edge.to_dict()})
+            yield {"kind": "dense_edge", "value": edge.to_dict(copy_properties=False)}
             written_edges.add(edge.id)
         for item in self._operation_log:
-            records.append({"kind": "operation", "value": dict(item)})
-        return records
+            yield {"kind": "operation", "value": dict(item)}
 
-    def _encode_records(self, records: Sequence[dict[str, Any]]) -> list[_EncodedRecord]:
+    def _encode_records(self, records: Iterable[dict[str, Any]]) -> list[_EncodedRecord]:
         return [(record, _encode_record(record)) for record in records]
 
     def _pack_blocks(self, records: Sequence[_EncodedRecord]) -> tuple[list[bytes], dict[str, dict[str, dict[str, int]]], dict[str, Any]]:
@@ -1927,7 +1984,9 @@ class BlockGraphStore:
         frame_length: int,
     ) -> None:
         kind = str(record.get("kind", ""))
-        value = dict(record.get("value", {}))
+        value = record.get("value", {})
+        if not isinstance(value, dict):
+            return
         if kind == "root_index":
             record_id = "root_index"
         else:
@@ -2035,6 +2094,8 @@ class BlockGraphStore:
                 if isinstance(postings, dict):
                     node_terms[str(term)] = {str(node_id): float(weight) for node_id, weight in postings.items()}
         self._node_terms = defaultdict(dict, node_terms)
+        self._node_term_index = self._build_node_term_index()
+        self._node_lexical_fingerprints = {}
 
     def _rebuild_indexes(self) -> None:
         self._node_key_index = {}
@@ -2042,6 +2103,8 @@ class BlockGraphStore:
         self._out_edges = defaultdict(set)
         self._in_edges = defaultdict(set)
         self._node_terms = defaultdict(dict)
+        self._node_term_index = {}
+        self._node_lexical_fingerprints = {}
         self._node_type_index = defaultdict(set)
         self._node_status_index = defaultdict(set)
         self._edge_type_index = defaultdict(set)
@@ -2052,13 +2115,31 @@ class BlockGraphStore:
         for edge in self._edges.values():
             self._index_edge(edge)
 
+    def _build_node_term_index(self) -> dict[str, set[str]]:
+        node_term_index: dict[str, set[str]] = defaultdict(set)
+        for term, postings in self._node_terms.items():
+            for node_id in postings:
+                node_term_index[node_id].add(term)
+        return dict(node_term_index)
+
     def _replace_node(self, node: MemoryNode) -> None:
         self._journal_node_before_change(node.id)
         old = self._nodes.get(node.id)
         if old:
-            self._remove_node_indexes(old)
+            old_fingerprint = self._node_lexical_fingerprints.get(old.id)
+            if old_fingerprint is None:
+                old_fingerprint = self._node_lexical_fingerprint(old)
+            new_fingerprint = self._node_lexical_fingerprint(node)
+            lexical_changed = old_fingerprint != new_fingerprint
+            self._remove_node_structural_indexes(old)
+            if lexical_changed:
+                self._remove_terms(old)
         self._nodes[node.id] = node
-        self._index_node(node)
+        self._index_node_structural(node)
+        if old and not lexical_changed:
+            self._node_lexical_fingerprints[node.id] = new_fingerprint
+        else:
+            self._reindex_node_terms(node)
 
     def _replace_edge(self, edge: MemoryEdge) -> None:
         self._journal_edge_before_change(edge.id)
@@ -2083,13 +2164,16 @@ class BlockGraphStore:
         self._edge_locations.pop(edge_id, None)
 
     def _index_node(self, node: MemoryNode) -> None:
+        self._index_node_structural(node)
+        self._reindex_node_terms(node)
+
+    def _index_node_structural(self, node: MemoryNode) -> None:
         if node.canonical_key:
             self._node_key_index[(node.type, node.canonical_key)] = node.id
         self._node_type_index[(node.type,)].add(node.id)
         self._node_status_index[(node.status,)].add(node.id)
         for property_name, encoded in _scalar_property_items(node.properties, INDEXED_NODE_PROPERTIES):
             self._node_property_index[(property_name, encoded)].add(node.id)
-        self._reindex_node_terms(node)
 
     def _index_edge(self, edge: MemoryEdge) -> None:
         self._edge_pattern_index[(edge.from_id, edge.to_id, edge.type)] = edge.id
@@ -2100,13 +2184,16 @@ class BlockGraphStore:
             self._edge_property_index[(property_name, encoded)].add(edge.id)
 
     def _remove_node_indexes(self, node: MemoryNode) -> None:
+        self._remove_node_structural_indexes(node)
+        self._remove_terms(node)
+
+    def _remove_node_structural_indexes(self, node: MemoryNode) -> None:
         if node.canonical_key:
             self._node_key_index.pop((node.type, node.canonical_key), None)
         self._node_type_index[(node.type,)].discard(node.id)
         self._node_status_index[(node.status,)].discard(node.id)
         for property_name, encoded in _scalar_property_items(node.properties, INDEXED_NODE_PROPERTIES):
             self._node_property_index[(property_name, encoded)].discard(node.id)
-        self._remove_terms(node)
 
     def _remove_edge_indexes(self, edge: MemoryEdge) -> None:
         self._edge_pattern_index.pop((edge.from_id, edge.to_id, edge.type), None)
@@ -2117,15 +2204,17 @@ class BlockGraphStore:
             self._edge_property_index[(property_name, encoded)].discard(edge.id)
 
     def _remove_terms(self, node: MemoryNode) -> None:
-        empty_terms: list[str] = []
-        for term, postings in self._node_terms.items():
+        terms = self._node_term_index.pop(node.id, set())
+        self._node_lexical_fingerprints.pop(node.id, None)
+        for term in terms:
+            postings = self._node_terms.get(term)
+            if not postings:
+                continue
             postings.pop(node.id, None)
             if not postings:
-                empty_terms.append(term)
-        for term in empty_terms:
-            self._node_terms.pop(term, None)
+                self._node_terms.pop(term, None)
 
-    def _reindex_node_terms(self, node: MemoryNode) -> None:
+    def _node_lexical_texts(self, node: MemoryNode) -> list[str]:
         index_texts = [node.type, node.label or "", node.canonical_key or ""]
         remaining = DEFAULT_LEXICAL_TEXT_BUDGET
         text = node.text or ""
@@ -2144,16 +2233,30 @@ class BlockGraphStore:
                         text_item = str(item)
                         index_texts.append(text_item[:remaining] if remaining else text_item[:128])
                         remaining = max(0, remaining - len(text_item))
+        return index_texts
+
+    def _node_lexical_fingerprint(self, node: MemoryNode) -> tuple[str, ...]:
+        return tuple(self._node_lexical_texts(node))
+
+    def _reindex_node_terms(self, node: MemoryNode) -> None:
+        index_texts = self._node_lexical_texts(node)
+        node_terms: set[str] = set()
         for term, score in keyword_scores(" ".join(index_texts), max_terms=80):
             self._node_terms[term][node.id] = float(score)
+            node_terms.add(term)
+        self._node_lexical_fingerprints[node.id] = tuple(index_texts)
+        if node_terms:
+            self._node_term_index[node.id] = node_terms
+        else:
+            self._node_term_index.pop(node.id, None)
 
-    def upsert_node(self, node: MemoryNode) -> tuple[MemoryNode, bool]:
+    def upsert_node(self, node: MemoryNode, *, return_clone: bool = True) -> tuple[MemoryNode, bool]:
         self._ensure_writable()
-        stored, created, record = self._prepare_node_upsert(node)
+        stored, created, record = self._prepare_node_upsert(node, return_clone=return_clone)
         self._commit(record)
         return stored, created
 
-    def _prepare_node_upsert(self, node: MemoryNode) -> tuple[MemoryNode, bool, dict[str, Any] | None]:
+    def _prepare_node_upsert(self, node: MemoryNode, *, return_clone: bool = True) -> tuple[MemoryNode, bool, dict[str, Any] | None]:
         now = utcnow_iso()
         node = self._clone_node(node)
         node.updated_at = now
@@ -2166,21 +2269,21 @@ class BlockGraphStore:
         if existing:
             merged = self._merge_nodes(existing, node)
             if _nodes_equivalent(existing, merged):
-                return self._clone_node(existing), False, None
+                return (self._clone_node(existing) if return_clone else existing), False, None
             self._replace_node(merged)
-            return self._clone_node(merged), False, {"kind": "node", "value": merged.to_dict()}
+            return (self._clone_node(merged) if return_clone else merged), False, {"kind": "node", "value": merged.to_dict()}
         self._replace_node(node)
-        return self._clone_node(node), True, {"kind": "node", "value": node.to_dict()}
+        return (self._clone_node(node) if return_clone else node), True, {"kind": "node", "value": node.to_dict()}
 
-    def batch_upsert_nodes(self, nodes: Sequence[MemoryNode]) -> list[tuple[MemoryNode, bool]]:
+    def batch_upsert_nodes(self, nodes: Sequence[MemoryNode], *, return_clones: bool = True) -> list[tuple[MemoryNode, bool]]:
         if self._transaction_depth == 0:
             with self.transaction():
-                return self.batch_upsert_nodes(nodes)
+                return self.batch_upsert_nodes(nodes, return_clones=return_clones)
         results: list[tuple[MemoryNode, bool]] = []
         records: list[dict[str, Any]] = []
         self._ensure_writable()
         for node in nodes:
-            stored, created, record = self._prepare_node_upsert(node)
+            stored, created, record = self._prepare_node_upsert(node, return_clone=return_clones)
             results.append((stored, created))
             if record is not None:
                 records.append(record)
@@ -2189,7 +2292,7 @@ class BlockGraphStore:
 
     def _merge_nodes(self, existing: MemoryNode, incoming: MemoryNode) -> MemoryNode:
         merged = self._clone_node(existing)
-        props = dict(merged.properties)
+        props = merged.properties
         props.update({key: value for key, value in incoming.properties.items() if value is not None})
         merged.label = incoming.label or merged.label
         merged.text = incoming.text or merged.text
@@ -2213,9 +2316,9 @@ class BlockGraphStore:
             merged.status = incoming.status
         return merged
 
-    def get_node(self, node_id: str) -> MemoryNode | None:
+    def get_node(self, node_id: str, *, clone: bool = True) -> MemoryNode | None:
         node = self._load_node_from_location(node_id) if node_id not in self._nodes else self._nodes.get(node_id)
-        return self._clone_node(node) if node else None
+        return self._clone_node(node) if node and clone else node
 
     def get_nodes(self, node_ids: Sequence[str]) -> list[MemoryNode]:
         out: list[MemoryNode] = []
@@ -2260,6 +2363,7 @@ class BlockGraphStore:
         type_: str | None = None,
         status: str | Sequence[str] | None = None,
         limit: int = 1000,
+        clone: bool = True,
     ) -> list[MemoryNode]:
         statuses = {status} if isinstance(status, str) else set(status or [])
         encoded = _property_value_key(value)
@@ -2273,7 +2377,8 @@ class BlockGraphStore:
             candidate_ids &= status_ids
         matches = [node for node_id in candidate_ids if (node := self._load_node_from_location(node_id)) is not None and node.properties.get(property_name) == value]
         matches.sort(key=lambda item: item.updated_at, reverse=True)
-        return [self._clone_node(node) for node in matches[:limit]]
+        limited = matches[:limit]
+        return [self._clone_node(node) for node in limited] if clone else limited
 
     def update_node_fields(self, node_id: str, **fields: Any) -> MemoryNode | None:
         self._ensure_writable()
@@ -2308,7 +2413,7 @@ class BlockGraphStore:
             node.updated_at = utcnow_iso()
             self._replace_node(node)
             self._commit({"kind": "node", "value": node.to_dict()})
-        return self.get_node(node_id)
+        return self._clone_node(node)
 
     def increment_node(self, node_id: str, **increments: float) -> MemoryNode | None:
         node = self.get_node(node_id)
@@ -2323,13 +2428,13 @@ class BlockGraphStore:
                 fields[key] = value + inc
         return self.update_node_fields(node_id, **fields)
 
-    def upsert_edge(self, edge: MemoryEdge) -> tuple[MemoryEdge, bool]:
+    def upsert_edge(self, edge: MemoryEdge, *, return_clone: bool = True) -> tuple[MemoryEdge, bool]:
         self._ensure_writable()
-        stored, created, record = self._prepare_edge_upsert(edge)
+        stored, created, record = self._prepare_edge_upsert(edge, return_clone=return_clone)
         self._commit(record)
         return stored, created
 
-    def _prepare_edge_upsert(self, edge: MemoryEdge) -> tuple[MemoryEdge, bool, dict[str, Any] | None]:
+    def _prepare_edge_upsert(self, edge: MemoryEdge, *, return_clone: bool = True) -> tuple[MemoryEdge, bool, dict[str, Any] | None]:
         if self._load_node_from_location(edge.from_id) is None or self._load_node_from_location(edge.to_id) is None:
             raise StorageError(f"Cannot create edge {edge.type} {edge.from_id}->{edge.to_id}: missing endpoint")
         now = utcnow_iso()
@@ -2340,30 +2445,52 @@ class BlockGraphStore:
         if existing:
             merged = self._merge_edges(existing, edge)
             if _edges_equivalent(existing, merged):
-                return self._clone_edge(existing), False, None
+                return (self._clone_edge(existing) if return_clone else existing), False, None
             self._replace_edge(merged)
-            return self._clone_edge(merged), False, {"kind": "edge", "value": merged.to_dict()}
+            return (self._clone_edge(merged) if return_clone else merged), False, {"kind": "edge", "value": merged.to_dict()}
         self._replace_edge(edge)
-        return self._clone_edge(edge), True, {"kind": "edge", "value": edge.to_dict()}
+        return (self._clone_edge(edge) if return_clone else edge), True, {"kind": "edge", "value": edge.to_dict()}
 
-    def batch_upsert_edges(self, edges: Sequence[MemoryEdge]) -> list[tuple[MemoryEdge, bool]]:
+    def batch_upsert_edges(self, edges: Sequence[MemoryEdge], *, return_clones: bool = True) -> list[tuple[MemoryEdge, bool]]:
         if self._transaction_depth == 0:
             with self.transaction():
-                return self.batch_upsert_edges(edges)
+                return self.batch_upsert_edges(edges, return_clones=return_clones)
         results: list[tuple[MemoryEdge, bool]] = []
         records: list[dict[str, Any]] = []
         self._ensure_writable()
         for edge in edges:
-            stored, created, record = self._prepare_edge_upsert(edge)
+            stored, created, record = self._prepare_edge_upsert(edge, return_clone=return_clones)
             results.append((stored, created))
             if record is not None:
                 records.append(record)
         self._commit_many(records)
         return results
 
+    def remove_node(self, node_id: str) -> bool:
+        if self._transaction_depth == 0:
+            with self.transaction():
+                return self.remove_node(node_id)
+        self._ensure_writable()
+        if self.get_node(node_id) is None:
+            return False
+        self._remove_node(node_id)
+        self._commit({"kind": "tombstone", "value": {"target_kind": "node", "id": node_id}})
+        return True
+
+    def remove_edge(self, edge_id: str) -> bool:
+        if self._transaction_depth == 0:
+            with self.transaction():
+                return self.remove_edge(edge_id)
+        self._ensure_writable()
+        if self.get_edge(edge_id) is None:
+            return False
+        self._remove_edge(edge_id)
+        self._commit({"kind": "tombstone", "value": {"target_kind": "edge", "id": edge_id}})
+        return True
+
     def _merge_edges(self, existing: MemoryEdge, incoming: MemoryEdge) -> MemoryEdge:
         merged = self._clone_edge(existing)
-        props = dict(merged.properties)
+        props = merged.properties
         props.update({key: value for key, value in incoming.properties.items() if value is not None})
         merged.weight = max(0.0, min(1.0, max(merged.weight, incoming.weight)))
         merged.confidence = max(0.0, min(1.0, (merged.confidence + incoming.confidence) / 2))
@@ -2375,9 +2502,9 @@ class BlockGraphStore:
         merged.updated_at = incoming.updated_at
         return merged
 
-    def get_edge(self, edge_id: str) -> MemoryEdge | None:
+    def get_edge(self, edge_id: str, *, clone: bool = True) -> MemoryEdge | None:
         edge = self._load_edge_from_location(edge_id) if edge_id not in self._edges else self._edges.get(edge_id)
-        return self._clone_edge(edge) if edge else None
+        return self._clone_edge(edge) if edge and clone else edge
 
     def get_edge_by_pattern(self, from_id: str, to_id: str, type_: str) -> MemoryEdge | None:
         edge_id = self._edge_pattern_index.get((from_id, to_id, type_))
@@ -2390,6 +2517,7 @@ class BlockGraphStore:
         to_id: str | None = None,
         type_: str | Sequence[str] | None = None,
         limit: int = 1000,
+        clone: bool = True,
     ) -> list[MemoryEdge]:
         types = {type_} if isinstance(type_, str) else set(type_ or [])
         if from_id is not None:
@@ -2413,7 +2541,8 @@ class BlockGraphStore:
             ):
                 edges.append(edge)
         edges.sort(key=lambda item: item.weight, reverse=True)
-        return [self._clone_edge(edge) for edge in edges[:limit]]
+        limited = edges[:limit]
+        return [self._clone_edge(edge) for edge in limited] if clone else limited
 
     def incident_edges(
         self,
@@ -2422,6 +2551,7 @@ class BlockGraphStore:
         edge_types: set[str] | None = None,
         ignored_edge_types: set[str] | None = None,
         limit: int = 10000,
+        clone: bool = True,
     ) -> list[MemoryEdge]:
         ids = set(node_ids)
         edge_ids: set[str] = set()
@@ -2436,7 +2566,8 @@ class BlockGraphStore:
             and (ignored_edge_types is None or edge.type not in ignored_edge_types)
         ]
         edges.sort(key=lambda item: (item.weight, item.updated_at), reverse=True)
-        return [self._clone_edge(edge) for edge in edges[:limit]]
+        limited = edges[:limit]
+        return [self._clone_edge(edge) for edge in limited] if clone else limited
 
     def find_edges_by_property(
         self,
@@ -2445,6 +2576,7 @@ class BlockGraphStore:
         *,
         type_: str | None = None,
         limit: int = 1000,
+        clone: bool = True,
     ) -> list[MemoryEdge]:
         encoded = _property_value_key(value)
         candidate_ids = set(self._edge_property_index.get((property_name, encoded), set())) if encoded is not None else set()
@@ -2452,7 +2584,8 @@ class BlockGraphStore:
             candidate_ids &= set(self._edge_type_index.get((type_,), set()))
         edges = [edge for edge_id in candidate_ids if (edge := self._load_edge_from_location(edge_id)) is not None and edge.properties.get(property_name) == value]
         edges.sort(key=lambda item: item.updated_at, reverse=True)
-        return [self._clone_edge(edge) for edge in edges[:limit]]
+        limited = edges[:limit]
+        return [self._clone_edge(edge) for edge in limited] if clone else limited
 
     def neighbors(
         self,
@@ -2551,7 +2684,7 @@ class BlockGraphStore:
             edge.updated_at = utcnow_iso()
             self._replace_edge(edge)
             self._commit({"kind": "edge", "value": edge.to_dict()})
-        return self.get_edge(edge_id)
+        return self._clone_edge(edge)
 
     def archive_nodes_by_artifact(
         self,
@@ -2617,18 +2750,22 @@ class BlockGraphStore:
         if not tokens:
             return []
         unique_terms = set(tokens)
+        query_terms: dict[str, float] = {term: 1.0 for term in unique_terms}
+        for a, b in zip(tokens, tokens[1:]):
+            if token_signal_score(a) >= 0.5 and token_signal_score(b) >= 0.5:
+                query_terms[f"{a} {b}"] = 1.35
         raw_by_node: dict[str, float] = defaultdict(float)
         matched_terms: dict[str, int] = defaultdict(int)
         node_count = max(1, len(self._nodes) + len(self._node_locations))
         max_idf = math.log1p(node_count)
-        for term in unique_terms:
+        for term, query_weight in query_terms.items():
             postings = self._node_terms.get(term, {})
             if not postings:
                 continue
             inverse_frequency = math.log1p(node_count / max(1, len(postings))) / max_idf
             term_weight = 0.20 + 0.80 * min(1.0, inverse_frequency)
             for node_id, weight in postings.items():
-                raw_by_node[node_id] += weight * term_weight
+                raw_by_node[node_id] += weight * term_weight * query_weight
                 matched_terms[node_id] += 1
         scored: list[tuple[MemoryNode, float]] = []
         for node_id, raw_score in raw_by_node.items():

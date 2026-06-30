@@ -9,7 +9,7 @@ from ..domain.models import MemoryEdge, MemoryNode
 from ..domain.timeutils import utcnow_iso
 from ..storage.graph_store import GraphStore
 from .context_scope import artifact_context_scope
-from .fingerprint import normalize_path, project_id
+from .fingerprint import normalize_path
 from .models import GraphRegistrationSummary, Project, ScanResult, SourceArtifact
 from .scanner import DEFAULT_MAX_FILE_SIZE_BYTES, ProjectScanner
 
@@ -40,7 +40,7 @@ class ProjectRegistry:
 
     def register_scan(self, result: ScanResult) -> GraphRegistrationSummary:
         summary = GraphRegistrationSummary()
-        project_node, project_created = self.store.upsert_node(_project_node(result.project))
+        project_node, project_created = self.store.upsert_node(_project_node(result.project), return_clone=False)
         summary.project_created = project_created
         seen_paths: set[str] = set()
 
@@ -159,9 +159,9 @@ class ProjectRegistry:
                 if part in {"", "."}:
                     continue
                 current_relative = f"{current_relative}/{part}".strip("/")
-                directory_node = self.store.get_node(directory_ids[current_relative]) if current_relative in directory_ids else None
+                directory_node = self.store.get_node(directory_ids[current_relative], clone=False) if current_relative in directory_ids else None
                 if directory_node is None:
-                    directory_node, directory_created = self.store.upsert_node(_directory_node(result.project, current_relative))
+                    directory_node, directory_created = self.store.upsert_node(_directory_node(result.project, current_relative), return_clone=False)
                     directory_ids[current_relative] = directory_node.id
                     if directory_created:
                         summary.artifacts_created += 1
@@ -178,7 +178,8 @@ class ProjectRegistry:
                         extractor="project_scanner",
                         evidence=current_relative,
                         properties={"project_id": result.project.id, "relative_path": current_relative, "target_kind": "directory"},
-                    )
+                    ),
+                    return_clone=False,
                 )
                 if edge_created:
                     summary.edges_created += 1
@@ -186,7 +187,7 @@ class ProjectRegistry:
                     summary.edges_updated += 1
                 parent_id = directory_node.id
 
-            file_node, file_created = self.store.upsert_node(_file_node(artifact))
+            file_node, file_created = self.store.upsert_node(_file_node(artifact), return_clone=False)
             if file_created:
                 summary.artifacts_created += 1
             else:
@@ -202,25 +203,26 @@ class ProjectRegistry:
                     extractor="project_scanner",
                     evidence=artifact.relative_path,
                     properties={"project_id": artifact.project_id, "artifact_id": artifact.id, "relative_path": artifact.relative_path, "target_kind": "file"},
-                )
+                ),
+                return_clone=False,
             )
             if edge_created:
                 summary.edges_created += 1
             else:
                 summary.edges_updated += 1
 
-            artifact_node, created = self.store.upsert_node(_artifact_node(artifact))
+            artifact_node, created = self.store.upsert_node(_artifact_node(artifact), return_clone=False)
             if created:
                 summary.artifacts_created += 1
             else:
                 summary.artifacts_updated += 1
-            _, edge_created = self.store.upsert_edge(_contains_edge(file_node.id, artifact_node.id, artifact.relative_path, artifact.project_id))
+            _, edge_created = self.store.upsert_edge(_contains_edge(file_node.id, artifact_node.id, artifact.relative_path, artifact.project_id), return_clone=False)
             if edge_created:
                 summary.edges_created += 1
             else:
                 summary.edges_updated += 1
             if artifact.relative_path.replace("\\", "/").endswith("/__init__.py") or artifact.relative_path == "__init__.py":
-                package_node, package_created = self.store.upsert_node(_package_node(artifact))
+                package_node, package_created = self.store.upsert_node(_package_node(artifact), return_clone=False)
                 if package_created:
                     summary.artifacts_created += 1
                 else:
@@ -236,7 +238,8 @@ class ProjectRegistry:
                         extractor="project_scanner",
                         evidence=artifact.relative_path,
                         properties={"project_id": artifact.project_id, "artifact_id": artifact.id, "relative_path": artifact.relative_path, "kind": "package"},
-                    )
+                    ),
+                    return_clone=False,
                 )
                 if edge_created:
                     summary.edges_created += 1
@@ -249,7 +252,7 @@ class ProjectRegistry:
         project = self.store.get_node_by_key("Project", root)
         if project is None:
             return None
-        artifacts = self.store.find_nodes_by_property("project_id", project.id, type_="SourceArtifact", limit=100000)
+        artifacts = self.store.find_nodes_by_property("project_id", project.id, type_="SourceArtifact", limit=100000, clone=False)
         counts_by_type: dict[str, int] = {}
         status_counts: dict[str, int] = {}
         for artifact in artifacts:
@@ -266,7 +269,7 @@ class ProjectRegistry:
     def _archive_missing(self, project: Project, seen_paths: set[str]) -> int:
         now = utcnow_iso()
         archived = 0
-        for node in self.store.find_nodes_by_property("project_id", project.id, type_="SourceArtifact", limit=100000):
+        for node in self.store.find_nodes_by_property("project_id", project.id, type_="SourceArtifact", limit=100000, clone=False):
             if node.properties.get("relative_path") in seen_paths:
                 continue
             if node.status in {"archived", "deleted"}:

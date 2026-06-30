@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,18 @@ from api.memory_graph import MemoryGraph
 DEFAULT_STORAGE_DIR = ".reql"
 DEFAULT_STORAGE_FILE = "memory.reql"
 DANGEROUS_EXCLUDE_PATTERNS = {"*", "**", "**/*", "/**", "/*", "/", ".", "./"}
+
+
+class _PromptInterrupted(Exception):
+    pass
+
+
+@dataclass(frozen=True)
+class _AgentCommandResolution:
+    platforms: tuple[str, ...]
+    project: bool
+    project_dir: Path
+    home_dir: Path | None
 
 
 class _SortedSubparserChoices(dict[str, argparse.ArgumentParser]):
@@ -51,6 +64,150 @@ def _print_compile_result(result: Any) -> None:
         print("Errors:")
         for error in run.errors:
             print(f"  {error}")
+
+
+def _available_disk_roots() -> list[str]:
+    if os.name == "nt":
+        roots = [f"{chr(letter)}:\\" for letter in range(ord("A"), ord("Z") + 1)]
+        return [root for root in roots if Path(root).exists()]
+
+    roots = ["/"]
+    for mount_parent in (Path("/mnt"), Path("/Volumes")):
+        try:
+            roots.extend(str(path) for path in mount_parent.iterdir() if path.is_dir())
+        except OSError:
+            continue
+    return list(dict.fromkeys(roots))
+
+
+def _no_agent_profiles_message() -> str:
+    disks = _available_disk_roots()
+    disk_text = ", ".join(disks) if disks else "none detected"
+    return (
+        "No supported coding-agent profiles were detected.\n"
+        f"Available disks: {disk_text}\n"
+        "Choose a platform and target explicitly, for example: "
+        "reql install codex --user"
+    )
+
+
+def _prompt_agent_target(available_platforms: str, *, action: str) -> tuple[list[str], Path] | None:
+    if not sys.stdin.isatty():
+        return None
+
+    from agents.install import detect_platforms
+
+    disks = _available_disk_roots()
+    print("No supported coding-agent profiles were detected.", file=sys.stderr)
+    if disks:
+        print("Available disks:", file=sys.stderr)
+        for index, disk in enumerate(disks, start=1):
+            print(f"  {index}. {disk}", file=sys.stderr)
+        raw_target = _read_stderr_prompt("Agent profile disk or path: ").strip()
+        if not raw_target:
+            print("No path selected.", file=sys.stderr)
+            return None
+        if raw_target.isdigit() and 1 <= int(raw_target) <= len(disks):
+            target = Path(disks[int(raw_target) - 1])
+            home_dir = _home_dir_for_disk(target.expanduser())
+        else:
+            target = Path(raw_target)
+            home_dir = _home_dir_for_agent_path(target.expanduser())
+    else:
+        raw_target = _read_stderr_prompt("Agent profile path: ").strip()
+        if not raw_target:
+            print("No path selected.", file=sys.stderr)
+            return None
+        target = Path(raw_target)
+        home_dir = _home_dir_for_agent_path(target.expanduser())
+
+    detected = list(detect_platforms(project=False, home_dir=home_dir))
+    if detected:
+        print(f"Detected platforms: {', '.join(detected)}", file=sys.stderr)
+        return detected, home_dir
+
+    print(f"No supported profiles found at {home_dir}.", file=sys.stderr)
+    print(f"Available platforms: {available_platforms}", file=sys.stderr)
+    platform = _read_stderr_prompt(f"Platform to {action}: ").strip()
+    if not platform:
+        print("No platform selected.", file=sys.stderr)
+        return None
+    return [platform], home_dir
+
+
+def _resolve_agent_command_target(args: argparse.Namespace, *, action: str) -> _AgentCommandResolution | None:
+    from agents.install import available_platforms_text, resolve_platforms
+
+    requested_platforms = [*args.platforms, *args.platform]
+    project = not args.user
+    project_dir = Path(args.project_dir)
+    home_dir = None
+    platforms = resolve_platforms(
+        requested_platforms,
+        install_all=args.all,
+        auto_detect=not requested_platforms and not args.all,
+        project=project,
+        project_dir=project_dir,
+    )
+    if not platforms:
+        prompted = None
+        if project and not requested_platforms and not args.all:
+            prompted = _prompt_agent_target(available_platforms_text(), action=action)
+        if prompted is not None:
+            prompted_platforms, home_dir = prompted
+            project = False
+            platforms = resolve_platforms(prompted_platforms)
+    if not platforms:
+        print(_no_agent_profiles_message(), file=sys.stderr)
+        return None
+    return _AgentCommandResolution(platforms=platforms, project=project, project_dir=project_dir, home_dir=home_dir)
+
+
+def _home_dir_for_agent_path(path: Path) -> Path:
+    resolved = path.resolve(strict=False) if path.is_absolute() else path
+    if path.is_absolute() and resolved == Path(resolved.anchor):
+        return _home_dir_for_disk(resolved)
+    if path.name == "skills" and path.parent.name in _AGENT_PROFILE_DIR_NAMES:
+        return path.parent.parent
+    if path.name in _AGENT_PROFILE_DIR_NAMES:
+        return path.parent
+    return path
+
+def _home_dir_for_disk(disk_root: Path) -> Path:
+    home = Path.home()
+    if not disk_root.is_absolute():
+        return home
+    try:
+        home_relative = home.relative_to(Path(home.anchor))
+    except ValueError:
+        return disk_root / home.name
+    return disk_root / home_relative
+
+
+_AGENT_PROFILE_DIR_NAMES = {
+    ".agents",
+    ".antigravity",
+    ".claude",
+    ".codex",
+    ".config",
+    ".copilot",
+    ".cursor",
+    ".gemini",
+    ".github",
+    ".hermes",
+    ".kilocode",
+    ".kimi",
+    ".openclaw",
+}
+
+
+def _read_stderr_prompt(prompt: str) -> str:
+    print(prompt, end="", file=sys.stderr, flush=True)
+    try:
+        return sys.stdin.readline().strip()
+    except KeyboardInterrupt as exc:
+        print(file=sys.stderr)
+        raise _PromptInterrupted from exc
 
 
 def _print_storage_inspection(payload: dict[str, Any]) -> None:
@@ -103,6 +260,182 @@ def _print_storage_compaction(payload: dict[str, Any]) -> None:
     print(f"Records: {payload['records_before']} -> {payload['records_after']}")
     print(f"Bytes: {payload['bytes_before']} -> {payload['bytes_after']}")
     print(f"Bytes reclaimed: {payload['bytes_reclaimed']}")
+
+
+def _print_agent_status(payload: dict[str, Any]) -> None:
+    print(f"Agent workspace: {'initialized' if payload['exists'] else 'not initialized'}")
+    print(f"Agent id: {payload.get('agent_id') or ''}")
+    print(f"Standard storage: {payload['standard_storage']}")
+    print(f"Agent storage: {payload['agent_storage']}")
+    print(f"Agent bus: {payload.get('bus_storage') or ''}")
+    if payload.get("initialized_at"):
+        print(f"Initialized at: {payload['initialized_at']}")
+    print(f"Nodes: {payload['nodes']}")
+    print(f"Relations: {payload['relations']}")
+    print(f"Derived nodes: {payload['derived_nodes']}")
+    print(f"Agent nodes: {payload['agent_nodes']}")
+    if payload.get("current_session_id"):
+        print(f"Current session: {payload['current_session_id']} ({payload.get('current_session_title') or ''})")
+
+
+def _print_agent_node(payload: dict[str, Any]) -> None:
+    node = payload.get("node") or payload.get("task") or payload
+    print(f"{node['id']}\t{node['type']}\t{node.get('status') or ''}\t{node.get('title') or node.get('content') or ''}")
+
+
+def _print_agent_list(payload: dict[str, Any]) -> None:
+    for node in payload.get("nodes", []):
+        print(f"{node['updated_at']}\t{node['id']}\t{node['type']}\t{node.get('status') or ''}\t{node.get('title') or ''}")
+    for edge in payload.get("relations", []):
+        print(f"{edge['updated_at']}\t{edge['id']}\t{edge['relation']}\t{edge['from_id']} -> {edge['to_id']}")
+
+
+def _print_agent_relations(payload: dict[str, Any]) -> None:
+    relations = payload.get("relations", [])
+    if not relations and "relation" in payload:
+        relations = [payload["relation"]]
+    for relation in relations:
+        print(f"{relation['id']}\t{relation['relation']}\t{relation['from_id']} -> {relation['to_id']}")
+
+
+def _print_agent_search(payload: dict[str, Any]) -> None:
+    for item in payload.get("results", []):
+        node = item["node"]
+        print(f"{float(item['score']):.3f}\t{node['id']}\t{node['type']}\t{node.get('status') or ''}\t{node.get('title') or ''}")
+
+
+def _print_agent_map(payload: dict[str, Any]) -> None:
+    filters = payload.get("filters") or {}
+    if filters:
+        print("Filters:")
+        for key, value in sorted(filters.items()):
+            print(f"  {key}: {value}")
+    sections = [
+        ("Open tasks", payload.get("open_tasks", [])),
+        ("Decisions", payload.get("decisions", [])),
+        ("Files", payload.get("files", [])),
+        ("Symbols", payload.get("symbols", [])),
+    ]
+    if "completed_tasks" in payload:
+        sections.insert(1, ("Completed tasks", payload.get("completed_tasks", [])))
+    for title, nodes in sections:
+        print(f"{title}:")
+        if not nodes:
+            print("  none")
+            continue
+        for node in nodes:
+            print(f"  {node['id']}\t{node.get('status') or ''}\t{node.get('title') or node.get('content') or ''}")
+    print("Relations:")
+    relations = payload.get("relations", [])
+    if not relations:
+        print("  none")
+    for edge in relations:
+        print(f"  {edge['id']}\t{edge['relation']}\t{edge['from_id']} -> {edge['to_id']}")
+
+
+def _print_agent_bus(payload: dict[str, Any]) -> None:
+    print(f"Agent bus: {payload.get('bus_storage') or ''}")
+    print(f"Current agent: {payload.get('current_agent_id') or 'none'}")
+    print("Agents:")
+    agents = payload.get("agents", [])
+    if not agents:
+        print("  none")
+    for agent in agents:
+        print(f"  {agent.get('agent_id') or ''}\t{agent.get('status') or ''}\t{agent.get('agent_storage') or ''}")
+    print("Messages:")
+    messages = payload.get("messages", [])
+    if not messages:
+        print("  none")
+    for message in messages:
+        print(f"  {message['updated_at']}\t{message.get('agent_id') or ''} -> {message.get('target_agent_id') or ''}\t{message.get('content') or ''}")
+    print("Handoffs:")
+    handoffs = payload.get("handoffs", [])
+    if not handoffs:
+        print("  none")
+    for handoff in handoffs:
+        print(f"  {handoff['updated_at']}\t{handoff.get('agent_id') or ''} -> {handoff.get('target_agent_id') or ''}\t{handoff.get('title') or ''}")
+
+
+def _load_agent_batch_file(path: str) -> list[dict[str, Any]]:
+    if path == "-":
+        raw = sys.stdin.read()
+        source = "<stdin>"
+    else:
+        source = path
+        raw = Path(path).read_text(encoding="utf-8")
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid agent batch JSON in {source}: {exc}") from exc
+    operations = payload.get("operations") if isinstance(payload, dict) else payload
+    if not isinstance(operations, list):
+        raise ValueError("Agent batch JSON must be an array or an object with an operations array")
+    for index, operation in enumerate(operations):
+        if not isinstance(operation, dict):
+            raise ValueError(f"Agent batch operation {index} must be an object")
+    return operations
+
+
+def _agent_batch_entry(value: str, *, op: str, text_key: str) -> dict[str, Any]:
+    text = value.strip()
+    if not text:
+        raise ValueError(f"Agent batch {op} text must not be empty")
+    operation: dict[str, Any] = {"op": op, text_key: text}
+    alias, content = _split_agent_batch_alias(text)
+    if alias is not None:
+        operation[text_key] = content
+        operation["as"] = alias
+    return operation
+
+
+def _split_agent_batch_alias(value: str) -> tuple[str | None, str]:
+    alias, separator, content = value.partition("=")
+    if not separator:
+        return None, value
+    alias = alias.strip()
+    content = content.strip()
+    if not alias or not content:
+        return None, value
+    if not (alias[0].isalpha() or alias[0] == "_"):
+        return None, value
+    if any(not (char.isalnum() or char in {"_", "-"}) for char in alias):
+        return None, value
+    return alias, content
+
+
+def _split_agent_batch_targets(value: str) -> list[str]:
+    targets = [item.strip() for item in value.split(",") if item.strip()]
+    if not targets:
+        raise ValueError("Agent batch link targets must not be empty")
+    return targets
+
+
+def _agent_batch_operations_from_args(args: argparse.Namespace) -> list[dict[str, Any]]:
+    operations: list[dict[str, Any]] = []
+    if getattr(args, "file", None):
+        operations.extend(_load_agent_batch_file(args.file))
+    for value in getattr(args, "note", []) or []:
+        operations.append(_agent_batch_entry(value, op="add", text_key="text"))
+    for value in getattr(args, "task", []) or []:
+        operations.append(_agent_batch_entry(value, op="task.add", text_key="description"))
+    for value in getattr(args, "decision", []) or []:
+        operations.append(_agent_batch_entry(value, op="decision.add", text_key="text"))
+    for value in getattr(args, "finding", []) or []:
+        operations.append(_agent_batch_entry(value, op="finding.add", text_key="text"))
+    for value in getattr(args, "done", []) or []:
+        task_id = value.strip()
+        if not task_id:
+            raise ValueError("Agent batch done id must not be empty")
+        operations.append({"op": "task.done", "id": task_id})
+    for from_id, relation, to_id in getattr(args, "link", []) or []:
+        operations.append({"op": "link", "from": from_id, "to": to_id, "relation": relation})
+    for from_id, relation, targets in getattr(args, "link_many", []) or []:
+        operations.append({"op": "link-many", "from": from_id, "to": _split_agent_batch_targets(targets), "relation": relation})
+    for from_id, targets in getattr(args, "touches", []) or []:
+        operations.append({"op": "link-many", "from": from_id, "to": _split_agent_batch_targets(targets), "relation": "touches"})
+    if not operations:
+        raise ValueError("Agent batch requires a JSON file or at least one inline operation")
+    return operations
 
 
 _READ_ONLY_COMMANDS = {"query_context", "query_explore", "query_graph", "query_memories", "query", "stats", "inspect"}
@@ -232,6 +565,7 @@ def _add_query_context_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--max-items", type=int, default=20, help="Maximum rendered context items")
     parser.add_argument("--include-archived", action="store_true", help="Include archived graph records")
     parser.add_argument("--cleanup", action="store_true", help="Return only cleanup findings matching the query")
+    parser.add_argument("--include-risky", action="store_true", help="In cleanup mode, include validate/risky and low-confidence findings")
     parser.add_argument("--code", action="store_true", help="Limit context to code symbols and source files")
     parser.add_argument("--docs", action="store_true", help="Limit context to documentation and imported document content")
     parser.add_argument("--test", action="store_true", help="Limit context to tests")
@@ -288,6 +622,15 @@ def _query_context_scopes_from_args(args: argparse.Namespace) -> list[str] | Non
 
 def _add_reql_statement_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("statement", nargs="*", help="REQL statement")
+    parser.add_argument("--json", action="store_true", help="Print structured JSON result")
+
+
+def _add_agent_filters(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--type", dest="node_type", default=None, help="Filter by agent node type")
+    parser.add_argument("--status", default=None, help="Filter by node status")
+    parser.add_argument("--relation", default=None, help="Filter by relation type")
+    parser.add_argument("--since", default=None, help="Filter by ISO updated_at timestamp")
+    parser.add_argument("--limit", type=int, default=50, help="Maximum items to print")
     parser.add_argument("--json", action="store_true", help="Print structured JSON result")
 
 
@@ -393,6 +736,105 @@ def build_parser() -> argparse.ArgumentParser:
     uninstall.add_argument("--dry-run", action="store_true", help="Print planned removals without writing them")
     uninstall.add_argument("--json", action="store_true", help="Print structured JSON result")
 
+    agent = sub.add_parser("agent", help="Agent Workspace commands for coding-agent working memory")
+    agent.add_argument("--agent", dest="agent_id", default=None, help="Use an agent id; defaults to REQL_AGENT_ID or the bus current agent")
+    agent_sub = agent.add_subparsers(dest="agent_command", required=True)
+    agent_init = agent_sub.add_parser("init", help="Initialize a private agent working graph from the standard graph")
+    agent_init.add_argument("--json", action="store_true", help="Print structured JSON result")
+    agent_status = agent_sub.add_parser("status", help="Show agent working graph status")
+    agent_status.add_argument("--json", action="store_true", help="Print structured JSON result")
+    agent_sync = agent_sub.add_parser("sync", help="Refresh derived standard graph references without deleting agent memory")
+    agent_sync.add_argument("--json", action="store_true", help="Print structured JSON result")
+    agent_reset = agent_sub.add_parser("reset", help="Reset the agent working graph from the current standard graph")
+    agent_reset.add_argument("--json", action="store_true", help="Print structured JSON result")
+    agent_add = agent_sub.add_parser("add", help="Add an operational note")
+    agent_add.add_argument("text")
+    agent_add.add_argument("--json", action="store_true", help="Print structured JSON result")
+    agent_task = agent_sub.add_parser("task", help="Task commands: add, done")
+    agent_task_sub = agent_task.add_subparsers(dest="agent_task_command", required=True)
+    agent_task_add = agent_task_sub.add_parser("add", help="Add an agent task")
+    agent_task_add.add_argument("description")
+    agent_task_add.add_argument("--json", action="store_true", help="Print structured JSON result")
+    agent_task_done = agent_task_sub.add_parser("done", help="Mark an agent task as done")
+    agent_task_done.add_argument("id")
+    agent_task_done.add_argument("--json", action="store_true", help="Print structured JSON result")
+    agent_decision = agent_sub.add_parser("decision", help="Decision commands: add")
+    agent_decision_sub = agent_decision.add_subparsers(dest="agent_decision_command", required=True)
+    agent_decision_add = agent_decision_sub.add_parser("add", help="Record a technical decision")
+    agent_decision_add.add_argument("decision")
+    agent_decision_add.add_argument("--json", action="store_true", help="Print structured JSON result")
+    agent_finding = agent_sub.add_parser("finding", help="Finding commands: add")
+    agent_finding_sub = agent_finding.add_subparsers(dest="agent_finding_command", required=True)
+    agent_finding_add = agent_finding_sub.add_parser("add", help="Record a code finding")
+    agent_finding_add.add_argument("observation")
+    agent_finding_add.add_argument("--json", action="store_true", help="Print structured JSON result")
+    agent_session = agent_sub.add_parser("session", help="Session commands: start")
+    agent_session_sub = agent_session.add_subparsers(dest="agent_session_command", required=True)
+    agent_session_start = agent_session_sub.add_parser("start", help="Start a new current agent session")
+    agent_session_start.add_argument("title")
+    agent_session_start.add_argument("--json", action="store_true", help="Print structured JSON result")
+    agent_link = agent_sub.add_parser("link", help="Create a relation between agent graph elements")
+    agent_link.add_argument("id1")
+    agent_link.add_argument("id2")
+    agent_link.add_argument("--relation", required=True, help="Relation type")
+    agent_link.add_argument("--json", action="store_true", help="Print structured JSON result")
+    agent_link_task = agent_sub.add_parser("link-task", help="Link an open task to a target resolved from a readable path")
+    agent_link_task.add_argument("--task", dest="task_id", default=None, help="Task id; defaults to the latest open task in the current session")
+    agent_link_task.add_argument("--file", dest="file_path", required=True, help="File path to resolve in the agent graph")
+    agent_link_task.add_argument("--relation", default="touches", help="Relation type; defaults to touches")
+    agent_link_task.add_argument("--json", action="store_true", help="Print structured JSON result")
+    agent_link_many = agent_sub.add_parser("link-many", help="Create one relation from a source to multiple targets")
+    agent_link_many.add_argument("id1")
+    agent_link_many.add_argument("ids", nargs="+", help="One or more target node IDs")
+    agent_link_many.add_argument("--relation", required=True, help="Relation type")
+    agent_link_many.add_argument("--json", action="store_true", help="Print structured JSON result")
+    agent_batch = agent_sub.add_parser("batch", help="Apply agent workspace operations from a JSON file or inline options")
+    agent_batch.add_argument("file", nargs="?", default=None, help="Optional JSON file path, or '-' to read from stdin")
+    agent_batch.add_argument("--note", action="append", default=[], metavar="[ALIAS=]TEXT", help="Add an operational note; may be repeated")
+    agent_batch.add_argument("--task", action="append", default=[], metavar="[ALIAS=]TEXT", help="Add an open task; may be repeated")
+    agent_batch.add_argument("--decision", action="append", default=[], metavar="[ALIAS=]TEXT", help="Add a decision; may be repeated")
+    agent_batch.add_argument("--finding", action="append", default=[], metavar="[ALIAS=]TEXT", help="Add a finding; may be repeated")
+    agent_batch.add_argument("--done", action="append", default=[], metavar="TASK_ID", help="Mark a task done; may be repeated")
+    agent_batch.add_argument("--link", action="append", nargs=3, metavar=("FROM", "RELATION", "TO"), default=[], help="Create one relation; aliases may be referenced as $alias")
+    agent_batch.add_argument("--link-many", dest="link_many", action="append", nargs=3, metavar=("FROM", "RELATION", "TARGETS"), default=[], help="Create relations from one source to comma-separated targets")
+    agent_batch.add_argument("--touches", action="append", nargs=2, metavar=("FROM", "TARGETS"), default=[], help="Create touches relations from one source to comma-separated targets")
+    agent_batch.add_argument("--json", action="store_true", help="Print structured JSON result")
+    agent_search = agent_sub.add_parser("search", help="Textually search the agent working graph")
+    agent_search.add_argument("query")
+    agent_search.add_argument("--type", dest="node_type", default=None, help="Filter by agent node type")
+    agent_search.add_argument("--status", default=None, help="Filter by node status")
+    agent_search.add_argument("--limit", type=int, default=20, help="Maximum matches")
+    agent_search.add_argument("--metadata", action="store_true", help="Include timestamps, source fields, and stored metadata")
+    agent_search.add_argument("--json", action="store_true", help="Print structured JSON result")
+    agent_show = agent_sub.add_parser("show", help="Show a node or relation")
+    agent_show.add_argument("id")
+    agent_show.add_argument("--json", action="store_true", help="Print structured JSON result")
+    agent_list = agent_sub.add_parser("list", help="List recent working memory items")
+    _add_agent_filters(agent_list)
+    agent_map = agent_sub.add_parser("map", help="Summarize the current agent working memory")
+    agent_map.add_argument("--task", dest="task_id", default=None, help="Focus the map on one agent task and related agent items")
+    agent_map.add_argument("--session", default=None, help="Focus the map on an agent session id, or 'current'")
+    agent_map.add_argument("--since", default=None, help="Only include agent items or relations updated at or after this ISO timestamp")
+    agent_map.add_argument("--completed", action="store_true", help="Include completed tasks for a session summary")
+    agent_map.add_argument("--metadata", action="store_true", help="Include timestamps, source fields, and stored metadata")
+    agent_map.add_argument("--json", action="store_true", help="Print structured JSON result")
+    agent_bus = agent_sub.add_parser("bus", help="Read the shared internal agent bus")
+    agent_bus.add_argument("--limit", type=int, default=50, help="Maximum agents, messages, and handoffs")
+    agent_bus.add_argument("--include-payloads", action="store_true", help="Include full handoff payload snapshots")
+    agent_bus.add_argument("--json", action="store_true", help="Print structured JSON result")
+    agent_publish = agent_sub.add_parser("publish", help="Publish a short message to the shared agent bus")
+    agent_publish.add_argument("text")
+    agent_publish.add_argument("--kind", default="note", help="Message kind")
+    agent_publish.add_argument("--target", default="all", help="Target agent id, or all")
+    agent_publish.add_argument("--json", action="store_true", help="Print structured JSON result")
+    agent_handoff = agent_sub.add_parser("handoff", help="Publish this agent's saved working context to the master bus")
+    agent_handoff.add_argument("summary", nargs="?", default=None)
+    agent_handoff.add_argument("--target", default="master", help="Target agent id")
+    agent_handoff.add_argument("--json", action="store_true", help="Print structured JSON result")
+    agent_export = agent_sub.add_parser("export", help="Export the agent working graph")
+    agent_export.add_argument("--metadata", action="store_true", help="Include full workspace metadata and all stored nodes")
+    agent_export.add_argument("--json", action="store_true", help="Print structured JSON result")
+
     config = sub.add_parser("config", help="Configuration commands: show, init")
     config_sub = config.add_subparsers(dest="config_command", required=True)
     config_sub.add_parser("show", help="Print the effective configuration")
@@ -477,12 +919,13 @@ def build_parser() -> argparse.ArgumentParser:
     _normalize_subparser_help(project_sub)
     _normalize_subparser_help(cache_sub)
     _normalize_subparser_help(storage_sub)
+    _normalize_subparser_help(agent_sub)
+    _normalize_subparser_help(agent_task_sub)
+    _normalize_subparser_help(agent_decision_sub)
+    _normalize_subparser_help(agent_finding_sub)
+    _normalize_subparser_help(agent_session_sub)
 
     return parser
-
-
-def _graph_scope(args: argparse.Namespace, config: REQLConfig) -> str:
-    return "default"
 
 
 def _max_file_size_bytes(args: argparse.Namespace, config: REQLConfig) -> int:
@@ -650,29 +1093,17 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "install":
-        from agents.install import available_platforms_text, install_agent_files, resolve_platforms
+        from agents.install import available_platforms_text, install_agent_files
 
         try:
-            requested_platforms = [*args.platforms, *args.platform]
-            project_install = not args.user
-            platforms = resolve_platforms(
-                requested_platforms,
-                install_all=args.all,
-                auto_detect=not requested_platforms and not args.all,
-                project=project_install,
-                project_dir=Path(args.project_dir),
-            )
-            if not platforms:
-                print(
-                    "No supported coding-agent profiles were detected. "
-                    f"Specify one of: {available_platforms_text()}",
-                    file=sys.stderr,
-                )
+            resolved = _resolve_agent_command_target(args, action="install")
+            if resolved is None:
                 return 2
             result = install_agent_files(
-                platforms,
-                project=project_install,
-                project_dir=Path(args.project_dir),
+                resolved.platforms,
+                project=resolved.project,
+                project_dir=resolved.project_dir,
+                home_dir=resolved.home_dir,
                 command_dir=Path(args.command_dir) if args.command_dir else None,
                 dry_run=args.dry_run,
                 hooks=not args.no_hooks,
@@ -680,6 +1111,9 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError as exc:
             print(f"{exc}. Available platforms: {available_platforms_text()}", file=sys.stderr)
             return 2
+        except _PromptInterrupted:
+            print("Install cancelled.", file=sys.stderr)
+            return 130
         if args.json:
             _print_json(result.to_dict())
         else:
@@ -689,21 +1123,26 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "uninstall":
-        from agents.install import available_platforms_text, resolve_platforms, uninstall_agent_files
+        from agents.install import available_platforms_text, uninstall_agent_files
 
         try:
-            project_uninstall = not args.user
-            platforms = resolve_platforms([*args.platforms, *args.platform], install_all=args.all)
+            resolved = _resolve_agent_command_target(args, action="uninstall")
+            if resolved is None:
+                return 2
             result = uninstall_agent_files(
-                platforms,
-                project=project_uninstall,
-                project_dir=Path(args.project_dir),
+                resolved.platforms,
+                project=resolved.project,
+                project_dir=resolved.project_dir,
+                home_dir=resolved.home_dir,
                 command_dir=Path(args.command_dir) if args.command_dir else None,
                 dry_run=args.dry_run,
             )
         except ValueError as exc:
             print(f"{exc}. Available platforms: {available_platforms_text()}", file=sys.stderr)
             return 2
+        except _PromptInterrupted:
+            print("Uninstall cancelled.", file=sys.stderr)
+            return 130
         if args.json:
             _print_json(result.to_dict())
         else:
@@ -752,6 +1191,202 @@ def main(argv: list[str] | None = None) -> int:
             _print_json(config.to_dict())
             return 0
 
+    if args.command == "agent":
+        from memory.agent import AgentWorkspace
+
+        agent_id = args.agent_id or os.environ.get("REQL_AGENT_ID")
+        if args.agent_command == "init" and not agent_id:
+            agent_id = AgentWorkspace.new_agent_id()
+        workspace = AgentWorkspace(args.storage, agent_id=agent_id, config=config)
+        try:
+            if args.agent_command == "init":
+                result = workspace.init()
+                if args.json:
+                    _print_json(result)
+                else:
+                    print(f"Agent id: {result['agent_id']}")
+                    print(f"Initialized agent workspace: {result['agent_storage']}")
+                    print(f"Agent bus: {result['bus_storage']}")
+                    print(f"Derived nodes: {result['derived_nodes']}")
+                    print(f"Derived relations: {result['derived_relations']}")
+                return 0
+            if args.agent_command == "status":
+                result = workspace.status()
+                if args.json:
+                    _print_json(result)
+                else:
+                    _print_agent_status(result)
+                return 0
+            if args.agent_command == "sync":
+                result = workspace.sync()
+                if args.json:
+                    _print_json(result)
+                else:
+                    print(f"Synced agent workspace: {result['agent_storage']}")
+                    print(f"Derived nodes: {result['derived_nodes']}")
+                    print(f"Derived relations: {result['derived_relations']}")
+                    print(f"Preserved agent nodes: {result['preserved_agent_nodes']}")
+                    print(f"Preserved agent relations: {result['preserved_agent_relations']}")
+                return 0
+            if args.agent_command == "reset":
+                result = workspace.reset()
+                if args.json:
+                    _print_json(result)
+                else:
+                    print(f"Reset agent workspace: {result['agent_storage']}")
+                    print(f"Derived nodes: {result['derived_nodes']}")
+                    print(f"Derived relations: {result['derived_relations']}")
+                return 0
+            if args.agent_command == "add":
+                result = workspace.add_note(args.text)
+                if args.json:
+                    _print_json(result)
+                else:
+                    _print_agent_node(result)
+                return 0
+            if args.agent_command == "task":
+                if args.agent_task_command == "add":
+                    result = workspace.add_task(args.description)
+                    if args.json:
+                        _print_json(result)
+                    else:
+                        _print_agent_node(result)
+                    return 0
+                if args.agent_task_command == "done":
+                    result = workspace.complete_task(args.id)
+                    if args.json:
+                        _print_json(result)
+                    else:
+                        _print_agent_node(result)
+                    return 0
+            if args.agent_command == "decision" and args.agent_decision_command == "add":
+                result = workspace.add_decision(args.decision)
+                if args.json:
+                    _print_json(result)
+                else:
+                    _print_agent_node(result)
+                return 0
+            if args.agent_command == "finding" and args.agent_finding_command == "add":
+                result = workspace.add_finding(args.observation)
+                if args.json:
+                    _print_json(result)
+                else:
+                    _print_agent_node(result)
+                return 0
+            if args.agent_command == "session" and args.agent_session_command == "start":
+                result = workspace.start_session(args.title)
+                if args.json:
+                    _print_json(result)
+                else:
+                    _print_agent_node({"node": result["session"]})
+                return 0
+            if args.agent_command == "link":
+                result = workspace.link(args.id1, args.id2, args.relation)
+                if args.json:
+                    _print_json(result)
+                else:
+                    _print_agent_relations(result)
+                return 0
+            if args.agent_command == "link-task":
+                result = workspace.link_task(task_id=args.task_id, file_path=args.file_path, relation=args.relation)
+                if args.json:
+                    _print_json(result)
+                else:
+                    _print_agent_relations(result)
+                return 0
+            if args.agent_command == "link-many":
+                result = workspace.link_many(args.id1, args.ids, args.relation)
+                if args.json:
+                    _print_json(result)
+                else:
+                    _print_agent_relations(result)
+                return 0
+            if args.agent_command == "batch":
+                result = workspace.batch(_agent_batch_operations_from_args(args))
+                if args.json:
+                    _print_json(result)
+                else:
+                    for item in result["results"]:
+                        if "node" in item or "task" in item:
+                            _print_agent_node(item)
+                        elif "relation" in item or "relations" in item:
+                            _print_agent_relations(item)
+                return 0
+            if args.agent_command == "search":
+                result = workspace.search(args.query, node_type=args.node_type, status=args.status, limit=args.limit, include_metadata=args.metadata)
+                if args.json:
+                    _print_json(result)
+                else:
+                    _print_agent_search(result)
+                return 0
+            if args.agent_command == "show":
+                result = workspace.show(args.id)
+                if args.json:
+                    _print_json(result)
+                else:
+                    if result["kind"] == "node":
+                        _print_agent_node({"node": result["node"]})
+                        for edge in [*result.get("outgoing", []), *result.get("incoming", [])]:
+                            print(f"{edge['id']}\t{edge['relation']}\t{edge['from_id']} -> {edge['to_id']}")
+                    else:
+                        edge = result["relation"]
+                        print(f"{edge['id']}\t{edge['relation']}\t{edge['from_id']} -> {edge['to_id']}")
+                return 0
+            if args.agent_command == "list":
+                result = workspace.list_items(
+                    node_type=args.node_type,
+                    status=args.status,
+                    relation=args.relation,
+                    since=args.since,
+                    limit=args.limit,
+                )
+                if args.json:
+                    _print_json(result)
+                else:
+                    _print_agent_list(result)
+                return 0
+            if args.agent_command == "map":
+                result = workspace.map(
+                    task_id=args.task_id,
+                    since=args.since,
+                    session=args.session,
+                    include_completed=args.completed,
+                    include_metadata=args.metadata,
+                )
+                if args.json:
+                    _print_json(result)
+                else:
+                    _print_agent_map(result)
+                return 0
+            if args.agent_command == "bus":
+                result = workspace.bus(limit=args.limit, include_payloads=args.include_payloads)
+                if args.json:
+                    _print_json(result)
+                else:
+                    _print_agent_bus(result)
+                return 0
+            if args.agent_command == "publish":
+                result = workspace.publish(args.text, kind=args.kind, target=args.target)
+                if args.json:
+                    _print_json(result)
+                else:
+                    _print_agent_node({"node": result["message"]})
+                return 0
+            if args.agent_command == "handoff":
+                result = workspace.handoff(args.summary, target=args.target)
+                if args.json:
+                    _print_json(result)
+                else:
+                    _print_agent_node({"node": result["handoff"]})
+                return 0
+            if args.agent_command == "export":
+                result = workspace.export(include_metadata=args.metadata)
+                _print_json(result)
+                return 0
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+
     if args.command == "storage":
         read_only = args.storage_command == "inspect"
         if profile_logger:
@@ -789,7 +1424,6 @@ def main(argv: list[str] | None = None) -> int:
 
     graph = _open(args, config, profile_logger=profile_logger)
     try:
-        graph_scope = _graph_scope(args, config)
         if args.command == "project":
             if args.project_command in {"compile", "update"}:
                 max_file_size = _max_file_size_bytes(args, config)
@@ -903,6 +1537,7 @@ def main(argv: list[str] | None = None) -> int:
                         mode=_query_context_mode_from_args(args),
                         scopes=_query_context_scopes_from_args(args),
                         include_archived=args.include_archived,
+                        include_risky=args.include_risky,
                     )
                 )
             else:
@@ -916,6 +1551,7 @@ def main(argv: list[str] | None = None) -> int:
                         mode=_query_context_mode_from_args(args),
                         scopes=_query_context_scopes_from_args(args),
                         include_archived=args.include_archived,
+                        include_risky=args.include_risky,
                     )
                 )
             return 0

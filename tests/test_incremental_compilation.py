@@ -175,34 +175,6 @@ class IncrementalCompilationTests(unittest.TestCase):
         self.assertEqual(result.run.nodes_created, 0)
         self.assertEqual(result.run.edges_created, 0)
 
-    def test_compile_backfills_context_scope_on_skipped_artifacts(self) -> None:
-        first = self.graph.compile_project(self.root)
-        self.assertFalse(first.run.errors)
-
-        targets = [
-            node
-            for node in self.graph.store.all_nodes()
-            if node.properties.get("relative_path") in {"a.py", "README.md"}
-            and node.type in {"SourceArtifact", "File", "SourceFragment", "Module"}
-        ]
-        self.assertTrue(targets)
-        for node in targets:
-            properties = dict(node.properties)
-            properties.pop("context_scope", None)
-            self.graph.store.update_node_fields(node.id, properties=properties)
-
-        second = self.graph.compile_project(self.root)
-
-        self.assertFalse(second.run.errors)
-        self.assertEqual(second.run.files_changed, 0)
-        self.assertTrue(second.run.nodes_updated >= len(targets))
-        for node in targets:
-            refreshed = self.graph.get_node(node.id)
-            self.assertIsNotNone(refreshed)
-            assert refreshed is not None
-            expected = "docs" if refreshed.properties.get("relative_path") == "README.md" else "code"
-            self.assertEqual(refreshed.properties.get("context_scope"), expected)
-
     def test_compile_detects_deleted_artifact_when_cache_is_missing(self) -> None:
         first = self.graph.compile_project(self.root)
         artifact_id = self._artifact_id(first, "a.py")

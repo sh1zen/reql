@@ -16,7 +16,8 @@ The optimization path preserves deterministic graph output: for the same input
 and options, the same relevant node types, edge types, properties, provenance,
 confidence values, cache records, and `GraphDelta` shape are emitted. Runtime
 improvements come from lower-cost storage transactions, batched upserts, cache
-planning maps, set-backed delta aggregation, and scoped document-code linking.
+planning maps, set-backed delta aggregation, scoped context-scope metadata
+refresh, and scoped document-code linking.
 
 ## Flow
 
@@ -27,6 +28,7 @@ project update PATH
   -> compare artifacts with .reql/artifact-cache.json entries
   -> recover missing cache entries from already compiled SourceArtifact records
   -> register Project, Directory, File, and SourceArtifact deltas for dirty files
+  -> refresh context-scope metadata for dirty files, or one-time legacy backfill
   -> compile changed supported code artifacts into technical graph nodes
   -> compile changed text document fragments structurally
   -> link document fragments to code symbols
@@ -77,6 +79,11 @@ Cache planning builds the active cache map for the project once per run from
 nodes when needed. The map is reused for clean/changed/deleted/recoverable
 decisions, which keeps detection rules unchanged while avoiding repeated
 per-artifact graph lookups during cold or dirty compiles.
+
+Context-scope metadata is written by the artifact and code/document node
+producers during compilation. Clean artifacts are not revisited only to repair
+missing scope metadata; if compiled graph records are incomplete, recompile the
+affected artifact so the owning producer writes the canonical fields.
 
 ## Graph Records
 

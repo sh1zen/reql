@@ -22,7 +22,7 @@ SECTION_START = "<!-- REQL-INSTALL:START -->"
 SECTION_END = "<!-- REQL-INSTALL:END -->"
 HOOK_ID = "REQL_AGENT_HOOK_V1"
 INSTALLER_VERSION = "1"
-VERSION_FILE = ".reql_agent_version"
+VERSION_FILE = ".reql_version"
 COMMAND_MARKER = "REQL-COMMAND-SHIM:V1"
 COMMAND_ENV = "REQL_COMMAND_DIR"
 _SKILL_GENERATOR: ModuleType | None = None
@@ -85,6 +85,7 @@ def resolve_platforms(
     auto_detect: bool = False,
     project: bool = False,
     project_dir: Path | None = None,
+    home_dir: Path | None = None,
 ) -> tuple[str, ...]:
     all_platforms = [name for name, cfg in PLATFORMS_CONFIG.items() if cfg["is_all"]]
 
@@ -95,7 +96,7 @@ def resolve_platforms(
         raw.extend(part.strip().casefold() for part in value.split(",") if part.strip())
     if not raw:
         if auto_detect:
-            raw.extend(detect_platforms(project=project, project_dir=project_dir))
+            raw.extend(detect_platforms(project=project, project_dir=project_dir, home_dir=home_dir))
         else:
             raw.append("codex")
 
@@ -114,34 +115,143 @@ def resolve_platforms(
     return tuple(resolved)
 
 
-def detect_platforms(*, project: bool = False, project_dir: Path | None = None) -> tuple[str, ...]:
+def detect_platforms(*, project: bool = False, project_dir: Path | None = None, home_dir: Path | None = None) -> tuple[str, ...]:
     """Detect supported coding-agent profiles or commands already present locally."""
-    home = Path.home()
+    home = (home_dir or Path.home()).expanduser()
     root = (project_dir or Path(".")).resolve()
     candidates: list[str] = []
 
-    def add(name: str, *paths: Path, commands: tuple[str, ...] = ()) -> None:
+    def add(
+        name: str,
+        *,
+        project_paths: tuple[Path, ...] = (),
+        user_paths: tuple[Path, ...] = (),
+        commands: tuple[str, ...] = (),
+    ) -> None:
         if name in candidates:
             return
-        if any(path.exists() for path in paths) or any(shutil.which(command) for command in commands):
+        paths = project_paths if project else user_paths
+        command_signals = () if project else commands
+        if any(_is_agent_profile_signal(path) for path in paths) or any(shutil.which(command) for command in command_signals):
             candidates.append(name)
 
-    add("codex", home / ".codex", root / ".codex", commands=("codex",))
-    add("claude", _env_path("CLAUDE_CONFIG_DIR", home / ".claude"), root / ".claude", commands=("claude",))
-    add("opencode", home / ".config" / "opencode", root / ".opencode", commands=("opencode",))
-    add("kilo", home / ".kilocode", root / ".kilocode", commands=("kilo", "kilocode"))
-    add("cursor", home / ".cursor", root / ".cursor", commands=("cursor",))
-    add("gemini", _gemini_user_dir(home), home / ".gemini", root / ".gemini", commands=("gemini",))
-    add("copilot", home / ".github" / "copilot-instructions.md", home / ".github" / "instructions", root / ".github", commands=("gh", "copilot"))
-    add("openclaw", home / ".openclaw", root / ".openclaw", commands=("openclaw",))
-    add("hermes", home / ".hermes", root / ".hermes", commands=("hermes",))
-    add("kimi", home / ".kimi", root / ".kimi", commands=("kimi",))
-    add("antigravity", home / ".antigravity", root / ".antigravity", commands=("antigravity",))
-    add("agents", home / ".config" / "agents", root / ".agents")
+    claude_dir = _env_path("CLAUDE_CONFIG_DIR", home / ".claude")
+    add(
+        "codex",
+        user_paths=(home / ".codex" / "skills",),
+        project_paths=(root / ".codex" / "skills", root / ".codex" / "hooks.json"),
+    )
+    add(
+        "claude",
+        user_paths=(claude_dir / "skills", claude_dir / "CLAUDE.md"),
+        project_paths=(root / ".claude" / "skills", root / ".claude" / "CLAUDE.md", root / ".claude" / "settings.json"),
+        commands=("claude",),
+    )
+    add(
+        "opencode",
+        user_paths=(home / ".config" / "opencode" / "skills",),
+        project_paths=(root / ".opencode" / "skills",),
+        commands=("opencode",),
+    )
+    add(
+        "kilo",
+        user_paths=(home / ".kilocode" / "skills", home / ".config" / "kilo" / "skills"),
+        project_paths=(root / ".kilocode" / "skills", root / ".config" / "kilo" / "skills"),
+        commands=("kilo", "kilocode"),
+    )
+    add("cursor", user_paths=(home / ".cursor" / "rules",), project_paths=(root / ".cursor" / "rules",), commands=("cursor",))
+    add(
+        "gemini",
+        user_paths=(_gemini_user_dir(home) / "skills", home / ".gemini" / "skills", home / "GEMINI.md"),
+        project_paths=(root / ".gemini" / "skills", root / "GEMINI.md"),
+        commands=("gemini",),
+    )
+    add(
+        "copilot",
+        user_paths=(home / ".copilot" / "skills", home / ".github" / "copilot-instructions.md", home / ".github" / "instructions"),
+        project_paths=(root / ".github" / "copilot-instructions.md", root / ".github" / "instructions"),
+        commands=("copilot",),
+    )
+    add("openclaw", user_paths=(home / ".openclaw" / "skills",), project_paths=(root / ".openclaw" / "skills",), commands=("openclaw",))
+    add("hermes", user_paths=(home / ".hermes" / "skills",), project_paths=(root / ".hermes" / "skills",), commands=("hermes",))
+    add("kimi", user_paths=(home / ".kimi" / "skills",), project_paths=(root / ".kimi" / "skills",), commands=("kimi",))
+    add(
+        "antigravity",
+        user_paths=(home / ".gemini" / "config" / "skills",),
+        project_paths=(root / ".agents" / "skills", root / ".agents" / "rules", root / ".agents" / "workflows"),
+        commands=("antigravity",),
+    )
+    add("agents", user_paths=(home / ".agents" / "skills",), project_paths=(root / ".agents" / "skills",))
 
     if project:
         return tuple(candidates)
-    return tuple(name for name in candidates if name != "agents" or (home / ".config" / "agents").exists())
+    return tuple(name for name in candidates if name != "agents" or (home / ".agents" / "skills").exists())
+
+
+def _is_agent_profile_signal(path: Path) -> bool:
+    if not path.exists():
+        return False
+    if path.is_dir():
+        return _directory_has_agent_profile_signal(path)
+    return not _is_reql_owned_file(path)
+
+
+def _directory_has_agent_profile_signal(path: Path) -> bool:
+    try:
+        entries = list(path.iterdir())
+    except OSError:
+        return False
+    if not entries:
+        return True
+    return any(not _is_reql_owned_path(entry) for entry in entries)
+
+
+def _is_reql_owned_path(path: Path) -> bool:
+    if path.name == "reql-agent":
+        return True
+    if path.is_file():
+        return _is_reql_owned_file(path)
+    return False
+
+
+def _is_reql_owned_file(path: Path) -> bool:
+    if path.name == VERSION_FILE:
+        return _is_reql_version_file(path)
+    try:
+        text = path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return False
+    if SECTION_START in text and not _remove_section(text).strip():
+        return True
+    if path.suffix.casefold() == ".json":
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError:
+            return False
+        return not bool(_strip_reql_hooks(data))
+    return False
+
+
+def _is_reql_version_file(path: Path) -> bool:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(payload, dict) and payload.get("installer") == "reql-install"
+
+
+def _strip_reql_hooks(value: object, *, in_list: bool = False) -> object | None:
+    if in_list and _is_reql_hook(value):
+        return None
+    if isinstance(value, dict):
+        cleaned = {key: cleaned_value for key, item in value.items() if (cleaned_value := _strip_reql_hooks(item)) is not None}
+        return cleaned or None
+    if isinstance(value, list):
+        cleaned_list = [cleaned_value for item in value if (cleaned_value := _strip_reql_hooks(item, in_list=True)) is not None]
+        return cleaned_list or None
+    if _is_reql_hook(value):
+        return None
+    return value
 
 
 def install_agent_files(
@@ -149,6 +259,7 @@ def install_agent_files(
     *,
     project: bool = False,
     project_dir: Path | None = None,
+    home_dir: Path | None = None,
     command_dir: Path | None = None,
     dry_run: bool = False,
     hooks: bool = True,
@@ -168,6 +279,7 @@ def install_agent_files(
             name,
             project=project,
             project_dir=root,
+            home_dir=home_dir,
             command_name=command_plan.command_name,
             command_path=command_plan.primary_path,
             fallback_command=command_plan.fallback_command,
@@ -175,10 +287,10 @@ def install_agent_files(
             status = _write_file(path, content, sectioned=kind == "instructions", dry_run=dry_run)
             actions.append(InstallAction(platform=name, scope=scope, kind=kind, path=path, status=status))
         if hooks:
-            hook_action = _install_hook(name, project=project, project_dir=root, dry_run=dry_run)
+            hook_action = _install_hook(name, project=project, project_dir=root, home_dir=home_dir, dry_run=dry_run)
             if hook_action is not None:
                 actions.append(InstallAction(platform=name, scope=scope, kind="hook", path=hook_action[0], status=hook_action[1]))
-        for stamp_path in _version_stamp_paths(name, project=project, project_dir=root):
+        for stamp_path in _version_stamp_paths(name, project=project, project_dir=root, home_dir=home_dir):
             status = _write_file(
                 stamp_path,
                 _version_payload(name, scope, command_path=command_plan.primary_path),
@@ -195,12 +307,14 @@ def uninstall_agent_files(
     *,
     project: bool = False,
     project_dir: Path | None = None,
+    home_dir: Path | None = None,
     command_dir: Path | None = None,
     dry_run: bool = False,
 ) -> InstallResult:
     selected = tuple(platforms)
     scope = "project" if project else "user"
     root = (project_dir or Path(".")).resolve()
+    home = (home_dir or Path.home()).expanduser()
     actions: list[InstallAction] = []
     command_plan = _command_plan(command_dir)
 
@@ -209,20 +323,20 @@ def uninstall_agent_files(
         actions.append(InstallAction(platform="shared", scope=scope, kind="command", path=path, status=status))
 
     for name in selected:
-        for kind, path, _content in _planned_files(name, project=project, project_dir=root):
+        for kind, path, _content in _planned_files(name, project=project, project_dir=root, home_dir=home):
             if kind in {"instructions"}:
-                status = _remove_section_file(path, dry_run=dry_run, stop=root if project else Path.home())
+                status = _remove_section_file(path, dry_run=dry_run, stop=root if project else home)
             else:
-                status = _remove_owned_file(path, dry_run=dry_run, stop=root if project else Path.home())
+                status = _remove_owned_file(path, dry_run=dry_run, stop=root if project else home)
             actions.append(InstallAction(platform=name, scope=scope, kind=kind, path=path, status=status))
-        hook_action = _uninstall_hook(name, project=project, project_dir=root, dry_run=dry_run)
+        hook_action = _uninstall_hook(name, project=project, project_dir=root, home_dir=home, dry_run=dry_run)
         if hook_action is not None:
             actions.append(InstallAction(platform=name, scope=scope, kind="hook", path=hook_action[0], status=hook_action[1]))
-        for stamp_path in _version_stamp_paths(name, project=project, project_dir=root):
-            status = _remove_owned_file(stamp_path, dry_run=dry_run, stop=root if project else Path.home())
+        for stamp_path in _version_stamp_paths(name, project=project, project_dir=root, home_dir=home):
+            status = _remove_owned_file(stamp_path, dry_run=dry_run, stop=root if project else home)
             actions.append(InstallAction(platform=name, scope=scope, kind="version", path=stamp_path, status=status))
             if not dry_run:
-                _cleanup_empty_dirs(stamp_path.parent, stop=root if project else Path.home())
+                _cleanup_empty_dirs(stamp_path.parent, stop=root if project else home)
 
     return InstallResult(platforms=selected, scope=scope, actions=tuple(actions))
 
@@ -232,11 +346,12 @@ def _planned_files(
     *,
     project: bool,
     project_dir: Path,
+    home_dir: Path | None = None,
     command_name: str = "reql",
     command_path: Path | None = None,
     fallback_command: str | None = None,
 ) -> list[tuple[str, Path, str]]:
-    home = Path.home()
+    home = (home_dir or Path.home()).expanduser()
     command_path = command_path or _command_plan(None).primary_path
     fallback_command = fallback_command or _launcher_fallback_command()
     instructions = _instruction_section(platform_name, project=project, command_name=command_name, command_path=command_path, fallback_command=fallback_command)
@@ -318,7 +433,7 @@ def _planned_files(
         return files
 
     if platform_name == "agents":
-        base = project_dir / ".agents" if project else home / ".config" / "agents"
+        base = project_dir / ".agents" if project else home / ".agents"
         return [
             *_skill_files(base=base, platform_name=platform_name, project=project, command_name=command_name, command_path=command_path, fallback_command=fallback_command),
             ("instructions", (project_dir if project else base) / "AGENTS.md", instructions),
@@ -327,8 +442,8 @@ def _planned_files(
     raise ValueError(f"unknown platform '{platform_name}'")
 
 
-def _version_stamp_paths(platform_name: str, *, project: bool, project_dir: Path) -> tuple[Path, ...]:
-    planned = _planned_files(platform_name, project=project, project_dir=project_dir)
+def _version_stamp_paths(platform_name: str, *, project: bool, project_dir: Path, home_dir: Path | None = None) -> tuple[Path, ...]:
+    planned = _planned_files(platform_name, project=project, project_dir=project_dir, home_dir=home_dir)
     paths = tuple(path.parent / VERSION_FILE for kind, path, _content in planned if kind == "skill")
     if paths:
         return paths
@@ -339,7 +454,7 @@ def _version_stamp_paths(platform_name: str, *, project: bool, project_dir: Path
 
 def _version_payload(platform_name: str, scope: str, *, command_path: Path | None = None) -> str:
     payload = {
-        "installer": "reql-agent-install",
+        "installer": "reql-install",
         "installer_version": INSTALLER_VERSION,
         "package_version": _package_version(),
         "platform": platform_name,
@@ -620,8 +735,8 @@ def _remove_section(existing: str) -> str:
     return ("\n\n".join(parts) + "\n") if parts else ""
 
 
-def _install_hook(platform_name: str, *, project: bool, project_dir: Path, dry_run: bool) -> tuple[Path, str] | None:
-    plan = _hook_plan(platform_name, project=project, project_dir=project_dir)
+def _install_hook(platform_name: str, *, project: bool, project_dir: Path, dry_run: bool, home_dir: Path | None = None) -> tuple[Path, str] | None:
+    plan = _hook_plan(platform_name, project=project, project_dir=project_dir, home_dir=home_dir)
     if plan is None:
         return None
     path, event, hook = plan
@@ -646,8 +761,8 @@ def _install_hook(platform_name: str, *, project: bool, project_dir: Path, dry_r
     return path, "updated" if existed else "created"
 
 
-def _uninstall_hook(platform_name: str, *, project: bool, project_dir: Path, dry_run: bool) -> tuple[Path, str] | None:
-    plan = _hook_plan(platform_name, project=project, project_dir=project_dir)
+def _uninstall_hook(platform_name: str, *, project: bool, project_dir: Path, dry_run: bool, home_dir: Path | None = None) -> tuple[Path, str] | None:
+    plan = _hook_plan(platform_name, project=project, project_dir=project_dir, home_dir=home_dir)
     if plan is None:
         return None
     path, event, _hook = plan
@@ -675,12 +790,12 @@ def _uninstall_hook(platform_name: str, *, project: bool, project_dir: Path, dry
         path.write_text(json.dumps(settings, indent=2, sort_keys=True) + "\n", encoding="utf-8")
         return path, "updated"
     path.unlink()
-    _cleanup_empty_dirs(path.parent, stop=project_dir if project else Path.home())
+    _cleanup_empty_dirs(path.parent, stop=project_dir if project else (home_dir or Path.home()).expanduser())
     return path, "removed"
 
 
-def _hook_plan(platform_name: str, *, project: bool, project_dir: Path) -> tuple[Path, str, dict[str, object]] | None:
-    home = Path.home()
+def _hook_plan(platform_name: str, *, project: bool, project_dir: Path, home_dir: Path | None = None) -> tuple[Path, str, dict[str, object]] | None:
+    home = (home_dir or Path.home()).expanduser()
     if platform_name == "claude":
         base = project_dir / ".claude" if project else _env_path("CLAUDE_CONFIG_DIR", home / ".claude")
         return base / "settings.json", "PreToolUse", _claude_hook()

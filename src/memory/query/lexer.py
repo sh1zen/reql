@@ -36,6 +36,7 @@ KEYWORDS = {
     "FALSE",
     "FILTER",
     "FIND",
+    "FINDING",
     "FINDINGS",
     "FRAGMENTS",
     "FROM",
@@ -80,6 +81,7 @@ KEYWORDS = {
     "TYPE",
     "TYPES",
     "VIA",
+    "VERIFY",
     "WHERE",
     "WITH",
 }

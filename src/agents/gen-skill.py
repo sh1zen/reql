@@ -30,17 +30,20 @@ class SkillResource:
 
 
 PROJECT_SKILL_SOURCE = SkillSource(
-    name="reql-project",
+    name="reql-agent",
     title="REQL Project",
     description=(
         "A Python graph-native and storage-agnostic memory engine. Use when {platform_name} "
         "needs to implement, review, document, inspect, or extend a project with bounded "
-        "repository graph context while preserving deterministic core behavior."
+        "repository graph context, or when {platform_name} needs persistent coding-agent "
+        "working memory with `reql agent` for tasks, notes, decisions, findings, risks, "
+        "plans, links, recovery, and export, while preserving deterministic core behavior."
     ),
     summary=(
-        "Use this skill for project mode. REQL compiles repository artifacts into a deterministic "
-        "graph for bounded context, retrieval, REQL queries, graph reports, communities, hubs, "
-        "and bridge analysis."
+        "Use this skill for REQL project mode and Agent Workspace mode. REQL is the local deterministic "
+        "project graph. Agent Workspace mode is the planning layer for large projects when the coding-agent "
+        "context is not enough, and it is still useful on small tasks to keep plans, choices, constraints, "
+        "tasks, code targets, and implementation links from drifting."
     ),
     command_examples=(
         CommandExample("project status .", "check whether this project has a compiled REQL graph"),
@@ -56,38 +59,54 @@ PROJECT_SKILL_SOURCE = SkillSource(
         CommandExample('query_context --query "<terms from user request>" --code', "compact code-scoped context with files, symbols, and targeted reads"),
         CommandExample('query_context --query "<terms from user request>" --docs', "limit context to documentation and imported documents"),
         CommandExample('query_context --query "<terms from user request>" --test', "limit context to tests"),
-        CommandExample('query_context --query "<terms from user request>" --cleanup', "cleanup findings matching the query"),
+        CommandExample('query_context --query "<terms from user request>" --cleanup', "safe-remove cleanup findings matching the query"),
         CommandExample('query_explore --query "<terms from user request>" --view owners --view code', "function-level owner/code slices for coding agents"),
         CommandExample('query_memories --query "<terms from user request>"', "compact ranked memory/source texts"),
         CommandExample('query_graph --query "<terms from user request>"', "seeds, edges, sources, and compact context"),
         CommandExample("inspect --node-id NODE_ID --json", "resolve a node id to location, sources, and neighbors"),
         CommandExample('query "RETRIEVE \\"<terms from user request>\\" LIMIT 8 RETURN id,type,text,score,relative_path,line_start,line_end"', "source/code text with exact locations"),
         CommandExample('query "HUBS LIMIT 20"', "inspect useful graph hubs"),
+        CommandExample("agent init", "create a private agent workspace, return its agent id, and register it on the shared bus"),
+        CommandExample("agent bus --json", "read registered agents, shared messages, and handoffs"),
+        CommandExample("agent status", "show whether the Agent Workspace exists and what it derives from"),
+        CommandExample('agent session start "Focused implementation pass"', "start a current Agent Workspace session"),
+        CommandExample('agent add "Read src/memory/cli.py and found argparse command routing"', "save a free-form operational note"),
+        CommandExample('agent task add "Patch CLI output filters"', "create an open task"),
+        CommandExample("agent task done AGENT_TASK_ID", "mark a task completed"),
+        CommandExample('agent decision add "Keep working memory separate from .reql/memory.reql"', "record a technical decision"),
+        CommandExample('agent finding add "agent map should only include touched files"', "record an observation about the code"),
+        CommandExample("agent sync", "refresh Agent Workspace standard-node references after compile adds new files"),
+        CommandExample("agent link AGENT_TASK_ID NODE_ID --relation touches", "connect agent work to a standard graph node"),
+        CommandExample("agent link-task --file test-agent/context_savings.py", "connect the latest open task to a file by readable path"),
+        CommandExample("agent link-many AGENT_TASK_ID NODE_ID OTHER_NODE_ID --relation touches", "connect one agent item to multiple graph nodes with one write"),
+        CommandExample("agent batch --json agent-ops.json", "apply multiple agent notes, tasks, decisions, findings, and links with one workspace lock"),
+        CommandExample("agent batch --task task=\"Patch CLI\" --decision decision=\"Use one lock\" --link '$task' implements '$decision'", "apply a small inline planning batch without a JSON file"),
+        CommandExample("agent list --type task --status open --json", "list filtered working-memory items"),
+        CommandExample('agent search "reset working graph" --json', "search the Agent Workspace"),
+        CommandExample("agent show AGENT_TASK_ID --json", "inspect a working-memory node or relation"),
+        CommandExample("agent map --session current --json", "summarize the current Agent Workspace session"),
+        CommandExample('agent handoff "Worker done; review saved map"', "publish this agent's saved working map to the master bus"),
+        CommandExample("agent export --json", "export the Agent Workspace for another coding agent"),
+        CommandExample("agent reset", "discard agent-created working memory and re-derive from the current standard graph"),
     ),
     workflow_steps=(
-        "Start with `{command_name} project status .` before broad repository exploration.",
+        "Start every repository-context task with `{command_name} project status .` before raw repository reads or broad exploration.",
         (
-            "If status succeeds, treat the graph as already built. Use `{command_name} query_context --query \"...\"`, "
-            "`{command_name} query_explore --query \"...\"`, `{command_name} query_memories --query \"...\"`, `{command_name} query_graph --query \"...\"`, "
-            "`{command_name} inspect --node-id NODE_ID --json`, or `{command_name} query \"...\"` for repository context."
+            "If status reports an active project, use REQL before reading code: `--code` for implementation and fixes, "
+            "`--cleanup` for cleanup or dead-code work, and `query_explore --view owners --view code` when context is noisy."
         ),
         (
-            "For implementation or bug-fix tasks, start with the simplest useful query, usually "
-            "`{command_name} query_context --query \"<terms from user request>\" --code`. For narrow exact-name removals or checks, "
-            "`{command_name} query_context --query \"<exact term>\"` is often enough. Use the files, symbols, and line ranges it renders "
-            "as the starting point. If more source is needed, read only the missing spans. Inspect the listed symbols and line ranges "
-            "before reading whole files or adding new modules, wrappers, overrides, or parallel implementations. Use `{command_name} query_explore --query "
-            "\"<terms from user request>\" --view owners --view code --view callers --view public_surface` when "
-            "you need dependency slices before reading source files. When the rendered context lacks enough code, use "
-            "`{command_name} query_context --query \"<terms from user request>\" --code`, "
-            "`{command_name} inspect --node-id NODE_ID --json`, or `{command_name} query "
+            "For narrow exact-name removals or checks, `{command_name} query_context --query \"<exact term>\"` is often enough. "
+            "Use returned files, symbols, "
+            "file spans, and targeted reads first; read whole files only when the returned spans are missing or ambiguous. "
+            "Use `{command_name} inspect --node-id NODE_ID --json` or `{command_name} query "
             "\"RETRIEVE \\\"<terms from user request>\\\" LIMIT 8 RETURN id,type,text,score,relative_path,line_start,line_end\"` "
-            "to get exact locations, then read only the local file spans that still need source-level inspection."
+            "to tighten source/code text with exact locations."
         ),
         (
             "Choose the query_context mode explicitly: no flag (`informative`) for project knowledge, structure, documents, "
             "existence checks, and architecture questions; add `--code`, `--docs`, or `--test` to limit the same mode to a precise section; "
-            "`--cleanup` for dead code, unused imports, unused variables, and removal candidates."
+            "`--cleanup` for safe-remove dead code, unused imports, unused variables, and removal candidates; add `--include-risky` only when you intentionally want public API, low-confidence, test-local, or validation-required candidates."
         ),
         (
             "If status reports `Project not found`, immediately run `{command_name} project compile .` from the "
@@ -95,8 +114,7 @@ PROJECT_SKILL_SOURCE = SkillSource(
             "After compile succeeds, query REQL before reading many files."
         ),
         (
-            "If `{command_name} project compile .` fails, report the failure briefly, then continue with targeted raw "
-            "file reads only as a fallback."
+            "If `{command_name} project compile .` fails, report the failure briefly, then continue with targeted raw file reads only as a fallback."
         ),
         "Document processing runs locally inside `{command_name} project compile .`.",
         (
@@ -110,30 +128,30 @@ PROJECT_SKILL_SOURCE = SkillSource(
             "Query the maintained graph instead."
         ),
         (
-            "Use REQL as the repository context index before raw repository scans. Do not run broad `rg`, recursive "
-            "directory listings, custom scanners, `find`, `grep -R`, ad hoc Python/Node crawlers, or other repository-wide "
-            "discovery commands to duplicate `query_context`, `query_explore`, `query_memories`, or `query_graph` "
-            "results. Read specific files only after REQL identifies them, when the user names an exact file/path, "
-            "or when exact source edits, targeted debugging, or tests require them. Use raw `{command_name} query \"...\"` "
-            "statements when you need exact rows, custom columns, explicit filters, provenance fields, or graph checks that "
-            "the higher-level `query_*` commands do not render."
+            "Use REQL as the repository context index before raw repository scans. Do not run broad `rg`, recursive listings, "
+            "custom scanners, `find`, `grep -R`, ad hoc crawlers, or other repository-wide discovery commands to duplicate "
+            "`query_context`, `query_explore`, `query_memories`, or `query_graph` results. Raw tools are for exact user-named "
+            "paths, REQL-returned candidates, targeted debugging, edits, and tests."
         ),
         (
-            "When raw tools are needed, keep them narrow: inspect REQL-returned paths and line ranges first, use "
-            "file-scoped `rg`/symbol searches rather than workspace-wide scans, and stop expanding once there is enough "
-            "evidence to choose the owner file or edit location."
+            "Open raw source only when REQL returned the path, symbol, or span; the user explicitly named the file; or a "
+            "test/debug failure requires that file. Prefer the line spans REQL returned over whole files. If more than three "
+            "files or roughly 200 raw lines are needed before editing, stop expanding and refine the REQL query instead. "
+            "Use file-scoped `rg`/symbol searches for targeted validation."
         ),
         (
-            "For unused-code or dead-code requests, query REQL cleanup findings first. Read `references/query.md`, "
-            "use `FINDINGS` or `StaticAnalysisFinding` queries for candidates, then validate candidates with targeted "
-            "source reads or symbol searches before recommending removals."
+            "Before editing, state the REQL query used and why each opened file is needed."
         ),
         (
-            "Do not add exclusions before the first bootstrap compile unless the user explicitly asked for exclusions "
-            "or the path is an obvious dependency/cache/build-output directory such as `node_modules/`, `vendor/`, "
-            "`.tmp/`, `dist/`, or `build/`. Never exclude framework/source roots needed for the task, such as "
-            "`wp-content/`, application directories, plugin/theme directories, or broad core directories, just to make "
-            "indexing smaller."
+            "For unused-code or dead-code requests, query REQL cleanup findings first. Remove directly only high-confidence "
+            "local findings such as unused imports or variables. Treat public APIs, CLI/MCP commands, hooks, `to_dict`, "
+            "serializers, tests, and re-exports as review-needed unless REQL gives stronger evidence. Read `references/query.md`, "
+            "use `FINDINGS` or `StaticAnalysisFinding` queries for candidates, then validate candidates with targeted source reads or symbol searches."
+        ),
+        (
+            "Do not add exclusions before the first bootstrap compile unless the user asked for them or the path is an obvious "
+            "dependency/cache/build-output directory such as `node_modules/`, `vendor/`, `.tmp/`, `dist/`, or `build/`. "
+            "Never exclude framework/source roots needed for the task."
         ),
         (
             "When exclusions are needed, call `{command_name} project exclude` once with all patterns in one command. "
@@ -157,10 +175,83 @@ PROJECT_SKILL_SOURCE = SkillSource(
             "`{command_name} project compile .` bootstrap after `Project not found`."
         ),
         "Keep REQL optional and deterministic: compile, document processing, query, retrieval, reports, hubs, and communities run locally.",
+        "Use `{command_name} agent status` before relying on working memory.",
+        (
+            "If the Agent Workspace is missing, run `{command_name} agent init` after the standard project graph "
+            "exists. The command returns an `agent_id`, registers that private workspace on the shared bus, and makes it current for later `agent` commands. "
+            "If the standard graph is stale or missing, use the project workflow first to compile/update it."
+        ),
+        (
+            "Use Agent Workspace mode for planning on large projects when coding-agent context is too small; use it on small tasks when "
+            "links between requirements, decisions, files, and tasks would otherwise get lost."
+        ),
+        (
+            "Start a focused working session with `{command_name} agent session start \"...\"` when old agent history would make `agent map` noisy."
+        ),
+        (
+            "For parallel workers, keep each worker on its own private memory with `{command_name} agent --agent AGENT_ID ...` or `REQL_AGENT_ID=AGENT_ID`. "
+            "Use `{command_name} agent bus` to read shared messages and handoffs without merging private working graphs."
+        ),
+        (
+            "Plan: use `{command_name} agent add \"...\"`, `agent decision add`, and `agent finding add` for compact info, choices, "
+            "constraints, assumptions, and risks. Keep each entry short and factual."
+        ),
+        (
+            "Task build: create tasks with `{command_name} agent task add \"...\"`; link each task to relevant plan items, decisions, "
+            "findings, files, or symbols with `{command_name} agent link ID1 ID2 --relation depends_on|implements|touches|explains|related_to`, "
+            "Use `{command_name} agent link-task --file path/to/file.py` when you know a file path but not its graph id. "
+            "Use `{command_name} agent link-many TASK_ID ID1 ID2 --relation touches` for repeated links. "
+            "For small planning batches, prefer `{command_name} agent batch --task task=\"...\" --decision decision=\"...\" --link '$task' implements '$decision'` over several separate writes."
+        ),
+        (
+            "Quick review: run `{command_name} agent map --session current`, `{command_name} agent map`, or `{command_name} agent map --task TASK_ID` before editing to check open tasks, "
+            "choices, constraints, touched files, and missing links."
+        ),
+        (
+            "Code linking: before writing, attach planned code targets to tasks by linking task ids to REQL-returned file/symbol node ids. "
+            "After `{command_name} project compile .` adds new files, run `{command_name} agent sync` before linking the new standard nodes. "
+            "When useful, store a short `agent add` code note and link it to the task; assemble the implementation by following those links."
+        ),
+        (
+            "Write: edit the project files, mark completed tasks with `{command_name} agent task done AGENT_TASK_ID`, and add findings or "
+            "decisions only when they affect the remaining work."
+        ),
+        (
+            "Link agent items to the standard graph whenever possible. Use ids returned by `query_context`, `query_graph`, "
+            "`query_memories`, `inspect`, or `agent search`. If those ids are new standard nodes from files added by a recent "
+            "`{command_name} project compile .`, run `{command_name} agent sync` before linking them. Then run "
+            "`{command_name} agent link ID1 ID2 --relation touches|implements|depends_on|blocks|explains|derived_from|related_to|replaces|conflicts_with`, or "
+            "`{command_name} agent link-task --file path/to/file.py` for task-to-file links without a manual id lookup. "
+            "Use `{command_name} agent batch --json FILE` or inline `agent batch --task ... --link ...` when several agent writes should share one lock."
+        ),
+        (
+            "Use `{command_name} agent map` after context loss or compaction to reconstruct the current working set. "
+            "Use `{command_name} agent map --session current` when a current session exists. Treat `open_tasks`, `decisions`, `files`, `symbols`, and `relations` as the operational handoff."
+        ),
+        (
+            "Use `{command_name} agent list --type ... --status ...` and `{command_name} agent search \"...\"` for focused retrieval. "
+            "Use `--json` when another tool or agent needs structured fields. Add `--metadata` only when timestamps, source fields, storage paths, or stored metadata are needed."
+        ),
+        (
+            "When a worker is done, run `{command_name} agent handoff \"summary\"` to publish the current saved working map to the master bus. "
+            "The handoff includes open tasks, decisions, files, symbols, and essential relations."
+        ),
+        (
+            "Run `{command_name} agent reset` only when intentionally discarding session working memory. Reset keeps the "
+            "standard graph untouched and re-derives the Agent Workspace from the current `.reql/memory.reql`."
+        ),
+        (
+            "Do not use the Agent Workspace as canonical project memory. Project facts belong in the standard graph via "
+            "`project compile`; agent notes/tasks/decisions are temporary and session-scoped."
+        ),
+        (
+            "Do not run multiple `reql agent` write commands in parallel. If a command reports that the Agent Workspace "
+            "is busy, retry after the other command finishes."
+        ),
     ),
     rule_points=(
         "Prefer `{command_name}`. If it is not on `PATH`, use `{command_path}`. If that is unavailable, use `{fallback_command}`.",
-        "Start with `{command_name} project status .` to check graph state.",
+        "Start every repository-context task with `{command_name} project status .` before raw repository reads.",
         (
             "If status reports `Project not found`, immediately run `{command_name} project compile .` from the "
             "runtime workspace root before broad raw file exploration. If compile fails, report the failure and use "
@@ -173,32 +264,28 @@ PROJECT_SKILL_SOURCE = SkillSource(
             "in parallel; pass all patterns in one command."
         ),
         (
-            "Retrieve bounded context with a query built from the user request's own feature, behavior, file, command, "
-            "error, field, endpoint, API, or symbol terms. Keep the user's language, preserve identifiers and exact errors, "
-            "and use the simplest query that can answer where to look, usually `{command_name} query_context --query \"<terms from user request>\"`. "
-            "Use `{command_name} query_explore --query \"<terms from user request>\"`, "
-            "`{command_name} query_memories --query \"<terms from user request>\"`, or "
-            "`{command_name} query_graph --query \"<terms from user request>\"`. Do not duplicate that context with broad "
+            "When status reports an active project, retrieve bounded context with a query built from the user request's own "
+            "feature, behavior, file, command, error, field, endpoint, API, or symbol terms. Use `--code` for implementation "
+            "and fixes, `--cleanup` for cleanup or dead code, and `query_explore --view owners --view code` when results are noisy. "
+            "Use `query_context`, `query_memories`, or `query_graph` before broad source discovery. Do not duplicate that context with broad "
             "`rg`, recursive directory listings, `find`, `grep -R`, custom scanners, ad hoc crawlers, or other repository-wide discovery commands."
         ),
         (
-            "Limit raw scans and large reads. Do not start with workspace-wide raw tools when REQL can answer where to look. "
-            "After REQL returns candidate files, symbols, or line ranges, use raw tools only in those paths or nearby spans, "
-            "or for exact user-named files and test/debug verification."
+            "Limit raw scans and large reads. Open raw source only when REQL returned the path, symbol, or span; the user "
+            "explicitly named the file; or a test/debug failure requires it. Prefer returned line ranges over whole files. "
+            "If more than three files or roughly 200 raw lines are needed before editing, refine REQL instead of expanding raw reads."
         ),
         (
             "Choose the query_context mode explicitly: no flag (`informative`) for project knowledge, structure, documents, "
             "existence checks, and architecture questions; add `--code`, `--docs`, or `--test` to limit the same mode to a precise section; "
-            "`--cleanup` for dead code, unused imports, unused variables, and removal candidates."
+            "`--cleanup` for safe-remove dead code, unused imports, unused variables, and removal candidates; add `--include-risky` only when you intentionally want public API, low-confidence, test-local, or validation-required candidates."
         ),
         (
             "For code changes, start with `{command_name} query_context --query \"<terms from user request>\" --code` to identify the smallest existing "
             "functions, methods, classes, files, and line ranges. For exact-name cleanup or removal tasks, a plain "
             "`{command_name} query_context --query \"<exact term>\"` can be enough and should be tried before more complex queries. "
-            "Prefer returned line ranges over reading whole files. Use `{command_name} "
-            "query_explore --query \"<terms from user request>\" --view owners --view code` when the context "
-            "is noisy or you need a tighter function-level slice before editing. If you need more code before editing, "
-            "use `inspect --node-id`, `RETRIEVE ... RETURN id,type,text,score,relative_path,line_start,line_end`, or `--json` only when structured fields are genuinely needed "
+            "If you need more code before editing, use `inspect --node-id`, "
+            "`RETRIEVE ... RETURN id,type,text,score,relative_path,line_start,line_end`, or `--json` only when structured fields are genuinely needed "
             "to collect locations before opening files, and avoid creating parallel implementations until "
             "REQL shows no suitable owner."
         ),
@@ -211,15 +298,23 @@ PROJECT_SKILL_SOURCE = SkillSource(
             "`relation`, or `direction` when provenance matters."
         ),
         (
+            "Before editing, state the REQL query used and why each opened file is needed."
+        ),
+        (
             "For unused-code cleanup, start with `{command_name} query \"FINDINGS WHERE finding_type IN "
             "[\\\"unused_variable\\\",\\\"unused_import\\\",\\\"possibly_unused_function\\\","
-            "\\\"possibly_unused_method\\\",\\\"possibly_unused_class\\\"] RETURN finding_type,severity,"
-            "cleanup_priority,symbol_type,symbol_name,qualified_name,relative_path,line_start,reason\"`, then "
-            "cross-check likely removals with targeted source reads or symbol searches."
+            "\\\"possibly_unused_method\\\",\\\"possibly_unused_class\\\",\\\"possibly_orphan_directory\\\"] RETURN finding_type,severity,"
+            "cleanup_priority,symbol_type,symbol_name,qualified_name,relative_path,directory,file_count,files,line_start,reason\"`, then "
+            "remove directly only high-confidence local findings such as unused imports or variables. Treat public APIs, "
+            "CLI/MCP commands, hooks, `to_dict`, serializers, tests, and re-exports as review-needed unless REQL gives stronger evidence."
         ),
         (
             "After modifying project files, run `{command_name} project compile .` once before finishing unless a "
             "`{command_name} project compile . --watch` process was already running and updated the graph."
+        ),
+        (
+            "After `{command_name} project compile .` adds new files, run `{command_name} agent sync` before linking "
+            "Agent Workspace items to the new standard graph nodes."
         ),
         "For document processing, run `{command_name} project compile .` normally. REQL applies configured document policies internally and uses its local deterministic processor.",
         (
@@ -238,10 +333,29 @@ PROJECT_SKILL_SOURCE = SkillSource(
             "repeated full rebuilds; start watch mode when monitoring/continuous updates are requested or a "
             "long-running process is appropriate."
         ),
+        "Use `{command_name} agent status` to check Agent Workspace state.",
+        "Use `{command_name} agent init` after the standard project graph exists; it returns an `agent_id`, registers a private workspace, and makes it current on the bus.",
+        "Use `{command_name} agent session start \"...\"` to create a focused current session and keep old agent history out of `agent map --session current`.",
+        "Use `{command_name} agent bus` to inspect the shared internal bus; use `{command_name} agent publish \"...\"` for short shared messages and `{command_name} agent handoff \"...\"` when a worker should return saved context to master.",
+        (
+            "Use Agent Workspace mode as a planning layer when project context exceeds the coding-agent window; on small tasks, use it "
+            "to preserve links between requirements, choices, constraints, tasks, files, symbols, and implementation notes."
+        ),
+        (
+            "Agent workflow: Plan with `agent add`, `agent decision add`, and `agent finding add`; task build with `agent task add`; "
+            "quick review with `agent map --session current` or `agent map`; code linking with `agent link` or `agent link-many` from tasks to files/symbols/fragments/static findings/code notes; write the project code; "
+            "then mark done tasks with `agent task done`."
+        ),
+        "After compile with new files, use `{command_name} agent sync` before linking new standard nodes.",
+        "Use `{command_name} agent link` to connect tasks, decisions, findings, files, symbols, risks, plans, and code notes.",
+        "Use `{command_name} agent batch --json FILE` or inline `{command_name} agent batch --task task=\"...\" --decision decision=\"...\" --link '$task' implements '$decision'` to add/link several Agent Workspace items with one lock instead of many serial commands.",
+        "Use `{command_name} agent map` to recover context after compaction, review links, or assemble work from linked tasks.",
+        "Use `{command_name} agent handoff \"summary\"` for master-facing completion payloads and `{command_name} agent export --json` for a compact private workspace export. Add `--metadata` only when a full metadata-bearing workspace dump is required.",
+        "Use `{command_name} agent reset` only when intentionally discarding session-scoped working memory.",
+        "Avoid parallel `reql agent` write commands; retry if the workspace is busy.",
     ),
-    deterministic_requirement="Keep REQL optional and deterministic; document processing runs in the local compiler.",
+    deterministic_requirement="Keep REQL optional and deterministic; document processing runs in the local compiler, and Agent Workspace operations stay local and separate from the standard REQL graph.",
 )
-
 
 def skill_markdowns(
     platform_name: str,
@@ -274,14 +388,24 @@ def skill_resources(
     command_path: Path,
     fallback_command: str,
 ) -> tuple[tuple[str, str, str], ...]:
-    resources = _project_skill_resources(
+    project_resources = _project_skill_resources(
         platform_name=platform_name,
         scope=_scope(project),
         command_name=command_name,
         command_path=command_path,
         fallback_command=fallback_command,
     )
-    return tuple((PROJECT_SKILL_SOURCE.name, item.path, item.content) for item in resources)
+    agent_workspace = _agent_workspace_resource(
+        platform_name=platform_name,
+        scope=_scope(project),
+        command_name=command_name,
+        command_path=command_path,
+        fallback_command=fallback_command,
+    )
+    return (
+        *(tuple((PROJECT_SKILL_SOURCE.name, item.path, item.content) for item in project_resources)),
+        (PROJECT_SKILL_SOURCE.name, agent_workspace.path, agent_workspace.content),
+    )
 
 
 def skill_markdown(
@@ -306,6 +430,8 @@ Use `{command_name} project compile . --watch` as monitor mode while the agent i
 
 Use `--watch-interval`, `--watch-debounce`, and `--watch-iterations` only when a bounded scripted run is needed.
 """
+    workflow_heading = "Required Project and Agent Workspace Workflow" if source.name == PROJECT_SKILL_SOURCE.name else "Required Agent Workflow"
+    reference_routing = _reference_routing(source.name)
     return f"""---
 name: {source.name}
 description: {source.description.format(platform_name=platform_name)}
@@ -325,17 +451,13 @@ description: {source.description.format(platform_name=platform_name)}
 reql-mcp --read-only                                    # optional MCP server for clients that support tools
 ```
 
-## Required Agent Workflow
+## {workflow_heading}
 
 {workflow}
 {watch_mode}
 ## Reference Routing
 
-- Read `references/bootstrap.md` when checking project state, compiling for the first time, handling exclusions, or deciding whether to fall back to raw files.
-- Read `references/query.md` when answering a repository question from an existing REQL graph or choosing between `query_context`, `query_memories`, `query_graph`, and REQL statements.
-- Read `references/update-watch.md` after modifying files, when a watcher is running, or when cache/delta state matters.
-- Read `references/reports-exports.md` when generating reports, exporting graph artifacts, inspecting hubs/communities, or wiring MCP.
-- Read `references/document-semantics.md` only when the task involves document ingestion or local document processing.
+{reference_routing}
 
 ## Ground Rules
 
@@ -348,6 +470,19 @@ Installed for: {platform_name} ({scope}).
 """
 
 
+def _reference_routing(source_name: str) -> str:
+    return "\n".join(
+        [
+            "- Read `references/bootstrap.md` when checking project state, compiling for the first time, handling exclusions, or deciding whether to fall back to raw files.",
+            "- Read `references/query.md` when answering a repository question from an existing REQL graph or choosing between `query_context`, `query_memories`, `query_graph`, and REQL statements.",
+            "- Read `references/update-watch.md` after modifying files, when a watcher is running, or when cache/delta state matters.",
+            "- Read `references/reports-exports.md` when generating reports, exporting graph artifacts, inspecting hubs/communities, or wiring MCP.",
+            "- Read `references/document-semantics.md` only when the task involves document ingestion or local document processing.",
+            "- Read `references/agent-workspace.md` when using `reql agent` commands, recovering working context, linking agent tasks to standard graph nodes, or exporting/resetting the Agent Workspace.",
+        ]
+    )
+
+
 def _project_skill_resources(
     *,
     platform_name: str,
@@ -358,8 +493,8 @@ def _project_skill_resources(
 ) -> tuple[SkillResource, ...]:
     usage = _command_usage(command_name=command_name, command_path=command_path, fallback_command=fallback_command)
     openai_yaml = """display_name: REQL Project
-short_description: Use REQL deterministic memory before broad repository exploration.
-default_prompt: Use REQL to inspect this project, compile it if needed, and answer from bounded graph context with cited evidence.
+short_description: Use REQL graph context and agent memory.
+default_prompt: Use REQL to inspect this project, compile it if needed, answer from bounded graph context, and persist working-memory tasks, decisions, and findings when useful.
 """
     bootstrap = f"""# REQL reference: bootstrap and project state
 
@@ -437,7 +572,7 @@ Common REQL statements:
 {command_name} query "FRAGMENTS WHERE relative_path CONTAINS 'docs' LIMIT 20"
 {command_name} query "RETRIEVE 'office plant' LIMIT 8 RETURN id,type,text,score,relative_path,line_start,line_end"
 {command_name} query "FIND nodes WHERE text ILIKE '%office plant%' LIMIT 10"
-{command_name} query "FINDINGS WHERE finding_type IN ['unused_variable','unused_import','possibly_unused_function','possibly_unused_method','possibly_unused_class'] RETURN finding_type,severity,cleanup_priority,symbol_type,symbol_name,qualified_name,relative_path,line_start,reason"
+{command_name} query "FINDINGS WHERE finding_type IN ['unused_variable','unused_import','possibly_unused_function','possibly_unused_method','possibly_unused_class','possibly_orphan_directory'] RETURN finding_type,severity,cleanup_priority,symbol_type,symbol_name,qualified_name,relative_path,directory,file_count,files,line_start,reason"
 {command_name} query "MATCH (s)-[:HAS_FINDING]->(f:StaticAnalysisFinding) RETURN s.type,s.name,f.finding_type,f.relative_path,f.line_start"
 {command_name} query "HUBS LIMIT 20"
 {command_name} query "CACHE STATUS"
@@ -476,7 +611,7 @@ REQL is not an LLM. It uses tokenization, lexical matching, graph links, and act
 
 - Informative: use no mode flag for project knowledge, structure, documents, architecture, existence checks, and "is there anything like X" questions. Prefer `{command_name} query_context --query "<terms from user request>"`, `{command_name} query_memories --query "<terms from user request>"`, or `{command_name} query_graph --query "<terms from user request>" --max-depth 2`. Use the rendered files, line references, source evidence, graph links, and embedded raw-query research references.
 - Scope filters: use `--code`, `--docs`, and `--test` with informative or cleanup queries when the user asks for a precise section. They restrict results to code symbols/source, documentation/imported documents, or tests.
-- Cleanup: use `--cleanup` for dead code, unused imports, unused variables, possibly-unused functions/classes/methods, and removal candidates. Start with `{command_name} query_context --query "<terms from user request>" --cleanup` or the `FINDINGS` query below, then remove only confirmed candidates.
+- Cleanup: use `--cleanup` for safe-remove dead code, unused imports, unused variables, and removal candidates. Start with `{command_name} query_context --query "<terms from user request>" --cleanup` or the `FINDINGS` query below, then remove only confirmed candidates. Add `--include-risky` only when you intentionally want public API, low-confidence, test-local, or validation-required candidates.
 
 ## Dependency Exploration
 
@@ -529,7 +664,7 @@ Recommended sequence:
 3. List concrete findings with:
 
 ```bash
-{command_name} query "FINDINGS WHERE finding_type IN ['unused_variable','unused_import','possibly_unused_function','possibly_unused_method','possibly_unused_class'] RETURN finding_type,severity,cleanup_priority,symbol_type,symbol_name,qualified_name,relative_path,line_start,reason,evidence_scope,confidence ORDER BY cleanup_priority LIMIT 100"
+{command_name} query "FINDINGS WHERE finding_type IN ['unused_variable','unused_import','possibly_unused_function','possibly_unused_method','possibly_unused_class','possibly_orphan_directory'] RETURN finding_type,severity,cleanup_priority,symbol_type,symbol_name,qualified_name,relative_path,directory,file_count,files,line_start,reason,evidence_scope,confidence ORDER BY cleanup_priority LIMIT 100"
 ```
 
 4. Expand provenance for ambiguous rows with:
@@ -539,9 +674,9 @@ Recommended sequence:
 ```
 
 5. Inspect only the candidate files and nearby callers/importers. Use targeted symbol searches when needed to check entry points, tests, public exports, callbacks, dynamic `getattr`/reflection, and documentation examples.
-6. Classify results separately: safe removals, likely dead but public/API-risk, and false positives. Treat `possibly_unused_function`, `possibly_unused_method`, and `possibly_unused_class` as local cleanup candidates, not whole-program proof.
+6. Classify results separately: safe removals, likely dead but public/API-risk, directory-level review items, and false positives. Treat `possibly_unused_function`, `possibly_unused_method`, and `possibly_unused_class` as local cleanup candidates, not whole-program proof.
 
-Prefer high-priority `unused_variable` and `unused_import` findings for direct edits. Require stronger evidence before deleting public functions, methods, classes, scripts, generated adapters, CLI/MCP tools, or framework lifecycle methods.
+Prefer high-priority `unused_variable` and `unused_import` findings for direct edits. `possibly_orphan_directory` findings aggregate multiple isolated code files under one containing directory with `file_count` and `files`; validate entrypoints, plugins, scripts, dynamic imports, and external users before deleting that directory. Require stronger evidence before deleting public functions, methods, classes, scripts, generated adapters, CLI/MCP tools, or framework lifecycle methods.
 
 ## JSON mode
 
@@ -685,6 +820,223 @@ Do not add manual document import steps. The core compile path must remain deter
     )
 
 
+def _agent_workspace_resource(
+    *,
+    platform_name: str,
+    scope: str,
+    command_name: str,
+    command_path: Path,
+    fallback_command: str,
+) -> SkillResource:
+    usage = _command_usage(command_name=command_name, command_path=command_path, fallback_command=fallback_command)
+    agent_workspace = f"""# REQL reference: Agent Workspace
+
+Load this when using `reql agent` to persist coding-agent working memory, recover context after compaction, link operational tasks to graph nodes, or export/reset session-scoped memory.
+
+## Command resolution
+
+{usage}
+
+## Purpose
+
+`{command_name} agent` writes to a private project-local graph for the current agent. CLI-created worker memories live under `.reql/agents/AGENT_ID.reql`; the Python API follows the bus current agent when one exists, and otherwise falls back to the compatible master workspace at `.reql/agent.reql`. The standard project graph remains `.reql/memory.reql` and is not modified by agent notes, tasks, decisions, findings, plans, risks, or links.
+
+All agents share an internal bus at `.reql/agent-bus.reql`. The bus stores registered agents, short shared messages, and handoffs. Use it to coordinate workers without merging their private working graphs.
+
+Use the standard graph for stable project facts. Use Agent Workspace mode as the planning layer when a project is too large for the coding-agent context window. It is also useful on small tasks when requirements, files, choices, and implementation steps need explicit links.
+
+Store only durable operational memory:
+
+- files and symbols read during this session;
+- decisions and why they were made;
+- findings, assumptions, risks, and blockers;
+- tasks, plans, completed work, and follow-up work;
+- links between tasks, decisions, findings, code notes, files, symbols, and standard graph nodes.
+
+## Bootstrap
+
+Check state:
+
+```bash
+{command_name} agent status
+```
+
+Initialize from the current standard graph:
+
+```bash
+{command_name} agent init
+```
+
+`agent init` returns an `agent_id`, registers that private memory on the shared bus, and makes it current for later `agent` commands in the same project. A simple single-agent run does not need extra flags. Parallel workers can reuse their id explicitly:
+
+```bash
+{command_name} agent --agent AGENT_ID status
+REQL_AGENT_ID=AGENT_ID {command_name} agent map --session current
+```
+
+If the standard graph does not exist or is stale, use the `reql-agent` skill first:
+
+```bash
+{command_name} project status .
+{command_name} project compile .
+```
+
+After `{command_name} project compile .` adds new files, run `{command_name} agent sync` before linking Agent Workspace items to the new standard nodes.
+
+## Required Agent Workflow
+
+Keep entries short and factual. Prefer one useful sentence over repeated status prose.
+
+### 1. Plan
+
+Add information, choices, constraints, assumptions, risks, and blockers:
+
+```bash
+{command_name} agent bus
+{command_name} agent session start "Focused implementation pass"
+{command_name} agent add "Read src/memory/cli.py; argparse owns command routing"
+{command_name} agent decision add "Keep .reql/agent.reql separate from .reql/memory.reql"
+{command_name} agent finding add "agent list should not dump standard relations"
+```
+
+### 2. Task Build
+
+Create the task list and link tasks to plan elements:
+
+```bash
+{command_name} agent task add "Patch agent map to show only touched files"
+{command_name} agent link AGENT_TASK_ID AGENT_DECISION_ID --relation implements
+{command_name} agent link AGENT_TASK_ID AGENT_FINDING_ID --relation depends_on
+{command_name} agent link-many AGENT_TASK_ID STANDARD_FILE_ID STANDARD_SYMBOL_ID --relation touches
+{command_name} agent batch --task task="Patch agent map" --decision decision="Use one workspace lock" --link '$task' implements '$decision'
+```
+
+Use task descriptions as executable work items, not summaries. Each task should point to the plan item, constraint, file, or symbol that explains it.
+When several items or links are known at once, prefer `{command_name} agent batch --json FILE` or inline `agent batch --task ... --link ...` so the Agent Workspace takes one lock.
+
+### 3. Quick Review
+
+Before editing, check that the map has enough structure to recover the work:
+
+```bash
+{command_name} agent map
+{command_name} agent map --session current
+{command_name} agent map --task AGENT_TASK_ID
+```
+
+Review open tasks, choices, constraints, touched files, and missing links. Use `--session current` when old agent history is not relevant. Add only the missing facts.
+
+### 4. Code Linking
+
+After REQL returns file or symbol ids, link planned code targets to tasks. If `{command_name} project compile .` created new file or symbol nodes, run `{command_name} agent sync` before linking those new standard nodes. Use this to assemble the implementation from the task graph before writing:
+
+```bash
+{command_name} agent sync
+{command_name} agent link AGENT_TASK_ID STANDARD_FILE_OR_SYMBOL_ID --relation touches
+{command_name} agent link-task --file test-agent/context_savings.py
+{command_name} agent add "Code note: update _agent_workspace_resource to describe plan/task/review/link/write flow"
+{command_name} agent link AGENT_TASK_ID AGENT_NOTE_ID --relation implements
+{command_name} agent link-many AGENT_TASK_ID STANDARD_FILE_ID STANDARD_SYMBOL_ID --relation touches
+```
+
+Code notes are for short target-specific intent, not long code dumps. The actual code belongs in project files.
+
+### 5. Write
+
+Edit the project, then update task state:
+
+```bash
+{command_name} agent task done AGENT_TASK_ID
+```
+
+Add new decisions or findings only when they change remaining work.
+
+### 6. Handoff To Master
+
+When a worker has saved the facts the master needs, publish a handoff:
+
+```bash
+{command_name} agent handoff "Worker finished parser review"
+{command_name} agent bus --json
+```
+
+The handoff snapshots the current saved map: open tasks, decisions, files, symbols, and essential relations. The master can read it from the bus and decide the next step without opening the worker's private store directly.
+
+## Link Agent Items
+
+Use ids returned by `query_context`, `query_graph`, `query_memories`, `inspect`, `agent list`, or `agent search`. After compile with new files, run sync before linking new standard nodes:
+
+```bash
+{command_name} agent sync
+{command_name} agent link AGENT_TASK_ID STANDARD_NODE_ID --relation touches
+{command_name} agent link AGENT_TASK_ID AGENT_DECISION_ID --relation implements
+{command_name} agent link AGENT_FINDING_ID STANDARD_SYMBOL_ID --relation explains
+{command_name} agent link-many AGENT_TASK_ID STANDARD_FILE_ID STANDARD_SYMBOL_ID --relation touches
+```
+
+Supported relation types:
+
+- `depends_on`
+- `blocks`
+- `implements`
+- `touches`
+- `explains`
+- `derived_from`
+- `related_to`
+- `replaces`
+- `conflicts_with`
+
+## Recover Context
+
+Use the map after context loss, thread compaction, or a long pause:
+
+```bash
+{command_name} agent map
+{command_name} agent map --session current
+{command_name} agent map --json
+```
+
+The map is intentionally operational and compact: open tasks, decisions, files directly touched by agent relations, symbols, and essential agent-created relations. It should not dump findings, fragments, metadata, or every derived standard file unless metadata is explicitly requested.
+
+Search and inspect:
+
+```bash
+{command_name} agent list --type task --status open --json
+{command_name} agent search "reset working graph" --json
+{command_name} agent search "reset working graph" --json --metadata
+{command_name} agent show AGENT_TASK_ID --json
+{command_name} agent bus --json
+```
+
+`agent list` keeps relation output focused on agent-created relations and, when node filters are present, relations connected to the listed nodes.
+
+## Export and Reset
+
+Export for another coding agent:
+
+```bash
+{command_name} agent handoff "Summary for master"
+{command_name} agent export --json
+{command_name} agent export --json --metadata
+```
+
+Reset only when intentionally discarding session-scoped working memory:
+
+```bash
+{command_name} agent reset
+```
+
+Reset recreates `.reql/agent.reql` from the current standard graph and deletes agent-created notes/tasks/decisions/findings/links. It does not modify `.reql/memory.reql`.
+
+## Concurrency
+
+Do not run multiple `reql agent` write commands in parallel. If a command reports that the Agent Workspace is busy, retry after the other command finishes. Read commands retry briefly; write commands fail fast with a clear busy message to avoid hidden hangs.
+
+Installed for: {platform_name} ({scope}).
+"""
+    return SkillResource("references/agent-workspace.md", agent_workspace)
+
+
 def instruction_section(
     platform_name: str,
     *,
@@ -699,13 +1051,12 @@ def instruction_section(
     scope = _scope(project)
     points = (
         _command_preference(command_name=command_name, command_path=command_path, fallback_command=fallback_command),
-        "When the user types `/reql`, use the generated `reql-project` skill or this REQL section before doing broad repository exploration.",
-        "Start with `{command_name} project status .` to check whether this project has graph state.",
+        "When the user types `/reql`, use the generated `reql-agent` skill or this REQL section before doing broad repository exploration.",
+        "Start with `{command_name} project status .` before raw repository reads to check whether this project has graph state.",
         (
-            "For codebase questions, first query REQL when project status succeeds. Use "
-            "`{command_name} query_context --query \"...\"`, `{command_name} query_explore --query \"...\"`, "
-            "`{command_name} query_memories --query \"...\"`, `{command_name} query_graph --query \"...\"`, "
-            "or focused REQL statements before raw source browsing."
+            "For codebase questions, first query REQL when project status succeeds. Use `--code` for implementation and fixes, "
+            "`--cleanup` for cleanup or dead code, `query_explore --view owners --view code` when context is noisy, "
+            "or focused REQL statements for relationship checks."
         ),
         (
             "Use `{command_name} query \"PATH FROM TEXT \\\"A\\\" TO TEXT \\\"B\\\" DEPTH 5\"` or targeted `MATCH`/`FIND`/`EXPLAIN` "
@@ -715,8 +1066,7 @@ def instruction_section(
             "For implementation, bug-fix, or refactor tasks, build a query from the user request's own feature, behavior, "
             "file, command, error, field, endpoint, API, or symbol terms, then use `{command_name} query_context --query \"<terms from user request>\" --code` "
             "as bounded code context. For exact identifiers or legacy names, try the shortest plain query first, such as `{command_name} query_context --query \"graphify\"`. Inspect only missing listed line ranges before whole files. Use `{command_name} query_explore --query \"<terms from user request>\" --view owners --view code` "
-            "when dependency slices are needed or the context is noisy. If you need exact code before editing, use "
-            "`{command_name} query_context --query \"<terms from user request>\" --code`, `{command_name} inspect --node-id NODE_ID --json`, "
+            "when dependency slices are needed or the context is noisy. If you need exact code before editing, use `{command_name} inspect --node-id NODE_ID --json` "
             "or `{command_name} query \"RETRIEVE \\\"<terms from user request>\\\" LIMIT 8 RETURN id,type,text,score,relative_path,line_start,line_end\"`, "
             "then read only the local file spans that still need source-level inspection. Avoid adding wrappers, overrides, or parallel implementations before confirming "
             "there is no suitable owner in the graph."
@@ -744,18 +1094,18 @@ def instruction_section(
         (
             "Use REQL as the repository context index before raw repository scans. Do not run broad `rg`, recursive "
             "directory listings, custom scanners, `find`, `grep -R`, ad hoc Python/Node crawlers, or other repository-wide "
-            "discovery commands to duplicate `query_context`, `query_explore`, `query_memories`, or `query_graph` "
-            "results. Use raw tools only after REQL identifies candidate paths/symbols, when the user names an "
-            "exact file/path, or when targeted verification, editing, debugging, or tests require local source reads."
+            "discovery commands to duplicate `query_context`, `query_explore`, `query_memories`, or `query_graph` results."
         ),
         (
-            "When raw tools are needed, keep them narrow: inspect the REQL-returned paths and line ranges first, use "
-            "file-scoped `rg`/symbol searches rather than workspace-wide scans, and stop expanding once there is enough "
-            "evidence to choose the owner file or edit location."
+            "Open raw source only when REQL returned the path, symbol, or span; the user explicitly named the file; or a "
+            "test/debug failure requires it. Prefer returned line ranges over whole files. If more than three files or "
+            "roughly 200 raw lines are needed before editing, refine the REQL query instead of expanding raw reads."
         ),
         (
-            "For unused-code cleanup requests, query `StaticAnalysisFinding`/`FINDINGS` first, then validate "
-            "candidates with targeted source reads or symbol searches before recommending removals."
+            "Before editing, state the REQL query used and why each opened file is needed. For unused-code cleanup requests, "
+            "query `StaticAnalysisFinding`/`FINDINGS` first. Remove directly only high-confidence local findings such as "
+            "unused imports or variables; treat public APIs, CLI/MCP commands, hooks, `to_dict`, serializers, tests, and "
+            "re-exports as review-needed unless REQL gives stronger evidence."
         ),
         (
             "Use `{command_name} project exclude \"path/or/glob\"` only for explicit exclusions or obvious "
@@ -867,12 +1217,13 @@ def shared_rule_body(
     section_end: str,
 ) -> str:
     points = (
-        "When the user types `/reql`, use the generated `reql-project` skill or this REQL rule before broad repository exploration.",
+        "When the user types `/reql`, use the generated `reql-agent` skill or this REQL rule before broad repository exploration.",
         *PROJECT_SKILL_SOURCE.rule_points,
-        "If project status succeeds, query REQL before raw source browsing. Build a short query from the user request's own feature, behavior, file, command, error, field, endpoint, API, or symbol terms; preserve the user's language, identifiers, and exact errors. Use the simplest bounded command that can answer where to look, usually `{command_name} query_context --query \"<terms from user request>\"`; for exact names, a query such as `{command_name} query_context --query \"graphify\"` is preferred over a long synthetic query. Add `--code`, `--docs`, `--test`, or `--cleanup` only when useful. Use `{command_name} query_explore --query \"<terms from user request>\"`, `{command_name} query_memories --query \"<terms from user request>\"`, `{command_name} query_graph --query \"<terms from user request>\"`, `{command_name} inspect --node-id NODE_ID --json`, and `{command_name} query \"RETRIEVE \\\"<terms from user request>\\\" LIMIT 8 RETURN id,type,text,score,relative_path,line_start,line_end\"` when the first context query is not enough.",
+        "If project status succeeds, query REQL before raw source browsing. Build a short query from the user request's own feature, behavior, file, command, error, field, endpoint, API, or symbol terms; preserve the user's language, identifiers, and exact errors. Use `{command_name} query_context --query \"<terms from user request>\" --code` for implementation and fixes, `{command_name} query_context --query \"<terms from user request>\" --cleanup` for cleanup or dead code, and `{command_name} query_explore --query \"<terms from user request>\" --view owners --view code` when results are noisy. For exact names, a query such as `{command_name} query_context --query \"graphify\"` is preferred over a long synthetic query. Use `{command_name} query_memories --query \"<terms from user request>\"`, `{command_name} query_graph --query \"<terms from user request>\"`, `{command_name} inspect --node-id NODE_ID --json`, and `{command_name} query \"RETRIEVE \\\"<terms from user request>\\\" LIMIT 8 RETURN id,type,text,score,relative_path,line_start,line_end\"` when the first context query is not enough.",
         "Limit raw scans and large reads. Do not start with workspace-wide `rg`, recursive directory listings, `find`, `grep -R`, or custom crawlers when REQL can answer where to look. After REQL returns candidate files, symbols, or line ranges, use raw tools only in those paths or nearby spans, or for exact user-named files and test/debug verification.",
-        "For code edits, make REQL return the smallest useful files and line ranges first with `query_context --query \"...\" --code`; use `--json` only when another tool or script genuinely needs structured fields such as `owner_candidates`, `working_set`, or `targeted_reads`.",
-        "For unused-code cleanup, start with `{command_name} query \"FINDINGS WHERE finding_type IN ['unused_variable','unused_import','possibly_unused_function','possibly_unused_method','possibly_unused_class'] RETURN finding_type,severity,cleanup_priority,symbol_name,qualified_name,relative_path,line_start,reason\"` and validate removals with targeted source reads or symbol searches.",
+        "Open raw source only when REQL returned the path, symbol, or span; the user explicitly named the file; or a test/debug failure requires it. Prefer returned line spans over whole files. If more than three files or roughly 200 raw lines are needed before editing, refine the REQL query instead of expanding raw reads.",
+        "Before editing, state the REQL query used and why each opened file is needed. For code edits, make REQL return the smallest useful files and line ranges first with `query_context --query \"...\" --code`; use `--json` only when another tool or script genuinely needs structured fields such as `owner_candidates`, `working_set`, or `targeted_reads`.",
+        "For unused-code cleanup, start with `{command_name} query \"FINDINGS WHERE finding_type IN ['unused_variable','unused_import','possibly_unused_function','possibly_unused_method','possibly_unused_class','possibly_orphan_directory'] RETURN finding_type,severity,cleanup_priority,symbol_name,qualified_name,relative_path,directory,file_count,files,line_start,reason\"`. Remove directly only high-confidence local findings such as unused imports or variables; treat public APIs, CLI/MCP commands, hooks, `to_dict`, serializers, tests, and re-exports as review-needed unless REQL gives stronger evidence.",
         "Dirty `.reql/` storage, cache, report, or export files are expected after compile/watch/update and are not a reason to skip REQL.",
         "Read `reports/GRAPH_REPORT.md` only for broad architecture review or when bounded queries do not surface enough context.",
         PROJECT_SKILL_SOURCE.deterministic_requirement,
@@ -938,7 +1289,7 @@ def _cursor_body(*, command_name: str, command_path: Path, fallback_command: str
         command_name=command_name,
     )
     return (
-        "When REQL is invoked for repository context, use the generated `reql-project` skill. "
+        "When REQL is invoked for repository context, use the generated `reql-agent` skill. "
         "Before broad repository exploration, check whether REQL has graph context:\n\n"
         f"{preference}\n\n"
         f"If status reports `Project not found`, immediately run `{command_name} project compile .` from the runtime "
@@ -960,5 +1311,6 @@ def _cursor_body(*, command_name: str, command_path: Path, fallback_command: str
         "once before finishing unless a watch process was already running and updated the graph. Before the final response "
         "for any task that changed files, confirm the graph update path: either the watch process already captured the "
         f"edits, or run `{command_name} project compile .` once and report the result briefly. "
+        f"After compile with new files, run `{command_name} agent sync` before linking Agent Workspace items to the new standard nodes. "
         f"{PROJECT_SKILL_SOURCE.deterministic_requirement}"
     )

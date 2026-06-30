@@ -18,6 +18,7 @@ from ..ast import (
     SortSpec,
     Stats,
     TypedNodeList,
+    VerifyFinding,
 )
 from ..errors import REQLSyntaxError
 from .clauses import RESERVED_EXPRESSION_ENDS, SYMBOL_NODE_TYPES, ClauseParserMixin
@@ -325,6 +326,13 @@ class CommandParserMixin(ClauseParserMixin):
             return CacheStatus(limit=limit)
         raise REQLSyntaxError(f"CACHE must be followed by STATUS at position {self.current.position}")
 
+    def _parse_verify(self) -> VerifyFinding:
+        self.expect_keyword("FINDING")
+        finding_id = self._parse_rest_as_identifier("VERIFY FINDING")
+        if not finding_id:
+            raise REQLSyntaxError("VERIFY FINDING expects a finding id")
+        return VerifyFinding(finding_id=finding_id)
+
     def _parse_stats(self) -> Stats:
         group_by: tuple[str, ...] = ()
         node_types: tuple[str, ...] = ()
@@ -336,3 +344,17 @@ class CommandParserMixin(ClauseParserMixin):
             else:
                 raise REQLSyntaxError(f"Unexpected token {self.current.value!r} in STATS statement")
         return Stats(group_by=group_by, node_types=node_types)
+
+    def _parse_rest_as_identifier(self, command: str) -> str:
+        parts: list[str] = []
+        while self.current.kind != "EOF":
+            if self.current.kind == "STRING":
+                value = self.current.value
+            else:
+                value = str(self.current.value)
+            parts.append(value)
+            self.advance()
+        identifier = "".join(parts).strip()
+        if any(ch.isspace() for ch in identifier):
+            raise REQLSyntaxError(f"{command} id must be quoted when it contains whitespace")
+        return identifier

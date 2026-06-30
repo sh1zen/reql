@@ -10,6 +10,8 @@ _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 
 
 def strip_accents(value: str) -> str:
+    if value.isascii():
+        return value
     normalized = unicodedata.normalize("NFKD", value)
     return "".join(ch for ch in normalized if not unicodedata.combining(ch))
 
@@ -31,12 +33,22 @@ def canonicalize(value: str) -> str:
 
 def token_signal_score(token: str) -> float:
     """Estimate token usefulness without language-specific stopword lists."""
-    token = token.strip("_-")
+    return _token_signal_score_stripped(token.strip("_-"))
+
+
+def _token_signal_score_stripped(token: str) -> float:
     if len(token) < 2:
         return 0.0
-    has_alpha = any(char.isalpha() for char in token)
-    has_digit = any(char.isdigit() for char in token)
-    has_structure = any(separator in token for separator in ("_", "-", ".", "/", "\\", "#", "+"))
+    has_alpha = False
+    has_digit = False
+    has_structure = False
+    for char in token:
+        if not has_alpha and char.isalpha():
+            has_alpha = True
+        elif not has_digit and char.isdigit():
+            has_digit = True
+        if not has_structure and char in "_-./\\#+":
+            has_structure = True
     if not has_alpha and not has_digit:
         return 0.0
     score = 0.25
@@ -52,12 +64,28 @@ def token_signal_score(token: str) -> float:
 
 
 def tokenize(value: str, *, keep_stopwords: bool = False) -> list[str]:
-    canonical = canonicalize(value)
-    tokens = [m.group(0).strip("_-") for m in _WORD_RE.finditer(canonical)]
-    tokens = [t for t in tokens if len(t) >= 2]
-    if not keep_stopwords:
-        tokens = [t for t in tokens if token_signal_score(t) > 0.0]
+    tokens, _ = _tokenize_with_signal_scores(value, keep_stopwords=keep_stopwords)
     return tokens
+
+
+def _tokenize_with_signal_scores(value: str, *, keep_stopwords: bool = False) -> tuple[list[str], dict[str, float]]:
+    canonical = canonicalize(value)
+    tokens: list[str] = []
+    signal_scores: dict[str, float] = {}
+    for match in _WORD_RE.finditer(canonical):
+        token = match.group(0).strip("_-")
+        if len(token) < 2:
+            continue
+        if keep_stopwords:
+            tokens.append(token)
+            continue
+        score = signal_scores.get(token)
+        if score is None:
+            score = _token_signal_score_stripped(token)
+            signal_scores[token] = score
+        if score > 0.0:
+            tokens.append(token)
+    return tokens, signal_scores
 
 
 def split_sentences(value: str) -> list[str]:
@@ -74,21 +102,21 @@ def split_sentences(value: str) -> list[str]:
 
 
 def keyword_scores(value: str, *, max_terms: int = 12) -> list[tuple[str, float]]:
-    tokens = tokenize(value)
+    tokens, token_scores = _tokenize_with_signal_scores(value)
     if not tokens:
         return []
     counts = Counter(tokens)
     # Add compact bigrams when both sides have useful structural signal.
     for a, b in zip(tokens, tokens[1:]):
-        if token_signal_score(a) >= 0.5 and token_signal_score(b) >= 0.5:
+        if token_scores[a] >= 0.5 and token_scores[b] >= 0.5:
             counts[f"{a} {b}"] += 1.25
     max_count = max(counts.values()) or 1
     scored = []
     for term, count in counts.items():
         if " " in term:
-            specificity = 1.15 + min(token_signal_score(part) for part in term.split())
+            specificity = 1.15 + min(token_scores[part] for part in term.split())
         else:
-            specificity = token_signal_score(term)
+            specificity = token_scores[term]
         scored.append((term, min(1.0, (count / max_count) * specificity)))
     scored.sort(key=lambda item: (item[1], len(item[0])), reverse=True)
     return scored[:max_terms]
@@ -125,12 +153,6 @@ def _looks_entity_like(token: str) -> bool:
     if token.isupper() and len(token) >= 2:
         return True
     return any(char.islower() for char in token) and any(char.isupper() for char in token[1:])
-
-
-def jaccard(a: set[str], b: set[str]) -> float:
-    if not a or not b:
-        return 0.0
-    return len(a & b) / len(a | b)
 
 
 def clamp(value: float, low: float = 0.0, high: float = 1.0) -> float:

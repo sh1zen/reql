@@ -18,10 +18,35 @@ from memory.code_analysis.languages.typescript import TypeScriptTreeSitterExtrac
 from memory.code_analysis.factory import EXTRACTOR_BY_LANGUAGE, extractor_for
 from memory.code_analysis.catalog import CODE_LANGUAGE_CATALOG
 from memory.artifacts.fingerprint import artifact_id, normalize_path, project_id
-from memory.domain.models import MemoryNode
+from memory.domain.models import MemoryEdge, MemoryNode
 
 
 class CodeGraphCompilationTests(unittest.TestCase):
+    def test_orphan_directory_inbound_check_reuses_prefetched_edges(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            graph = MemoryGraph.open(Path(td) / "memory.reql")
+            try:
+                edge = MemoryEdge(
+                    id="edge:external",
+                    from_id="function:app",
+                    to_id="function:legacy",
+                    type="REFERENCES",
+                    properties={"source_file": "app.py", "project_id": "project:test"},
+                )
+
+                self.assertTrue(
+                    graph.incremental._directory_has_external_inbound(
+                        "legacy",
+                        {
+                            "function:app": "app.py",
+                            "function:legacy": "legacy/old.py",
+                        },
+                        [edge],
+                    )
+                )
+            finally:
+                graph.close()
+
     def test_tree_sitter_extractor_factory_uses_registered_language_classes(self) -> None:
         artifact = SourceArtifact(
             id="artifact:demo",
@@ -832,6 +857,125 @@ class CodeGraphCompilationTests(unittest.TestCase):
             finally:
                 graph.close()
 
+    def test_unused_variable_reference_index_preserves_owner_visibility(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "project"
+            root.mkdir()
+            (root / "app.py").write_text(
+                "\n".join(
+                    [
+                        "def same_owner():",
+                        "    read_same_owner = 1",
+                        "    return read_same_owner",
+                        "",
+                        "def nested_owner():",
+                        "    read_from_nested = 2",
+                        "    write_only = 3",
+                        "    write_only = 4",
+                        "    def inner():",
+                        "        return read_from_nested",
+                        "    return inner()",
+                        "",
+                        "same_owner()",
+                        "nested_owner()",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            graph = MemoryGraph.open(Path(td) / "memory.reql")
+            try:
+                result = graph.compile_project(root)
+                self.assertFalse(result.run.errors)
+                unused_variables = {
+                    node.properties.get("symbol_name")
+                    for node in graph.store.all_nodes()
+                    if node.type == "StaticAnalysisFinding"
+                    and node.properties.get("finding_type") == "unused_variable"
+                    and node.properties.get("relative_path") == "app.py"
+                }
+
+                self.assertNotIn("read_same_owner", unused_variables)
+                self.assertNotIn("read_from_nested", unused_variables)
+                self.assertIn("write_only", unused_variables)
+            finally:
+                graph.close()
+
+    def test_unused_symbol_findings_respect_sibling_imports_outside_tests_package(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "project"
+            probe_dir = root / "test-agent"
+            probe_dir.mkdir(parents=True)
+            (probe_dir / "planning_probe.py").write_text(
+                "\n".join(
+                    [
+                        "from dataclasses import dataclass",
+                        "",
+                        "@dataclass(frozen=True)",
+                        "class PlanningReport:",
+                        "    feature: str",
+                        "",
+                        "    def as_lines(self):",
+                        "        return (self.feature,)",
+                        "",
+                        "def build_probe_plan(feature):",
+                        "    return PlanningReport(feature)",
+                        "",
+                        "def unused_probe_helper():",
+                        "    return 'unused'",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (probe_dir / "test_planning_probe.py").write_text(
+                "\n".join(
+                    [
+                        "import unittest",
+                        "",
+                        "from planning_probe import build_probe_plan",
+                        "",
+                        "class PlanningProbeTests(unittest.TestCase):",
+                        "    def test_build_probe_plan(self):",
+                        "        report = build_probe_plan('agent workspace probe')",
+                        "        self.assertEqual(report.as_lines(), ('agent workspace probe',))",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            graph = MemoryGraph.open(Path(td) / "memory.reql")
+            try:
+                result = graph.compile_project(root)
+                self.assertFalse(result.run.errors)
+
+                imports = [
+                    node
+                    for node in graph.store.all_nodes()
+                    if node.type == "Import"
+                    and node.properties.get("relative_path") == "test-agent/test_planning_probe.py"
+                    and node.properties.get("name") == "build_probe_plan"
+                ]
+                self.assertTrue(imports)
+                self.assertEqual(imports[0].properties.get("resolved_relative_path"), "test-agent/planning_probe.py")
+
+                active_findings = [
+                    node
+                    for node in graph.store.all_nodes()
+                    if node.type == "StaticAnalysisFinding" and node.status == "active"
+                ]
+
+                def has_active_finding(symbol_name: str) -> bool:
+                    return any(
+                        node.properties.get("finding_type", "").startswith("possibly_unused")
+                        and node.properties.get("symbol_name") == symbol_name
+                        and node.properties.get("relative_path") == "test-agent/planning_probe.py"
+                        for node in active_findings
+                    )
+
+                self.assertFalse(has_active_finding("build_probe_plan"))
+                self.assertFalse(has_active_finding("as_lines"))
+                self.assertTrue(has_active_finding("unused_probe_helper"))
+            finally:
+                graph.close()
+
     def test_framework_like_method_names_are_not_globally_suppressed(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "project"
@@ -1017,6 +1161,60 @@ class CodeGraphCompilationTests(unittest.TestCase):
                 self.assertEqual(default_ordered.rows[0]["cleanup_rank"], 3)
                 priority_ordered = graph.query("FINDINGS RETURN symbol_name,cleanup_priority ORDER BY cleanup_priority LIMIT 5")
                 self.assertEqual(priority_ordered.rows[0]["cleanup_priority"], "high")
+            finally:
+                graph.close()
+
+    def test_compile_aggregates_orphan_directory_cleanup_findings(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "project"
+            legacy_dir = root / "legacy"
+            legacy_dir.mkdir(parents=True)
+            (root / "app.py").write_text("print('active')\n", encoding="utf-8")
+            (legacy_dir / "__init__.py").write_text("", encoding="utf-8")
+            (legacy_dir / "old_a.py").write_text(
+                "from legacy.old_b import helper\n\n"
+                "def run():\n"
+                "    return helper()\n",
+                encoding="utf-8",
+            )
+            (legacy_dir / "old_b.py").write_text(
+                "def helper():\n"
+                "    return 'old'\n",
+                encoding="utf-8",
+            )
+            graph = MemoryGraph.open(Path(td) / "memory.reql")
+            try:
+                result = graph.compile_project(root)
+                self.assertFalse(result.run.errors)
+                query = graph.query(
+                    "FINDINGS WHERE finding_type = 'possibly_orphan_directory' "
+                    "RETURN relative_path,file_count,files,removal_safety,cleanup_priority,status"
+                )
+                self.assertEqual(len(query.rows), 1)
+                self.assertEqual(query.rows[0]["relative_path"], "legacy")
+                self.assertEqual(query.rows[0]["file_count"], 3)
+                self.assertEqual(query.rows[0]["cleanup_priority"], "medium")
+                self.assertEqual(query.rows[0]["removal_safety"], "validate")
+                self.assertEqual(query.rows[0]["status"], "active")
+                self.assertEqual(
+                    sorted(query.rows[0]["files"]),
+                    ["legacy/__init__.py", "legacy/old_a.py", "legacy/old_b.py"],
+                )
+
+                (root / "app.py").write_text("from legacy.old_a import run\n\nprint(run())\n", encoding="utf-8")
+                refreshed = graph.compile_project(root)
+                self.assertFalse(refreshed.run.errors)
+                query = graph.query("FINDINGS WHERE finding_type = 'possibly_orphan_directory' RETURN relative_path,status")
+                self.assertEqual(query.rows, [])
+                archived = [
+                    node
+                    for node in graph.store.all_nodes()
+                    if node.type == "StaticAnalysisFinding"
+                    and node.properties.get("finding_type") == "possibly_orphan_directory"
+                    and node.properties.get("relative_path") == "legacy"
+                    and node.status == "archived"
+                ]
+                self.assertTrue(archived)
             finally:
                 graph.close()
 

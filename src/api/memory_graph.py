@@ -227,6 +227,7 @@ class MemoryGraph:
         mode: str = "informative",
         scopes: list[str] | set[str] | tuple[str, ...] | None = None,
         include_archived: bool = False,
+        include_risky: bool = False,
     ) -> str:
         """Return the compact deterministic context block for a query."""
         subgraph = self.retrieval.retrieve(
@@ -243,6 +244,7 @@ class MemoryGraph:
             max_items=max_items,
             query_mode=mode,
             query_scopes=scopes,
+            include_risky=include_risky,
         )
 
     def query_context_payload(
@@ -256,6 +258,7 @@ class MemoryGraph:
         mode: str = "informative",
         scopes: list[str] | set[str] | tuple[str, ...] | None = None,
         include_archived: bool = False,
+        include_risky: bool = False,
     ) -> dict[str, Any]:
         """Return compact structured query context."""
         subgraph = self.retrieval.retrieve(
@@ -267,7 +270,13 @@ class MemoryGraph:
                 context_scopes=set(scopes) if scopes else None,
             )
         )
-        return self.retrieval.query_context_payload(subgraph, max_items=max_items, query_mode=mode, query_scopes=scopes)
+        return self.retrieval.query_context_payload(
+            subgraph,
+            max_items=max_items,
+            query_mode=mode,
+            query_scopes=scopes,
+            include_risky=include_risky,
+        )
 
     def query_memories(
         self,

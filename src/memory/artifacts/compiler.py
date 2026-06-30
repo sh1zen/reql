@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Sequence
 
 from ..code_analysis.catalog import detect_code_language
 from ..code_analysis.models import CodeImport, CodeModule, CodeParseResult, CodeSymbol, CodeText
@@ -17,7 +17,7 @@ from ..document_ingestion.models import DocumentFragment, DocumentParseResult
 from ..domain.ids import stable_id
 from ..domain.models import MemoryEdge, MemoryNode
 from ..domain.timeutils import utcnow_iso
-from ..extraction.document_processor import DocumentProcessingResult, DocumentProcessor, DocumentRawEvent, DocumentTerm, DocumentTermRelation
+from ..extraction.document_processor import DocumentProcessingResult, DocumentProcessor, DocumentRawEvent, DocumentTerm
 from ..extraction.normalization import canonicalize
 from ..storage.graph_store import GraphStore
 from .context_scope import artifact_context_scope
@@ -79,6 +79,7 @@ DOCUMENT_CODE_LINK_STOP_TERMS = {
 }
 MAX_DOCUMENT_CODE_LINKS_PER_FRAGMENT = 8
 MAX_DOCUMENT_CODE_LINKS_PER_RUN = 1000
+_CodeMatcher = tuple[tuple[int, str, str, str, str], MemoryNode, str]
 
 LANGUAGE_BUILTIN_GLOBALS = {
     "AbortController",
@@ -273,7 +274,7 @@ class ArtifactCompiler:
         fragment_edges: list[MemoryEdge] = []
 
         fragment_nodes = [_fragment_node(artifact, fragment, parse_result) for fragment in parse_result.fragments]
-        for fragment, (node, created) in zip(parse_result.fragments, store.batch_upsert_nodes(fragment_nodes)):
+        for fragment, (node, created) in zip(parse_result.fragments, _batch_upsert_nodes(store, fragment_nodes)):
             fragment_id_map[fragment.id] = node.id
             persisted_fragment_ids.add(node.id)
             result.affected_node_ids.add(node.id)
@@ -401,7 +402,7 @@ class ArtifactCompiler:
                     edge = _typed_edge(parent_id, fragment_id, "HAS_CODE_BLOCK", {"project_id": artifact.project_id, "artifact_id": artifact.id, "relative_path": artifact.relative_path}, source_file=artifact.relative_path, line_start=fragment.start_line, line_end=fragment.end_line, extractor=parse_result.parser_name, evidence=fragment.fragment_type)
                     edges.append(edge)
 
-        for (fragment, fragment_id, _), (concept, concept_created) in zip(concept_upserts, store.batch_upsert_nodes([item[2] for item in concept_upserts])):
+        for (fragment, fragment_id, _), (concept, concept_created) in zip(concept_upserts, _batch_upsert_nodes(store, [item[2] for item in concept_upserts])):
             _track_node(result, concept.id, concept_created)
             common = {
                 "project_id": artifact.project_id,
@@ -423,7 +424,7 @@ class ArtifactCompiler:
                 continue
             uri_upserts.append((link, source_id, uri, _uri_node(uri, str(link.get("text") or uri))))
 
-        for (link, source_id, uri, _), (target, created) in zip(uri_upserts, store.batch_upsert_nodes([item[3] for item in uri_upserts])):
+        for (link, source_id, uri, _), (target, created) in zip(uri_upserts, _batch_upsert_nodes(store, [item[3] for item in uri_upserts])):
             _track_node(result, target.id, created)
             edge = _typed_edge(source_id, target.id, "LINKS_TO", {"project_id": artifact.project_id, "artifact_id": artifact.id, "relative_path": artifact.relative_path, "uri": uri}, source_file=artifact.relative_path, line_start=None, line_end=None, extractor=parse_result.parser_name, evidence=uri)
             edges.append(edge)
@@ -440,7 +441,7 @@ class ArtifactCompiler:
             node_upserts.append(("config", _config_node(artifact)))
         if _is_test_artifact(artifact):
             node_upserts.append(("test", _test_node(artifact)))
-        for kind, (node, created) in zip([kind for kind, _ in node_upserts], store.batch_upsert_nodes([node for _, node in node_upserts])):
+        for kind, (node, created) in zip([kind for kind, _ in node_upserts], _batch_upsert_nodes(store, [node for _, node in node_upserts])):
             _track_node(result, node.id, created)
             edges.append(
                 _typed_edge(
@@ -480,7 +481,7 @@ class ArtifactCompiler:
         current_edge_ids: set[str] = set()
         concept_nodes = {term.key: _document_term_node(artifact, term, output) for term in output.terms}
         raw_event_nodes = {event.id_key: _document_raw_event_node(artifact, event) for event in output.raw_events}
-        for node, created in store.batch_upsert_nodes([*concept_nodes.values(), *raw_event_nodes.values()]):
+        for node, created in _batch_upsert_nodes(store, [*concept_nodes.values(), *raw_event_nodes.values()]):
             _track_node(result, node.id, created)
             current_node_ids.add(node.id)
         edges: list[MemoryEdge] = []
@@ -521,14 +522,14 @@ class ArtifactCompiler:
         current_node_ids: set[str],
         current_edge_ids: set[str],
     ) -> None:
-        for edge in store.find_edges_by_property("artifact_id", artifact.id, limit=100000):
+        for edge in _find_edges_by_property(store, "artifact_id", artifact.id, limit=100000):
             if edge.properties.get("extractor") != "document_processor" or edge.id in current_edge_ids or edge.properties.get("status") == "archived":
                 continue
             _archive_edge(store, edge)
             result.archived_edges.append(edge.id)
             result.affected_edge_ids.add(edge.id)
         for node_type in ("Concept", "RawEvent"):
-            for node in store.find_nodes_by_property("artifact_id", artifact.id, type_=node_type, limit=100000):
+            for node in _find_nodes_by_property(store, "artifact_id", artifact.id, type_=node_type, limit=100000):
                 if node.properties.get("extractor") != "document_processor" or node.id in current_node_ids or node.status == "archived":
                     continue
                 _archive_concept(store, node)
@@ -555,7 +556,7 @@ class ArtifactCompiler:
         import_node_ids: dict[str, str] = {}
         imported_names = _imported_binding_names(code_result.imports)
 
-        def upsert_external(name: str | None, kind: str) -> MemoryNode | None:
+        def pending_external(name: str | None, kind: str) -> MemoryNode | None:
             clean_name = _clean_external_symbol_name(name, imported_names=imported_names)
             if clean_name is None:
                 return None
@@ -563,9 +564,8 @@ class ArtifactCompiler:
             cached = external_nodes.get(key)
             if cached is not None:
                 return cached
-            target, created = store.upsert_node(_external_code_symbol_node(artifact, clean_name, kind))
+            target = _external_code_symbol_node(artifact, clean_name, kind)
             current_ids.add(target.id)
-            _track_node(result, target.id, created)
             external_nodes[key] = target
             return target
 
@@ -598,19 +598,19 @@ class ArtifactCompiler:
         ):
             pending_edges.append(edge)
 
-        read_references = [reference for reference in code_result.references if reference.access in {"read", "return", "raise"}]
+        read_references_by_name = _read_references_by_name(code_result.references)
         symbol_nodes: dict[str, MemoryNode] = {}
         skipped_local_variables = {
             symbol.qualified_name
             for symbol in code_result.symbols
-            if symbol.kind == "variable" and not _should_persist_variable(symbol, read_references)
+            if symbol.kind == "variable" and not _should_persist_variable(symbol, read_references_by_name)
         }
         symbol_upserts = [
             (symbol, _symbol_node(artifact, symbol, code_result))
             for symbol in code_result.symbols
             if symbol.qualified_name not in skipped_local_variables
         ]
-        for (symbol, _), (node, node_created) in zip(symbol_upserts, store.batch_upsert_nodes([node for _, node in symbol_upserts])):
+        for (symbol, _), (node, node_created) in zip(symbol_upserts, _batch_upsert_nodes(store, [node for _, node in symbol_upserts])):
             current_ids.add(node.id)
             symbol_nodes[symbol.qualified_name] = node
             _track_node(result, node.id, node_created)
@@ -652,7 +652,7 @@ class ArtifactCompiler:
                 continue
             if symbol.metadata.get("is_schema"):
                 schema_upserts.append((symbol, _schema_node(artifact, symbol), node.id))
-        for (symbol, _, parent_node_id), (schema_node, schema_created) in zip(schema_upserts, store.batch_upsert_nodes([node for _, node, _ in schema_upserts])):
+        for (symbol, _, parent_node_id), (schema_node, schema_created) in zip(schema_upserts, _batch_upsert_nodes(store, [node for _, node, _ in schema_upserts])):
             current_ids.add(schema_node.id)
             _track_node(result, schema_node.id, schema_created)
             pending_edges.append(
@@ -675,7 +675,7 @@ class ArtifactCompiler:
             if not node:
                 continue
             for decorator in symbol.decorators:
-                target = upsert_external(decorator, "decorator")
+                target = pending_external(decorator, "decorator")
                 if target is None:
                     continue
                 pending_edges.append(_typed_edge(node.id, target.id, "DECORATED_BY", {"project_id": artifact.project_id, "artifact_id": artifact.id, "decorator": decorator}, source_file=artifact.relative_path, line_start=symbol.start_line, line_end=symbol.start_line, extractor=code_result.parser_name, evidence=decorator))
@@ -683,16 +683,16 @@ class ArtifactCompiler:
                 if endpoint_node is not None:
                     endpoint_upserts.append((symbol, node.id, decorator, endpoint_node))
             for base in symbol.bases:
-                target = symbol_resolver.resolve(base) or upsert_external(base, "external")
+                target = symbol_resolver.resolve(base) or pending_external(base, "external")
                 if target is None:
                     continue
                 current_ids.add(target.id)
                 relation_type = "IMPLEMENTS" if node.type == "Interface" or symbol_resolver.is_interface(base) or _solidity_base_is_interface(code_result, base, target) else "INHERITS"
                 pending_edges.append(_typed_edge(node.id, target.id, relation_type, {"project_id": artifact.project_id, "artifact_id": artifact.id, "base": base}, source_file=artifact.relative_path, line_start=symbol.start_line, line_end=symbol.start_line, extractor=code_result.parser_name, evidence=base))
-            target = upsert_external(symbol.returns, "external")
+            target = pending_external(symbol.returns, "external")
             if target is not None:
                 pending_edges.append(_typed_edge(node.id, target.id, "RETURNS", {"project_id": artifact.project_id, "artifact_id": artifact.id, "hint": symbol.returns}, source_file=artifact.relative_path, line_start=symbol.start_line, line_end=symbol.start_line, extractor=code_result.parser_name, evidence=symbol.returns or ""))
-        for (symbol, handler_node_id, decorator, _), (endpoint, endpoint_created) in zip(endpoint_upserts, store.batch_upsert_nodes([node for _, _, _, node in endpoint_upserts])):
+        for (symbol, handler_node_id, decorator, _), (endpoint, endpoint_created) in zip(endpoint_upserts, _batch_upsert_nodes(store, [node for _, _, _, node in endpoint_upserts])):
             current_ids.add(endpoint.id)
             _track_node(result, endpoint.id, endpoint_created)
             pending_edges.append(
@@ -711,7 +711,7 @@ class ArtifactCompiler:
 
         import_nodes = [(item, _import_node(artifact, item)) for item in code_result.imports]
         dependency_nodes = [(item, _dependency_node(artifact, item)) for item in code_result.imports]
-        for (item, _), (node, node_created) in zip(import_nodes, store.batch_upsert_nodes([node for _, node in import_nodes])):
+        for (item, _), (node, node_created) in zip(import_nodes, _batch_upsert_nodes(store, [node for _, node in import_nodes])):
             current_ids.add(node.id)
             import_node_ids[item.id] = node.id
             _track_node(result, node.id, node_created)
@@ -723,9 +723,16 @@ class ArtifactCompiler:
                 properties = {"project_id": artifact.project_id, "artifact_id": artifact.id, "module": item.module, "name": item.name, "resolved_relative_path": resolved_file.properties.get("relative_path")}
                 pending_edges.append(_typed_edge(file_id, resolved_file.id, "IMPORTS", properties, source_file=artifact.relative_path, line_start=item.line, line_end=item.line, extractor=code_result.parser_name, evidence=item.raw or item.module or item.name or ""))
                 pending_edges.append(_typed_edge(module_node.id, resolved_file.id, "IMPORTS", properties, source_file=artifact.relative_path, line_start=item.line, line_end=item.line, extractor=code_result.parser_name, evidence=item.raw or item.module or item.name or ""))
+                for target_symbol in _resolved_import_symbol_nodes(store, artifact, item, resolved_file):
+                    symbol_properties = {
+                        **properties,
+                        "import_name": item.name,
+                        "target_symbol": target_symbol.properties.get("qualified_name") or target_symbol.properties.get("name"),
+                    }
+                    pending_edges.append(_typed_edge(node.id, target_symbol.id, "IMPORTS", symbol_properties, source_file=artifact.relative_path, line_start=item.line, line_end=item.line, extractor=code_result.parser_name, evidence=item.raw or item.module or item.name or ""))
             if _is_package_init_artifact(artifact):
                 pending_edges.append(_typed_edge(module_node.id, node.id, "RE_EXPORTS", {"project_id": artifact.project_id, "artifact_id": artifact.id, "module": item.module, "name": item.name, "alias": item.alias}, source_file=artifact.relative_path, line_start=item.line, line_end=item.line, extractor=code_result.parser_name, evidence=item.raw or item.module or item.name or ""))
-        for (item, _), (dependency, dep_created) in zip(dependency_nodes, store.batch_upsert_nodes([node for _, node in dependency_nodes])):
+        for (item, _), (dependency, dep_created) in zip(dependency_nodes, _batch_upsert_nodes(store, [node for _, node in dependency_nodes])):
             current_ids.add(dependency.id)
             _track_node(result, dependency.id, dep_created)
             pending_edges.append(_typed_edge(file_id, dependency.id, "DEPENDS_ON", {"project_id": artifact.project_id, "artifact_id": artifact.id, "module": item.module, "name": item.name}, source_file=artifact.relative_path, line_start=item.line, line_end=item.line, extractor=code_result.parser_name, evidence=item.raw or item.module or item.name or ""))
@@ -767,7 +774,7 @@ class ArtifactCompiler:
             if target_node is None and reference.access in {"raise", "return"}:
                 if _reference_targets_local_argument(reference, symbol_nodes):
                     continue
-                target_node = upsert_external(reference.name, "external")
+                target_node = pending_external(reference.name, "external")
             if target_node is None or owner.id == target_node.id:
                 continue
             relation = {"read": "READS", "write": "WRITES", "raise": "RAISES", "return": "RETURNS"}.get(str(reference.access or ""), "REFERENCES")
@@ -786,15 +793,18 @@ class ArtifactCompiler:
                     )
                 )
 
+        for node, node_created in _batch_upsert_nodes(store, list(external_nodes.values())):
+            _track_node(result, node.id, node_created)
+
         comment_nodes = [(text_item, _code_text_node(artifact, text_item)) for text_item in code_result.comments]
-        for (text_item, _), (node, node_created) in zip(comment_nodes, store.batch_upsert_nodes([node for _, node in comment_nodes])):
+        for (text_item, _), (node, node_created) in zip(comment_nodes, _batch_upsert_nodes(store, [node for _, node in comment_nodes])):
             current_ids.add(node.id)
             _track_node(result, node.id, node_created)
             owner = symbol_nodes.get(text_item.owner or "") or module_node
             pending_edges.append(_typed_edge(owner.id, node.id, "HAS_COMMENT", {"project_id": artifact.project_id, "artifact_id": artifact.id}, source_file=artifact.relative_path, line_start=text_item.start_line, line_end=text_item.end_line, extractor=code_result.parser_name, evidence=(text_item.text or "")[:200]))
 
         docstring_nodes = [(text_item, _code_text_node(artifact, text_item)) for text_item in code_result.docstrings]
-        for (text_item, _), (node, node_created) in zip(docstring_nodes, store.batch_upsert_nodes([node for _, node in docstring_nodes])):
+        for (text_item, _), (node, node_created) in zip(docstring_nodes, _batch_upsert_nodes(store, [node for _, node in docstring_nodes])):
             current_ids.add(node.id)
             _track_node(result, node.id, node_created)
             owner = symbol_nodes.get(text_item.owner or "") or module_node
@@ -806,10 +816,11 @@ class ArtifactCompiler:
             symbol_nodes,
             import_node_ids,
             table,
+            read_references_by_name=read_references_by_name,
         )
         for (finding, target_node_id), (node, node_created) in zip(
             finding_upserts,
-            store.batch_upsert_nodes([item[0] for item in finding_upserts]),
+            _batch_upsert_nodes(store, [item[0] for item in finding_upserts]),
         ):
             current_ids.add(node.id)
             _track_node(result, node.id, node_created)
@@ -890,13 +901,13 @@ def archive_artifact_fragments(store: GraphStore, artifact: SourceArtifact | Mem
         result.archived_edges.append(edge.id)
         result.affected_edge_ids.add(edge.id)
     for node_type in ("Concept", "RawEvent"):
-        for node in store.find_nodes_by_property("artifact_id", artifact_id, type_=node_type, limit=100000):
+        for node in _find_nodes_by_property(store, "artifact_id", artifact_id, type_=node_type, limit=100000):
             if node.status == "archived" or node.properties.get("extractor") != "document_processor":
                 continue
             _archive_concept(store, node)
             result.archived_nodes.append(node.id)
             result.affected_node_ids.add(node.id)
-            for edge in store.incident_edges([node.id], limit=10000):
+            for edge in _incident_edges(store, [node.id], limit=10000):
                 if edge.properties.get("artifact_id") != artifact_id or edge.properties.get("status") == "archived":
                     continue
                 _archive_edge(store, edge)
@@ -927,9 +938,9 @@ def link_document_fragments_to_code(
     current_term_code_pairs: set[tuple[str, str]] = set()
     has_existing_document_code_links = any(
         edge.properties.get("extractor") in {"document_code_linker", "document_processor"}
-        for edge in store.find_edges_by_property("project_id", project_id, type_="REFERENCES", limit=100000)
+        for edge in _find_edges_by_property(store, "project_id", project_id, type_="REFERENCES", limit=100000)
     )
-    simple_index, complex_matchers = _document_code_link_index(code_nodes)
+    simple_index, complex_index, complex_fallback = _document_code_link_index(code_nodes)
     link_limit_reached = False
     for fragment in fragments:
         if len(pending_edges) >= MAX_DOCUMENT_CODE_LINKS_PER_RUN:
@@ -939,7 +950,8 @@ def link_document_fragments_to_code(
         if not text.strip():
             continue
         matched_targets: set[str] = set()
-        for code_node, evidence in _matching_code_targets(text, simple_index, complex_matchers):
+        fragment_terms: list[MemoryNode] | None = None
+        for code_node, evidence in _matching_code_targets(text, simple_index, complex_index, complex_fallback):
             if len(matched_targets) >= MAX_DOCUMENT_CODE_LINKS_PER_FRAGMENT or len(pending_edges) >= MAX_DOCUMENT_CODE_LINKS_PER_RUN:
                 link_limit_reached = len(pending_edges) >= MAX_DOCUMENT_CODE_LINKS_PER_RUN
                 break
@@ -968,7 +980,9 @@ def link_document_fragments_to_code(
                     is_technical=True,
                 )
             )
-            for term_node in _document_processor_terms_for_fragment(store, fragment):
+            if fragment_terms is None:
+                fragment_terms = _document_processor_terms_for_fragment(store, fragment)
+            for term_node in fragment_terms:
                 current_term_code_pairs.add((term_node.id, code_node.id))
                 pending_edges.append(
                     _typed_edge(
@@ -1109,7 +1123,7 @@ def _artifact_fragments(store: GraphStore, artifact: SourceArtifact) -> list[Mem
 def _fragments_for_artifact_id(store: GraphStore, project_id: str, artifact_id: str) -> list[MemoryNode]:
     return [
         node
-        for node in store.find_nodes_by_property("artifact_id", artifact_id, type_="SourceFragment", limit=100000)
+        for node in _find_nodes_by_property(store, "artifact_id", artifact_id, type_="SourceFragment", limit=100000)
         if node.type == "SourceFragment"
         and node.properties.get("project_id") == project_id
         and node.properties.get("artifact_id") == artifact_id
@@ -1129,8 +1143,8 @@ def _fragment_related_edges(store: GraphStore, node: MemoryNode) -> list[MemoryE
     ]
     edges: list[MemoryEdge] = []
     for edge_type in edge_types:
-        edges.extend(store.get_edges(from_id=node.id, type_=edge_type, limit=100))
-        edges.extend(store.get_edges(to_id=node.id, type_=edge_type, limit=100))
+        edges.extend(_get_edges(store, from_id=node.id, type_=edge_type, limit=100))
+        edges.extend(_get_edges(store, to_id=node.id, type_=edge_type, limit=100))
     deduped: dict[str, MemoryEdge] = {}
     for edge in edges:
         deduped[edge.id] = edge
@@ -1139,8 +1153,8 @@ def _fragment_related_edges(store: GraphStore, node: MemoryNode) -> list[MemoryE
 
 def _concepts_for_fragment(store: GraphStore, fragment: MemoryNode) -> list[MemoryNode]:
     concepts: dict[str, MemoryNode] = {}
-    for edge in store.get_edges(from_id=fragment.id, type_="CONTAINS", limit=100):
-        node = store.get_node(edge.to_id)
+    for edge in _get_edges(store, from_id=fragment.id, type_="CONTAINS", limit=100):
+        node = _get_node(store, edge.to_id)
         if node is not None and node.type == "Concept":
             concepts[node.id] = node
     return list(concepts.values())
@@ -1148,10 +1162,10 @@ def _concepts_for_fragment(store: GraphStore, fragment: MemoryNode) -> list[Memo
 
 def _document_processor_terms_for_fragment(store: GraphStore, fragment: MemoryNode) -> list[MemoryNode]:
     terms: dict[str, MemoryNode] = {}
-    for edge in store.get_edges(from_id=fragment.id, type_="MENTIONS", limit=100):
+    for edge in _get_edges(store, from_id=fragment.id, type_="MENTIONS", limit=100):
         if edge.properties.get("extractor") != "document_processor":
             continue
-        node = store.get_node(edge.to_id)
+        node = _get_node(store, edge.to_id)
         if node is not None and node.type == "Concept" and node.status != "archived":
             terms[node.id] = node
     return sorted(terms.values(), key=lambda node: float(node.properties.get("rank") or 0.0), reverse=True)[:8]
@@ -1164,7 +1178,7 @@ def _semantic_document_fragments(
     artifact_ids: set[str] | None,
 ) -> list[MemoryNode]:
     fragments: list[MemoryNode] = []
-    for node in store.find_nodes_by_property("project_id", project_id, type_="SourceFragment", limit=100000):
+    for node in _find_nodes_by_property(store, "project_id", project_id, type_="SourceFragment", limit=100000):
         if node.status == "archived":
             continue
         if node.properties.get("project_id") != project_id:
@@ -1181,7 +1195,7 @@ def _semantic_document_fragments(
 
 def _project_code_nodes(store: GraphStore, project_id: str) -> list[MemoryNode]:
     nodes: list[MemoryNode] = []
-    for node in store.find_nodes_by_property("project_id", project_id, limit=100000):
+    for node in _find_nodes_by_property(store, "project_id", project_id, limit=100000):
         if node.status != "archived" and node.type in DOCUMENT_CODE_LINK_NODE_TYPES and node.properties.get("project_id") == project_id:
             nodes.append(node)
     nodes.sort(key=lambda item: (item.type, item.label.casefold(), item.id))
@@ -1251,32 +1265,51 @@ def _qualified_tail_is_safe(value: str, tail: str) -> bool:
 
 def _document_code_link_index(
     code_nodes: list[MemoryNode],
-) -> tuple[dict[str, list[tuple[tuple[int, str, str, str, str], MemoryNode, str]]], list[tuple[tuple[int, str, str, str, str], MemoryNode, str]]]:
-    simple_index: dict[str, list[tuple[tuple[int, str, str, str, str], MemoryNode, str]]] = {}
-    complex_matchers: list[tuple[tuple[int, str, str, str, str], MemoryNode, str]] = []
+) -> tuple[dict[str, list[_CodeMatcher]], dict[str, list[_CodeMatcher]], list[_CodeMatcher]]:
+    simple_index: dict[str, list[_CodeMatcher]] = {}
+    complex_index: dict[str, list[_CodeMatcher]] = {}
+    complex_fallback: list[_CodeMatcher] = []
     for node in code_nodes:
         for term in _code_node_terms(node):
             priority = (-len(term), node.type, node.label.casefold(), node.id, term.casefold())
             entry = (priority, node, term)
             if _term_requires_regex(term):
-                complex_matchers.append(entry)
+                anchor = _complex_term_anchor(term)
+                if anchor:
+                    complex_index.setdefault(anchor, []).append(entry)
+                else:
+                    complex_fallback.append(entry)
             else:
                 simple_index.setdefault(term.casefold(), []).append(entry)
     for entries in simple_index.values():
         entries.sort(key=lambda item: item[0])
-    complex_matchers.sort(key=lambda item: item[0])
-    return simple_index, complex_matchers
+    for entries in complex_index.values():
+        entries.sort(key=lambda item: item[0])
+    complex_fallback.sort(key=lambda item: item[0])
+    return simple_index, complex_index, complex_fallback
 
 
 def _matching_code_targets(
     text: str,
-    simple_index: dict[str, list[tuple[tuple[int, str, str, str, str], MemoryNode, str]]],
-    complex_matchers: list[tuple[tuple[int, str, str, str, str], MemoryNode, str]],
+    simple_index: dict[str, list[_CodeMatcher]],
+    complex_index: dict[str, list[_CodeMatcher]],
+    complex_fallback: list[_CodeMatcher],
 ) -> list[tuple[MemoryNode, str]]:
-    candidates: list[tuple[tuple[int, str, str, str, str], MemoryNode, str]] = []
-    for token in _document_link_tokens(text):
+    candidates: list[_CodeMatcher] = []
+    seen_complex: set[tuple[str, str]] = set()
+    tokens = _document_link_tokens(text)
+    for token in tokens:
         candidates.extend(simple_index.get(token, []))
-    for entry in complex_matchers:
+    for token in tokens:
+        for entry in complex_index.get(token, []):
+            _, node, term = entry
+            key = (node.id, term)
+            if key in seen_complex:
+                continue
+            seen_complex.add(key)
+            if _text_mentions_term(text, term):
+                candidates.append(entry)
+    for entry in complex_fallback:
         _, _, term = entry
         if _text_mentions_term(text, term):
             candidates.append(entry)
@@ -1286,6 +1319,13 @@ def _matching_code_targets(
 
 def _document_link_tokens(text: str) -> set[str]:
     return {match.group(0).casefold() for match in re.finditer(r"(?<![A-Za-z0-9_])[A-Za-z_][A-Za-z0-9_]{2,}(?![A-Za-z0-9_])", text)}
+
+
+def _complex_term_anchor(term: str) -> str | None:
+    tokens = [match.group(0).casefold() for match in re.finditer(r"[A-Za-z_][A-Za-z0-9_]{2,}", term)]
+    if not tokens:
+        return None
+    return min(tokens, key=lambda item: (-len(item), item))
 
 
 def _term_requires_regex(term: str) -> bool:
@@ -1319,7 +1359,7 @@ def _archive_stale_document_code_links(
         for fragment_id, target_ids in current_targets_by_fragment.items()
         for target_id in target_ids
     }
-    existing = store.find_edges_by_property("project_id", project_id, type_="REFERENCES", limit=100000)
+    existing = _find_edges_by_property(store, "project_id", project_id, type_="REFERENCES", limit=100000)
     for edge in existing:
         if edge.properties.get("extractor") != "document_code_linker":
             continue
@@ -1337,7 +1377,7 @@ def _archive_stale_document_processor_code_links(
     project_id: str,
     current_pairs: set[tuple[str, str]],
 ) -> None:
-    existing = store.find_edges_by_property("project_id", project_id, type_="REFERENCES", limit=100000)
+    existing = _find_edges_by_property(store, "project_id", project_id, type_="REFERENCES", limit=100000)
     for edge in existing:
         if edge.properties.get("extractor") != "document_processor":
             continue
@@ -1382,7 +1422,7 @@ def _archive_edge(store: GraphStore, edge: MemoryEdge) -> None:
 
 
 def _mark_artifact_compiled(store: GraphStore, artifact: SourceArtifact, parse_result: DocumentParseResult) -> None:
-    node = store.get_node(artifact.id)
+    node = _get_node(store, artifact.id)
     if node is None:
         return
     properties = dict(node.properties)
@@ -1622,11 +1662,68 @@ def _track_edge(result: ArtifactCompilationResult, edge_id: str, created: bool) 
 def _upsert_edges_deduped(store: GraphStore, result: ArtifactCompilationResult, edges: list[MemoryEdge]) -> None:
     if not edges:
         return
-    by_pattern: dict[tuple[str, str, str, str], MemoryEdge] = {}
+    by_pattern: dict[tuple[str, str, str], MemoryEdge] = {}
     for edge in edges:
         by_pattern[(edge.from_id, edge.type, edge.to_id)] = edge
-    for stored, created in store.batch_upsert_edges(list(by_pattern.values())):
+    for stored, created in _batch_upsert_edges(store, list(by_pattern.values())):
         _track_edge(result, stored.id, created)
+
+
+def _batch_upsert_nodes(store: GraphStore, nodes: list[MemoryNode]) -> list[tuple[MemoryNode, bool]]:
+    return store.batch_upsert_nodes(nodes, return_clones=False)
+
+
+def _batch_upsert_edges(store: GraphStore, edges: list[MemoryEdge]) -> list[tuple[MemoryEdge, bool]]:
+    return store.batch_upsert_edges(edges, return_clones=False)
+
+
+def _find_nodes_by_property(
+    store: GraphStore,
+    property_name: str,
+    value: Any,
+    *,
+    type_: str | None = None,
+    status: str | Sequence[str] | None = None,
+    limit: int = 1000,
+) -> list[MemoryNode]:
+    return store.find_nodes_by_property(property_name, value, type_=type_, status=status, limit=limit, clone=False)
+
+
+def _find_edges_by_property(
+    store: GraphStore,
+    property_name: str,
+    value: Any,
+    *,
+    type_: str | None = None,
+    limit: int = 1000,
+) -> list[MemoryEdge]:
+    return store.find_edges_by_property(property_name, value, type_=type_, limit=limit, clone=False)
+
+
+def _get_node(store: GraphStore, node_id: str) -> MemoryNode | None:
+    return store.get_node(node_id, clone=False)
+
+
+def _get_edges(
+    store: GraphStore,
+    *,
+    from_id: str | None = None,
+    to_id: str | None = None,
+    type_: str | Sequence[str] | None = None,
+    limit: int = 1000,
+) -> list[MemoryEdge]:
+    return store.get_edges(from_id=from_id, to_id=to_id, type_=type_, limit=limit, clone=False)
+
+
+def _incident_edges(
+    store: GraphStore,
+    node_ids: Sequence[str],
+    *,
+    edge_types: set[str] | None = None,
+    ignored_edge_types: set[str] | None = None,
+    limit: int = 10000,
+) -> list[MemoryEdge]:
+    return store.incident_edges(node_ids, edge_types=edge_types, ignored_edge_types=ignored_edge_types, limit=limit, clone=False)
 
 
 class _SymbolNodeResolver:
@@ -1989,14 +2086,83 @@ def _file_id_for_relative_path(project_id: str, relative_path: str) -> str:
     return stable_id("file", project_id, relative_path)
 
 
+def _ensure_resolved_import_metadata(store: GraphStore, artifact: SourceArtifact, item: CodeImport) -> str | None:
+    if not isinstance(item.metadata, dict):
+        item.metadata = {}
+    existing = item.metadata.get("resolved_relative_path")
+    if existing:
+        return str(existing)
+    resolved = _resolve_import_relative_path(store, artifact, item)
+    if resolved:
+        item.metadata["resolved_relative_path"] = resolved
+    return resolved
+
+
 def _resolved_import_file_node(store: GraphStore, artifact: SourceArtifact, item: CodeImport) -> MemoryNode | None:
-    resolved = item.metadata.get("resolved_relative_path") if isinstance(item.metadata, dict) else None
+    resolved = _ensure_resolved_import_metadata(store, artifact, item)
     if not resolved:
         return None
-    node = store.get_node(_file_id_for_relative_path(artifact.project_id, str(resolved)))
+    node = _get_node(store, _file_id_for_relative_path(artifact.project_id, str(resolved)))
     if node is None or node.type != "File" or node.status == "archived":
         return None
     return node
+
+
+def _resolve_import_relative_path(store: GraphStore, artifact: SourceArtifact, item: CodeImport) -> str | None:
+    for relative_path in _candidate_import_relative_paths(artifact.relative_path, item):
+        node = _get_node(store, _file_id_for_relative_path(artifact.project_id, relative_path))
+        if node is not None and node.type == "File" and node.status != "archived":
+            return relative_path
+    return None
+
+
+def _candidate_import_relative_paths(source_relative_path: str, item: CodeImport) -> list[str]:
+    source_path = Path(source_relative_path.replace("\\", "/"))
+    source_dir = "" if str(source_path.parent) == "." else source_path.parent.as_posix()
+    module = str(item.module or item.name or "").strip(".")
+    if not module or module == "*":
+        return []
+    module_parts = [part for part in module.split(".") if part]
+
+    base_dirs: list[str] = []
+    if item.level > 0:
+        source_parts = [] if not source_dir else source_dir.split("/")
+        keep = max(0, len(source_parts) - (item.level - 1))
+        base_dirs.append("/".join(source_parts[:keep]))
+    else:
+        base_dirs.append("")
+        if source_dir:
+            base_dirs.append(source_dir)
+
+    candidates: list[str] = []
+    seen: set[str] = set()
+    for base_dir in base_dirs:
+        module_path = "/".join([part for part in [base_dir, *module_parts] if part])
+        for candidate in (f"{module_path}.py", f"{module_path}/__init__.py"):
+            normalized = candidate.replace("\\", "/").strip("/")
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                candidates.append(normalized)
+    return candidates
+
+
+def _resolved_import_symbol_nodes(store: GraphStore, artifact: SourceArtifact, item: CodeImport, resolved_file: MemoryNode) -> list[MemoryNode]:
+    import_name = str(item.name or "").strip()
+    if not import_name or import_name == "*":
+        return []
+    resolved_path = str(resolved_file.properties.get("relative_path") or "")
+    if not resolved_path:
+        return []
+    symbols = _find_nodes_by_property(store, "relative_path", resolved_path, status="active", limit=10000)
+    out: list[MemoryNode] = []
+    for node in symbols:
+        if node.type not in DOCUMENT_CODE_LINK_NODE_TYPES:
+            continue
+        if node.properties.get("project_id") != artifact.project_id:
+            continue
+        if str(node.properties.get("name") or "") == import_name:
+            out.append(node)
+    return out
 
 
 def _config_node(artifact: SourceArtifact) -> MemoryNode:
@@ -2185,9 +2351,7 @@ def _external_code_symbol_node(artifact: SourceArtifact, name: str, kind: str) -
     )
 
 
-def _should_persist_variable(symbol: CodeSymbol, read_references: list[Any]) -> bool:
-    if symbol.kind != "variable":
-        return True
+def _should_persist_variable(symbol: CodeSymbol, read_references_by_name: dict[str, list[Any]]) -> bool:
     if "." in symbol.name:
         return True
     parent = symbol.parent_qualified_name or ""
@@ -2197,7 +2361,7 @@ def _should_persist_variable(symbol: CodeSymbol, read_references: list[Any]) -> 
         return True
     if symbol.name.isupper():
         return True
-    return not _variable_has_read_reference(symbol, read_references)
+    return not _variable_has_read_reference(symbol, read_references_by_name)
 
 
 def _call_relation_type(call: Any, target_node: MemoryNode) -> str:
@@ -2236,7 +2400,7 @@ def _store_unresolved_call_summaries(store: GraphStore, calls_by_owner: dict[str
     for owner_id, calls in calls_by_owner.items():
         if not calls:
             continue
-        owner = store.get_node(owner_id)
+        owner = _get_node(store, owner_id)
         if owner is None or owner.status == "archived":
             continue
         deduped: dict[tuple[str, object], dict[str, Any]] = {}
@@ -2261,10 +2425,11 @@ def _static_analysis_finding_nodes(
     symbol_nodes: dict[str, MemoryNode],
     import_node_ids: dict[str, str],
     table: SymbolTable,
+    *,
+    read_references_by_name: dict[str, list[Any]],
 ) -> list[tuple[MemoryNode, str]]:
     findings: list[tuple[MemoryNode, str]] = []
     used_symbol_names = _used_symbol_qualified_names(code_result, table)
-    read_references = [reference for reference in code_result.references if reference.access in {"read", "return", "raise"}]
     parent_symbols = {symbol.qualified_name: symbol for symbol in code_result.symbols}
 
     for symbol in code_result.symbols:
@@ -2274,7 +2439,7 @@ def _static_analysis_finding_nodes(
         if symbol.kind == "variable":
             if not _is_local_variable(symbol, parent_symbols):
                 continue
-            if not _variable_has_read_reference(symbol, read_references):
+            if not _variable_has_read_reference(symbol, read_references_by_name):
                 confidence = 0.45 if _is_test_artifact(artifact) else 0.8
                 evidence_scope = "test_local_artifact" if _is_test_artifact(artifact) else "local_artifact"
                 findings.append(
@@ -2550,10 +2715,22 @@ def _used_symbol_qualified_names(code_result: CodeParseResult, table: SymbolTabl
     return used
 
 
-def _variable_has_read_reference(symbol: CodeSymbol, references: list[Any]) -> bool:
+def _read_references_by_name(references: list[Any]) -> dict[str, list[Any]]:
+    references_by_name: dict[str, list[Any]] = {}
+    for reference in references:
+        if getattr(reference, "access", None) not in {"read", "return", "raise"}:
+            continue
+        name = str(getattr(reference, "name", "") or "")
+        if not name:
+            continue
+        references_by_name.setdefault(name.split(".", 1)[0], []).append(reference)
+    return references_by_name
+
+
+def _variable_has_read_reference(symbol: CodeSymbol, references_by_name: dict[str, list[Any]]) -> bool:
     if "." in symbol.name:
         return True
-    for reference in references:
+    for reference in references_by_name.get(symbol.name, []):
         if not _reference_owner_can_see_symbol(reference.owner, symbol):
             continue
         if reference.name == symbol.name or str(reference.name).startswith(f"{symbol.name}."):
@@ -2736,7 +2913,7 @@ def _reference_targets_local_argument(reference: Any, symbol_nodes: dict[str, Me
 def _code_nodes_for_artifact(store: GraphStore, artifact: SourceArtifact | MemoryNode) -> list[MemoryNode]:
     return [
         node
-        for node in store.find_nodes_by_property("artifact_id", artifact.id, limit=100000)
+        for node in _find_nodes_by_property(store, "artifact_id", artifact.id, limit=100000)
         if node.type in CODE_GRAPH_NODE_TYPES and node.properties.get("artifact_id") == artifact.id
     ]
 
@@ -2744,9 +2921,9 @@ def _code_nodes_for_artifact(store: GraphStore, artifact: SourceArtifact | Memor
 def _code_related_edges(store: GraphStore, node: MemoryNode) -> list[MemoryEdge]:
     edges: dict[str, MemoryEdge] = {}
     for edge_type in CODE_GRAPH_EDGE_TYPES:
-        for edge in store.get_edges(from_id=node.id, type_=edge_type, limit=100):
+        for edge in _get_edges(store, from_id=node.id, type_=edge_type, limit=100):
             edges[edge.id] = edge
-        for edge in store.get_edges(to_id=node.id, type_=edge_type, limit=100):
+        for edge in _get_edges(store, to_id=node.id, type_=edge_type, limit=100):
             edges[edge.id] = edge
     return list(edges.values())
 
@@ -2754,7 +2931,7 @@ def _code_related_edges(store: GraphStore, node: MemoryNode) -> list[MemoryEdge]
 def _code_related_edges_for_nodes(store: GraphStore, nodes: list[MemoryNode]) -> list[MemoryEdge]:
     if not nodes:
         return []
-    return store.incident_edges([node.id for node in nodes], edge_types=CODE_GRAPH_EDGE_TYPES, limit=max(10000, len(nodes) * len(CODE_GRAPH_EDGE_TYPES) * 10))
+    return _incident_edges(store, [node.id for node in nodes], edge_types=CODE_GRAPH_EDGE_TYPES, limit=max(10000, len(nodes) * len(CODE_GRAPH_EDGE_TYPES) * 10))
 
 
 def _archive_code_node(store: GraphStore, node: MemoryNode) -> None:

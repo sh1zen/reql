@@ -1,16 +1,31 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from api import MemoryGraph
 from memory.config import load_config
 from memory.domain.models import MemoryEdge, MemoryNode
+
+
+class _InteractiveInput(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+
+class _InterruptingInput(io.StringIO):
+    def isatty(self) -> bool:
+        return True
+
+    def readline(self, *args: object, **kwargs: object) -> str:
+        raise KeyboardInterrupt
 
 
 class CLITests(unittest.TestCase):
@@ -253,6 +268,69 @@ class CLITests(unittest.TestCase):
             self.assertFalse(any('"name":"storage.open.read_only_fallback"' in line for line in lines))
             self.assertTrue(any('"read_only":true' in line and '"name":"storage.open"' in line for line in lines))
 
+    def test_query_context_cleanup_include_risky_flag_expands_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "memory.reql"
+            graph = MemoryGraph.open(db)
+            try:
+                graph.add_node(
+                    MemoryNode(
+                        id="finding:safe-cli",
+                        type="StaticAnalysisFinding",
+                        label="unused_variable: safe_cli",
+                        text="safe cli cleanup target",
+                        properties={
+                            "relative_path": "app.py",
+                            "finding_type": "unused_variable",
+                            "symbol_name": "safe_cli",
+                            "line_start": 2,
+                            "line_end": 2,
+                            "cleanup_priority": "high",
+                            "cleanup_rank": 3,
+                            "confidence": 0.8,
+                            "removal_safety": "safe",
+                            "removal_reason": "unused_variable is local to this artifact with high confidence and no public-surface signal.",
+                            "validation_reason": "",
+                            "blocking_signals": [],
+                        },
+                    )
+                )
+                graph.add_node(
+                    MemoryNode(
+                        id="finding:risky-cli",
+                        type="StaticAnalysisFinding",
+                        label="possibly_unused_function: risky_cli",
+                        text="risky cli cleanup target",
+                        properties={
+                            "relative_path": "app.py",
+                            "finding_type": "possibly_unused_function",
+                            "symbol_name": "risky_cli",
+                            "line_start": 5,
+                            "line_end": 6,
+                            "cleanup_priority": "low",
+                            "cleanup_rank": 1,
+                            "confidence": 0.4,
+                            "removal_safety": "risky",
+                            "removal_reason": "possibly_unused_function has no detected local usage, but removal needs validation before editing.",
+                            "validation_reason": "Validate public API before removing this symbol.",
+                            "blocking_signals": ["public_api"],
+                        },
+                    )
+                )
+            finally:
+                graph.close()
+
+            base = [sys.executable, "-m", "memory.cli", "--storage", str(db), "query_context", "--query", "cli cleanup target", "--cleanup", "--json"]
+            default_result = subprocess.run(base, check=True, capture_output=True, text=True)
+            risky_result = subprocess.run(base + ["--include-risky"], check=True, capture_output=True, text=True)
+
+            default_payload = json.loads(default_result.stdout)
+            risky_payload = json.loads(risky_result.stdout)
+            self.assertEqual({item["id"] for item in default_payload["cleanup_candidates"]}, {"finding:safe-cli"})
+            self.assertEqual(default_payload["cleanup_filter"]["mode"], "safe_remove")
+            self.assertEqual({item["id"] for item in risky_payload["cleanup_candidates"]}, {"finding:safe-cli", "finding:risky-cli"})
+            self.assertEqual(risky_payload["cleanup_filter"]["mode"], "include_risky")
+
     def test_project_exclude_creates_and_appends_config_scan_exclude_rules(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "project"
@@ -424,17 +502,18 @@ class CLITests(unittest.TestCase):
             command_path = command_dir / command_name
             self.assertTrue(command_path.exists())
             self.assertTrue(any(action["kind"] == "command" and action["status"] == "created" for action in payload["actions"]))
-            self.assertTrue((project / ".codex" / "skills" / "reql-project" / "SKILL.md").exists())
-            self.assertTrue((project / ".claude" / "skills" / "reql-project" / "SKILL.md").exists())
-            self.assertTrue((project / ".codex" / "skills" / "reql-project" / "agents" / "openai.yaml").exists())
-            self.assertTrue((project / ".codex" / "skills" / "reql-project" / "references" / "bootstrap.md").exists())
-            self.assertTrue((project / ".codex" / "skills" / "reql-project" / "references" / "query.md").exists())
-            self.assertTrue((project / ".codex" / "skills" / "reql-project" / "references" / "update-watch.md").exists())
-            self.assertTrue((project / ".codex" / "skills" / "reql-project" / "references" / "reports-exports.md").exists())
-            self.assertTrue((project / ".codex" / "skills" / "reql-project" / "references" / "document-semantics.md").exists())
+            self.assertTrue((project / ".codex" / "skills" / "reql-agent" / "SKILL.md").exists())
+            self.assertTrue((project / ".claude" / "skills" / "reql-agent" / "SKILL.md").exists())
+            self.assertTrue((project / ".codex" / "skills" / "reql-agent" / "agents" / "openai.yaml").exists())
+            self.assertTrue((project / ".codex" / "skills" / "reql-agent" / "references" / "bootstrap.md").exists())
+            self.assertTrue((project / ".codex" / "skills" / "reql-agent" / "references" / "query.md").exists())
+            self.assertTrue((project / ".codex" / "skills" / "reql-agent" / "references" / "update-watch.md").exists())
+            self.assertTrue((project / ".codex" / "skills" / "reql-agent" / "references" / "reports-exports.md").exists())
+            self.assertTrue((project / ".codex" / "skills" / "reql-agent" / "references" / "document-semantics.md").exists())
+            self.assertTrue((project / ".codex" / "skills" / "reql-agent" / "references" / "agent-workspace.md").exists())
             self.assertTrue((project / ".claude" / "CLAUDE.md").exists())
-            self.assertTrue((project / ".codex" / "skills" / "reql-project" / ".reql_agent_version").exists())
-            self.assertTrue((project / ".claude" / "skills" / "reql-project" / ".reql_agent_version").exists())
+            self.assertTrue((project / ".codex" / "skills" / "reql-agent" / ".reql_version").exists())
+            self.assertTrue((project / ".claude" / "skills" / "reql-agent" / ".reql_version").exists())
             claude_settings = json.loads((project / ".claude" / "settings.json").read_text(encoding="utf-8"))
             self.assertIn("REQL_AGENT_HOOK_V1", json.dumps(claude_settings))
             self.assertIn("do not duplicate that context with broad", json.dumps(claude_settings))
@@ -443,12 +522,19 @@ class CLITests(unittest.TestCase):
             self.assertIn("preserve the user", json.dumps(claude_settings))
             self.assertIn("language, identifiers, and exact errors", json.dumps(claude_settings))
             self.assertNotIn('--query "current task"', json.dumps(claude_settings))
-            codex_project_skill = (project / ".codex" / "skills" / "reql-project" / "SKILL.md").read_text(encoding="utf-8")
-            claude_project_skill = (project / ".claude" / "skills" / "reql-project" / "SKILL.md").read_text(encoding="utf-8")
+            codex_project_skill = (project / ".codex" / "skills" / "reql-agent" / "SKILL.md").read_text(encoding="utf-8")
+            claude_project_skill = (project / ".claude" / "skills" / "reql-agent" / "SKILL.md").read_text(encoding="utf-8")
             self.assertIn("REQL Project", codex_project_skill)
+            self.assertIn("Agent Workspace mode", codex_project_skill)
             self.assertIn("Installed for: codex (project-local).", codex_project_skill)
             self.assertIn(str(command_path), codex_project_skill)
-            self.assertIn("Use this skill for project mode", codex_project_skill)
+            self.assertIn("Use this skill for REQL project mode and Agent Workspace mode", codex_project_skill)
+            self.assertIn("agent init", codex_project_skill)
+            self.assertIn("agent sync", codex_project_skill)
+            self.assertIn("agent batch --task", codex_project_skill)
+            self.assertIn("agent map", codex_project_skill)
+            self.assertIn("agent export --json", codex_project_skill)
+            self.assertIn("After `reql project compile .` adds new files, run `reql agent sync` before linking", codex_project_skill)
             self.assertIn("project status .", codex_project_skill)
             self.assertIn("Project not found", codex_project_skill)
             self.assertIn("immediately run", codex_project_skill)
@@ -484,15 +570,17 @@ class CLITests(unittest.TestCase):
             self.assertIn("Before the final response for any task that changed files", codex_project_skill)
             self.assertIn("Reference Routing", codex_project_skill)
             self.assertIn("references/bootstrap.md", codex_project_skill)
+            self.assertIn("references/agent-workspace.md", codex_project_skill)
             self.assertIn('query_context --query "<terms from user request>"', codex_project_skill)
             self.assertIn('query_explore --query "<terms from user request>"', codex_project_skill)
             self.assertIn('query_memories --query "<terms from user request>"', codex_project_skill)
             self.assertIn('query_graph --query "<terms from user request>"', codex_project_skill)
             self.assertNotIn('retrieve --query "<terms from user request>"', codex_project_skill)
-            bootstrap_reference = (project / ".codex" / "skills" / "reql-project" / "references" / "bootstrap.md").read_text(encoding="utf-8")
-            query_reference = (project / ".codex" / "skills" / "reql-project" / "references" / "query.md").read_text(encoding="utf-8")
-            update_watch_reference = (project / ".codex" / "skills" / "reql-project" / "references" / "update-watch.md").read_text(encoding="utf-8")
-            openai_yaml = (project / ".codex" / "skills" / "reql-project" / "agents" / "openai.yaml").read_text(encoding="utf-8")
+            bootstrap_reference = (project / ".codex" / "skills" / "reql-agent" / "references" / "bootstrap.md").read_text(encoding="utf-8")
+            query_reference = (project / ".codex" / "skills" / "reql-agent" / "references" / "query.md").read_text(encoding="utf-8")
+            update_watch_reference = (project / ".codex" / "skills" / "reql-agent" / "references" / "update-watch.md").read_text(encoding="utf-8")
+            openai_yaml = (project / ".codex" / "skills" / "reql-agent" / "agents" / "openai.yaml").read_text(encoding="utf-8")
+            agent_reference = (project / ".codex" / "skills" / "reql-agent" / "references" / "agent-workspace.md").read_text(encoding="utf-8")
             self.assertIn("Fast path: existing graph", bootstrap_reference)
             self.assertIn("Raw tool limits", bootstrap_reference)
             self.assertIn("custom scanners, or ad hoc crawlers", bootstrap_reference)
@@ -534,17 +622,39 @@ class CLITests(unittest.TestCase):
             self.assertIn("framework callbacks", query_reference)
             self.assertIn("Before the final response for any task that changed files", update_watch_reference)
             self.assertIn("display_name: REQL Project", openai_yaml)
+            self.assertIn("agent memory", openai_yaml)
+            self.assertIn("Agent Workspace", agent_reference)
+            self.assertIn("agent status", agent_reference)
+            self.assertIn("agent reset", agent_reference)
+            self.assertIn("does not modify `.reql/memory.reql`", agent_reference)
+            self.assertIn("planning layer when a project is too large", agent_reference)
+            self.assertIn("Required Agent Workflow", agent_reference)
+            self.assertIn("### 1. Plan", agent_reference)
+            self.assertIn("### 2. Task Build", agent_reference)
+            self.assertIn("### 3. Quick Review", agent_reference)
+            self.assertIn("### 4. Code Linking", agent_reference)
+            self.assertIn("### 5. Write", agent_reference)
+            self.assertIn("assemble the implementation from the task graph", agent_reference)
+            self.assertIn("After `reql project compile .` adds new files, run `reql agent sync` before linking", agent_reference)
+            self.assertIn("After compile with new files, run sync before linking new standard nodes", agent_reference)
+            self.assertIn("code notes, files, symbols", agent_reference)
+            self.assertIn("Plan: use", codex_project_skill)
+            self.assertIn("Task build:", codex_project_skill)
+            self.assertIn("Quick review:", codex_project_skill)
+            self.assertIn("Code linking:", codex_project_skill)
+            self.assertIn("Write: edit the project files", codex_project_skill)
             generated_skill_text = "\n".join(
                 [
                     codex_project_skill,
                     bootstrap_reference,
                     query_reference,
                     update_watch_reference,
-                    (project / ".codex" / "skills" / "reql-project" / "references" / "reports-exports.md").read_text(encoding="utf-8"),
-                    (project / ".codex" / "skills" / "reql-project" / "references" / "document-semantics.md").read_text(encoding="utf-8"),
+                    (project / ".codex" / "skills" / "reql-agent" / "references" / "reports-exports.md").read_text(encoding="utf-8"),
+                    (project / ".codex" / "skills" / "reql-agent" / "references" / "document-semantics.md").read_text(encoding="utf-8"),
+                    agent_reference,
                 ]
             )
-            document_semantics_reference = (project / ".codex" / "skills" / "reql-project" / "references" / "document-semantics.md").read_text(encoding="utf-8")
+            document_semantics_reference = (project / ".codex" / "skills" / "reql-agent" / "references" / "document-semantics.md").read_text(encoding="utf-8")
             self.assertIn("Deterministic document processor", document_semantics_reference)
             self.assertIn("RawEvent", document_semantics_reference)
             self.assertIn("CO_OCCURS_WITH", document_semantics_reference)
@@ -566,8 +676,8 @@ class CLITests(unittest.TestCase):
             self.assertNotIn("explain hub NODE_ID", generated_skill_text)
             self.assertNotIn("where is this", generated_skill_text)
             self.assertNotIn("dove sta questo", generated_skill_text)
-            self.assertEqual([path.name for path in (project / ".codex" / "skills").iterdir()], ["reql-project"])
-            self.assertEqual([path.name for path in (project / ".claude" / "skills").iterdir()], ["reql-project"])
+            self.assertEqual(sorted(path.name for path in (project / ".codex" / "skills").iterdir()), ["reql-agent"])
+            self.assertEqual(sorted(path.name for path in (project / ".claude" / "skills").iterdir()), ["reql-agent"])
             self.assertIn("Installed for: claude (project-local).", claude_project_skill)
 
             shim_env = dict(os.environ)
@@ -620,9 +730,10 @@ class CLITests(unittest.TestCase):
             uninstall_payload = json.loads(uninstall.stdout)
             self.assertEqual(uninstall_payload["scope"], "project")
             self.assertFalse(command_path.exists())
-            self.assertFalse((project / ".codex" / "skills" / "reql-project" / "SKILL.md").exists())
-            self.assertFalse((project / ".codex" / "skills" / "reql-project" / "references" / "bootstrap.md").exists())
-            self.assertFalse((project / ".claude" / "skills" / "reql-project" / "SKILL.md").exists())
+            self.assertFalse((project / ".codex" / "skills" / "reql-agent" / "SKILL.md").exists())
+            self.assertFalse((project / ".codex" / "skills" / "reql-agent" / "references" / "bootstrap.md").exists())
+            self.assertFalse((project / ".codex" / "skills" / "reql-agent" / "references" / "agent-workspace.md").exists())
+            self.assertFalse((project / ".claude" / "skills" / "reql-agent" / "SKILL.md").exists())
             self.assertFalse((project / ".claude" / "settings.json").exists())
             self.assertNotIn("REQL-INSTALL:START", (project / "AGENTS.md").read_text(encoding="utf-8"))
             self.assertIn("Existing instructions", (project / "AGENTS.md").read_text(encoding="utf-8"))
@@ -688,6 +799,7 @@ class CLITests(unittest.TestCase):
             env = dict(os.environ)
             env["HOME"] = str(fake_home)
             env["USERPROFILE"] = str(fake_home)
+            env["PATH"] = ""
             if fake_home.drive:
                 env["HOMEDRIVE"] = fake_home.drive
                 env["HOMEPATH"] = str(fake_home)[len(fake_home.drive) :]
@@ -735,7 +847,7 @@ class CLITests(unittest.TestCase):
                 fake_home / ".hermes" / "AGENTS.md",
                 fake_home / ".kimi" / "AGENTS.md",
                 fake_home / ".antigravity" / "AGENTS.md",
-                fake_home / ".config" / "agents" / "AGENTS.md",
+                fake_home / ".agents" / "AGENTS.md",
             ]
             for path in profile_instruction_paths:
                 self.assertTrue(path.exists(), str(path))
@@ -749,12 +861,18 @@ class CLITests(unittest.TestCase):
 
             self.assertTrue((fake_home / ".cursor" / "rules" / "reql.mdc").exists())
             self.assertTrue((fake_home / ".github" / "instructions" / "reql.instructions.md").exists())
+            self.assertTrue((fake_home / ".agents" / "skills" / "reql-agent" / "SKILL.md").exists())
+            self.assertFalse((fake_home / ".config" / "agents" / "skills" / "reql-agent" / "SKILL.md").exists())
             opencode_document_semantics = (
-                fake_home / ".config" / "opencode" / "skills" / "reql-project" / "references" / "document-semantics.md"
+                fake_home / ".config" / "opencode" / "skills" / "reql-agent" / "references" / "document-semantics.md"
+            ).read_text(encoding="utf-8")
+            opencode_agent_reference = (
+                fake_home / ".config" / "opencode" / "skills" / "reql-agent" / "references" / "agent-workspace.md"
             ).read_text(encoding="utf-8")
             self.assertIn("Deterministic document processor", opencode_document_semantics)
             self.assertIn("RawEvent", opencode_document_semantics)
             self.assertNotIn("host `@agent` dispatch path", opencode_document_semantics)
+            self.assertIn("Agent Workspace", opencode_agent_reference)
 
     def test_install_without_platforms_auto_detects_agent_profiles(self) -> None:
         tmp_root = Path.cwd() / ".tmp"
@@ -763,10 +881,11 @@ class CLITests(unittest.TestCase):
             fake_home = Path(td) / "home"
             command_dir = Path(td) / "bin"
             (fake_home / ".codex").mkdir(parents=True)
-            (fake_home / ".cursor").mkdir(parents=True)
+            (fake_home / ".cursor" / "rules").mkdir(parents=True)
             env = dict(os.environ)
             env["HOME"] = str(fake_home)
             env["USERPROFILE"] = str(fake_home)
+            env["PATH"] = ""
             if fake_home.drive:
                 env["HOMEDRIVE"] = fake_home.drive
                 env["HOMEPATH"] = str(fake_home)[len(fake_home.drive) :]
@@ -790,10 +909,404 @@ class CLITests(unittest.TestCase):
             )
 
             payload = json.loads(result.stdout)
-            self.assertIn("codex", payload["platforms"])
+            self.assertNotIn("codex", payload["platforms"])
             self.assertIn("cursor", payload["platforms"])
-            self.assertTrue((fake_home / "AGENTS.md").exists())
+            self.assertFalse((fake_home / "AGENTS.md").exists())
             self.assertTrue((fake_home / ".cursor" / "rules" / "reql.mdc").exists())
+
+            uninstall = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "memory.cli",
+                    "uninstall",
+                    "--user",
+                    "--command-dir",
+                    str(command_dir),
+                    "--json",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+            uninstall_payload = json.loads(uninstall.stdout)
+            self.assertEqual(uninstall_payload["scope"], "user")
+            self.assertNotIn("codex", uninstall_payload["platforms"])
+            self.assertIn("cursor", uninstall_payload["platforms"])
+            self.assertFalse((fake_home / ".cursor" / "rules" / "reql.mdc").exists())
+
+    def test_install_without_detected_profiles_lists_disks_instead_of_defaulting_to_codex(self) -> None:
+        tmp_root = Path.cwd() / ".tmp"
+        tmp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=tmp_root) as td:
+            fake_home = Path(td) / "home"
+            command_dir = Path(td) / "bin"
+            fake_home.mkdir()
+            env = dict(os.environ)
+            env["HOME"] = str(fake_home)
+            env["USERPROFILE"] = str(fake_home)
+            env["PATH"] = ""
+            if fake_home.drive:
+                env["HOMEDRIVE"] = fake_home.drive
+                env["HOMEPATH"] = str(fake_home)[len(fake_home.drive) :]
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "memory.cli",
+                    "install",
+                    "--user",
+                    "--command-dir",
+                    str(command_dir),
+                    "--no-hooks",
+                    "--json",
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("No supported coding-agent profiles were detected.", result.stderr)
+            self.assertIn("Available disks:", result.stderr)
+            self.assertIn("reql install codex --user", result.stderr)
+            self.assertFalse((fake_home / "AGENTS.md").exists())
+            self.assertFalse((fake_home / ".codex" / "skills" / "reql-agent" / "SKILL.md").exists())
+
+    def test_interactive_install_prompts_for_target_then_proceeds(self) -> None:
+        from memory import cli as cli_mod
+
+        tmp_root = Path.cwd() / ".tmp"
+        tmp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=tmp_root) as td:
+            initial_project = Path(td) / "initial"
+            selected_disk = Path(td) / "agent-disk"
+            command_dir = Path(td) / "bin"
+            initial_project.mkdir()
+            selected_disk.mkdir()
+            stdin = _InteractiveInput("1\ncodex\n")
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with (
+                patch.object(cli_mod.sys, "stdin", stdin),
+                patch.object(cli_mod.sys, "stdout", stdout),
+                patch.object(cli_mod.sys, "stderr", stderr),
+                patch.object(cli_mod, "_available_disk_roots", return_value=[str(selected_disk)]),
+            ):
+                rc = cli_mod.main(
+                    [
+                        "install",
+                        "--project-dir",
+                        str(initial_project),
+                        "--command-dir",
+                        str(command_dir),
+                        "--no-hooks",
+                        "--json",
+                    ]
+                )
+
+            self.assertEqual(rc, 0)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["platforms"], ["codex"])
+            self.assertEqual(payload["scope"], "user")
+            selected_home = cli_mod._home_dir_for_disk(selected_disk)
+            self.assertTrue((selected_home / ".codex" / "skills" / "reql-agent" / "SKILL.md").exists())
+            self.assertFalse((initial_project / ".codex" / "skills" / "reql-agent" / "SKILL.md").exists())
+            self.assertIn("Available disks:", stderr.getvalue())
+            self.assertIn("No supported profiles found at", stderr.getvalue())
+            self.assertNotIn("Project path", stderr.getvalue())
+
+    def test_interactive_install_retries_autodetect_on_selected_path_before_asking_platform(self) -> None:
+        from memory import cli as cli_mod
+
+        tmp_root = Path.cwd() / ".tmp"
+        tmp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=tmp_root) as td:
+            selected_disk = Path(td) / "agent-disk"
+            command_dir = Path(td) / "bin"
+            selected_home = cli_mod._home_dir_for_disk(selected_disk)
+            (selected_home / ".cursor" / "rules").mkdir(parents=True)
+            stdin = _InteractiveInput("1\n")
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with (
+                patch.object(cli_mod.sys, "stdin", stdin),
+                patch.object(cli_mod.sys, "stdout", stdout),
+                patch.object(cli_mod.sys, "stderr", stderr),
+                patch.object(cli_mod, "_available_disk_roots", return_value=[str(selected_disk)]),
+            ):
+                rc = cli_mod.main(
+                    [
+                        "install",
+                        "--command-dir",
+                        str(command_dir),
+                        "--no-hooks",
+                        "--json",
+                    ]
+                )
+
+            self.assertEqual(rc, 0)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["platforms"], ["cursor"])
+            self.assertEqual(payload["scope"], "user")
+            self.assertTrue((selected_home / ".cursor" / "rules" / "reql.mdc").exists())
+            self.assertIn("Detected platforms: cursor", stderr.getvalue())
+            self.assertNotIn("Platform to install", stderr.getvalue())
+
+    def test_interactive_uninstall_prompts_for_target_then_proceeds(self) -> None:
+        from agents.install import install_agent_files
+        from memory import cli as cli_mod
+
+        tmp_root = Path.cwd() / ".tmp"
+        tmp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=tmp_root) as td:
+            initial_project = Path(td) / "initial"
+            selected_disk = Path(td) / "agent-disk"
+            command_dir = Path(td) / "bin"
+            initial_project.mkdir()
+            selected_disk.mkdir()
+            selected_home = cli_mod._home_dir_for_disk(selected_disk)
+            install_agent_files(
+                ["codex"],
+                project=False,
+                home_dir=selected_home,
+                command_dir=command_dir,
+                hooks=False,
+            )
+            stdin = _InteractiveInput("1\ncodex\n")
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with (
+                patch.object(cli_mod.sys, "stdin", stdin),
+                patch.object(cli_mod.sys, "stdout", stdout),
+                patch.object(cli_mod.sys, "stderr", stderr),
+                patch.object(cli_mod, "_available_disk_roots", return_value=[str(selected_disk)]),
+            ):
+                rc = cli_mod.main(
+                    [
+                        "uninstall",
+                        "--project-dir",
+                        str(initial_project),
+                        "--command-dir",
+                        str(command_dir),
+                        "--json",
+                    ]
+                )
+
+            self.assertEqual(rc, 0)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["platforms"], ["codex"])
+            self.assertEqual(payload["scope"], "user")
+            self.assertFalse((selected_home / ".codex" / "skills" / "reql-agent" / "SKILL.md").exists())
+            self.assertIn("Available disks:", stderr.getvalue())
+            self.assertIn("No supported profiles found at", stderr.getvalue())
+            self.assertIn("Platform to uninstall", stderr.getvalue())
+
+    def test_interactive_uninstall_retries_autodetect_on_selected_path_before_asking_platform(self) -> None:
+        from agents.install import install_agent_files
+        from memory import cli as cli_mod
+
+        tmp_root = Path.cwd() / ".tmp"
+        tmp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=tmp_root) as td:
+            selected_disk = Path(td) / "agent-disk"
+            command_dir = Path(td) / "bin"
+            selected_disk.mkdir()
+            selected_home = cli_mod._home_dir_for_disk(selected_disk)
+            (selected_home / ".cursor" / "rules").mkdir(parents=True)
+            install_agent_files(
+                ["cursor"],
+                project=False,
+                home_dir=selected_home,
+                command_dir=command_dir,
+                hooks=False,
+            )
+            stdin = _InteractiveInput("1\n")
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with (
+                patch.object(cli_mod.sys, "stdin", stdin),
+                patch.object(cli_mod.sys, "stdout", stdout),
+                patch.object(cli_mod.sys, "stderr", stderr),
+                patch.object(cli_mod, "_available_disk_roots", return_value=[str(selected_disk)]),
+            ):
+                rc = cli_mod.main(
+                    [
+                        "uninstall",
+                        "--command-dir",
+                        str(command_dir),
+                        "--json",
+                    ]
+                )
+
+            self.assertEqual(rc, 0)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["platforms"], ["cursor"])
+            self.assertEqual(payload["scope"], "user")
+            self.assertFalse((selected_home / ".cursor" / "rules" / "reql.mdc").exists())
+            self.assertIn("Detected platforms: cursor", stderr.getvalue())
+            self.assertNotIn("Platform to uninstall", stderr.getvalue())
+
+    def test_interactive_install_interrupt_exits_without_traceback(self) -> None:
+        from memory import cli as cli_mod
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with (
+            patch.object(cli_mod.sys, "stdin", _InterruptingInput()),
+            patch.object(cli_mod.sys, "stdout", stdout),
+            patch.object(cli_mod.sys, "stderr", stderr),
+            patch.object(cli_mod, "_available_disk_roots", return_value=["C:\\"]),
+        ):
+            rc = cli_mod.main(["install", "--json"])
+
+        self.assertEqual(rc, 130)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("Install cancelled.", stderr.getvalue())
+
+    def test_interactive_uninstall_interrupt_exits_without_traceback(self) -> None:
+        from memory import cli as cli_mod
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with (
+            patch.object(cli_mod.sys, "stdin", _InterruptingInput()),
+            patch.object(cli_mod.sys, "stdout", stdout),
+            patch.object(cli_mod.sys, "stderr", stderr),
+            patch.object(cli_mod, "_available_disk_roots", return_value=["C:\\"]),
+        ):
+            rc = cli_mod.main(["uninstall", "--json"])
+
+        self.assertEqual(rc, 130)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("Uninstall cancelled.", stderr.getvalue())
+        self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_copilot_auto_detect_ignores_generic_github_directory(self) -> None:
+        from agents.install import detect_platforms
+
+        tmp_root = Path.cwd() / ".tmp"
+        tmp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=tmp_root) as td:
+            fake_home = Path(td) / "home"
+            project = Path(td) / "repo"
+            fake_home.mkdir()
+            (project / ".cursor" / "rules").mkdir(parents=True)
+            (project / ".github").mkdir()
+
+            original_env = {name: os.environ.get(name) for name in ("HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "PATH")}
+            try:
+                os.environ["HOME"] = str(fake_home)
+                os.environ["USERPROFILE"] = str(fake_home)
+                os.environ["PATH"] = ""
+                if fake_home.drive:
+                    os.environ["HOMEDRIVE"] = fake_home.drive
+                    os.environ["HOMEPATH"] = str(fake_home)[len(fake_home.drive) :]
+
+                platforms = detect_platforms(project=True, project_dir=project)
+                self.assertNotIn("codex", platforms)
+                self.assertIn("cursor", platforms)
+                self.assertNotIn("copilot", platforms)
+
+                (project / ".github" / "copilot-instructions.md").write_text("# Copilot\n", encoding="utf-8")
+                platforms = detect_platforms(project=True, project_dir=project)
+                self.assertIn("copilot", platforms)
+            finally:
+                for name, value in original_env.items():
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
+
+    def test_codex_auto_detect_ignores_codex_directory_and_command(self) -> None:
+        from agents.install import detect_platforms
+
+        tmp_root = Path.cwd() / ".tmp"
+        tmp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=tmp_root) as td:
+            fake_home = Path(td) / "home"
+            project = Path(td) / "repo"
+            fake_bin = Path(td) / "bin"
+            fake_home.mkdir()
+            fake_bin.mkdir()
+            (fake_home / ".codex").mkdir()
+            (project / ".codex").mkdir(parents=True)
+            command_name = "codex.cmd" if sys.platform.startswith("win") else "codex"
+            command_path = fake_bin / command_name
+            command_path.write_text("@echo off\n" if sys.platform.startswith("win") else "#!/bin/sh\n", encoding="utf-8")
+            command_path.chmod(0o755)
+
+            original_env = {name: os.environ.get(name) for name in ("HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "PATH")}
+            try:
+                os.environ["HOME"] = str(fake_home)
+                os.environ["USERPROFILE"] = str(fake_home)
+                os.environ["PATH"] = str(fake_bin)
+                if fake_home.drive:
+                    os.environ["HOMEDRIVE"] = fake_home.drive
+                    os.environ["HOMEPATH"] = str(fake_home)[len(fake_home.drive) :]
+
+                platforms = detect_platforms(project=True, project_dir=project)
+                self.assertNotIn("codex", platforms)
+
+                (project / ".codex" / "skills").mkdir()
+                platforms = detect_platforms(project=True, project_dir=project)
+                self.assertIn("codex", platforms)
+            finally:
+                for name, value in original_env.items():
+                    if value is None:
+                        os.environ.pop(name, None)
+                    else:
+                        os.environ[name] = value
+
+    def test_project_install_auto_detect_does_not_use_user_scope_codex_profile(self) -> None:
+        tmp_root = Path.cwd() / ".tmp"
+        tmp_root.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=tmp_root) as td:
+            fake_home = Path(td) / "home"
+            command_dir = Path(td) / "bin"
+            project = Path(td) / "repo"
+            user_codex_skill = fake_home / ".codex" / "skills" / "some-real-skill"
+            project.mkdir()
+            user_codex_skill.mkdir(parents=True)
+            (user_codex_skill / "SKILL.md").write_text("# User Codex Skill\n", encoding="utf-8")
+            env = dict(os.environ)
+            env["HOME"] = str(fake_home)
+            env["USERPROFILE"] = str(fake_home)
+            env["PATH"] = ""
+            if fake_home.drive:
+                env["HOMEDRIVE"] = fake_home.drive
+                env["HOMEPATH"] = str(fake_home)[len(fake_home.drive) :]
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "memory.cli",
+                    "install",
+                    "--project-dir",
+                    str(project),
+                    "--command-dir",
+                    str(command_dir),
+                    "--no-hooks",
+                    "--json",
+                ],
+                capture_output=True,
+                text=True,
+                env=env,
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("No supported coding-agent profiles were detected.", result.stderr)
+            self.assertFalse((project / ".codex" / "skills" / "reql-agent" / "SKILL.md").exists())
 
     def test_cli_lifecycle(self) -> None:
         with tempfile.TemporaryDirectory() as td:
