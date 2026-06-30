@@ -38,7 +38,7 @@ class TreeSitterCodeParser:
         tree = parser.parse(source)
         root = tree.root_node
         if bool(getattr(root, "has_error", False)):
-            return _empty_result(artifact, language, f"Tree-sitter syntax error in {artifact.relative_path}")
+            return _syntax_recovery_result(artifact, language)
         return _extractor_for(artifact, source, language, parser_language).extract(root)
 
 
@@ -126,6 +126,38 @@ def _language(artifact: SourceArtifact) -> str:
 def _empty_result(artifact: SourceArtifact, language: str, error: str) -> CodeParseResult:
     module = CodeModule(id=stable_id("module", artifact.id), artifact_id=artifact.id, name=_module_name(artifact.relative_path), path=artifact.relative_path, language=language, metadata={"tree_sitter": True})
     return CodeParseResult(module=module, symbols=[], imports=[], calls=[], references=[], classes=[], functions=[], methods=[], comments=[], docstrings=[], errors=[error], parser_name=TreeSitterCodeParser.parser_name, parser_version=TreeSitterCodeParser.parser_version)
+
+
+def _syntax_recovery_result(artifact: SourceArtifact, language: str) -> CodeParseResult:
+    error = f"Tree-sitter syntax error in {artifact.relative_path}"
+    module = CodeModule(
+        id=stable_id("module", artifact.id),
+        artifact_id=artifact.id,
+        name=_module_name(artifact.relative_path),
+        path=artifact.relative_path,
+        language=language,
+        metadata={
+            "tree_sitter": True,
+            "tree_sitter_has_error": True,
+            "parser_status": "partial",
+            "parser_warning": error,
+        },
+    )
+    return CodeParseResult(
+        module=module,
+        symbols=[],
+        imports=[],
+        calls=[],
+        references=[],
+        classes=[],
+        functions=[],
+        methods=[],
+        comments=[],
+        docstrings=[],
+        errors=[],
+        parser_name=TreeSitterCodeParser.parser_name,
+        parser_version=TreeSitterCodeParser.parser_version,
+    )
 
 
 def _symbol(

@@ -8,6 +8,7 @@ from pathlib import Path
 DEFAULT_IGNORE_PATTERNS = (
     ".git/",
     ".reql/",
+    ".cache/",
     ".venv/",
     "venv/",
     "node_modules/",

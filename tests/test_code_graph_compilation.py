@@ -104,6 +104,43 @@ class CodeGraphCompilationTests(unittest.TestCase):
             finally:
                 graph.close()
 
+    def test_tree_sitter_syntax_recovery_does_not_fail_project_compile(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "project"
+            js_fixture = root / "extensions" / "plugin-check" / "vendor" / "package" / "fixture.js"
+            ps_helper = root / "extensions" / "xml-importer" / "linecounter.ps1"
+            js_fixture.parent.mkdir(parents=True)
+            ps_helper.parent.mkdir(parents=True)
+            js_fixture.write_text("<<<<<<< bad fixture\n", encoding="utf-8")
+            ps_helper.write_text("function broken {\n", encoding="utf-8")
+            graph = MemoryGraph.open(Path(td) / "memory.reql")
+            try:
+                result = graph.compile_project(root)
+
+                self.assertFalse(result.run.errors)
+                relative_paths = {artifact.relative_path for artifact in result.scan.artifacts}
+                self.assertIn("extensions/plugin-check/vendor/package/fixture.js", relative_paths)
+                self.assertIn("extensions/xml-importer/linecounter.ps1", relative_paths)
+
+                modules = {
+                    node.properties.get("relative_path"): node
+                    for node in graph.store.all_nodes()
+                    if node.type == "Module"
+                }
+                for relative_path in (
+                    "extensions/plugin-check/vendor/package/fixture.js",
+                    "extensions/xml-importer/linecounter.ps1",
+                ):
+                    module = modules.get(relative_path)
+                    self.assertIsNotNone(module)
+                    assert module is not None
+                    metadata = module.properties.get("metadata")
+                    self.assertIsInstance(metadata, dict)
+                    self.assertEqual(metadata.get("parser_status"), "partial")
+                    self.assertTrue(metadata.get("tree_sitter_has_error"))
+            finally:
+                graph.close()
+
     def test_graph_compilation_creates_symbols_relations_and_calls(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "project"
