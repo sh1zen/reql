@@ -1,15 +1,33 @@
 from __future__ import annotations
 
+from collections import Counter
+from dataclasses import asdict
 import tempfile
 import unittest
 from pathlib import Path
 
 from api import MemoryGraph
-from memory.domain.models import MemoryEdge, MemoryNode
+from memory.domain.models import MemoryEdge, MemoryNode, MemoryQuery
 from memory.extraction import normalization
 
 
 class NormalizationTests(unittest.TestCase):
+    def test_token_signal_score_preserves_formula(self) -> None:
+        cases = {
+            "a": 0.0,
+            "__": 0.0,
+            "abc": 0.25,
+            "abcd": 0.5,
+            "abcdef": 0.75,
+            "1234": 0.65,
+            "abc123": 0.9,
+            "a_b": 0.45,
+            "api-error": 0.95,
+        }
+        for token, expected in cases.items():
+            with self.subTest(token=token):
+                self.assertEqual(normalization.token_signal_score(token), expected)
+
     def test_query_tokenization_is_language_agnostic(self) -> None:
         self.assertFalse(hasattr(normalization, "STOPWORDS"))
         self.assertFalse(hasattr(normalization, "TECH_TERMS"))
@@ -22,6 +40,90 @@ class NormalizationTests(unittest.TestCase):
         self.assertIn("pagamento", tokens)
         self.assertIn("uberweisung", tokens)
         self.assertIn("apierror42", tokens)
+
+    def test_keyword_scores_match_reference_scoring(self) -> None:
+        samples = [
+            "compile artifact compile_project APIError42 Überweisung",
+            "alpha beta alpha-beta nested.path route#handler",
+            "dove questo pagamento where this read return raise",
+            "compile compile compile APIError42 APIError42",
+            "résumé naïve über façade route#handler nested.path alpha-beta",
+            "x y z __ -- method_name method-name path/to/file.py",
+        ]
+        for sample in samples:
+            with self.subTest(sample=sample):
+                self.assertEqual(normalization.keyword_scores(sample, max_terms=20), self._reference_keyword_scores(sample, max_terms=20))
+
+    def _reference_keyword_scores(self, value: str, *, max_terms: int = 12) -> list[tuple[str, float]]:
+        tokens = normalization.tokenize(value)
+        if not tokens:
+            return []
+        counts = Counter(tokens)
+        for a, b in zip(tokens, tokens[1:]):
+            if normalization.token_signal_score(a) >= 0.5 and normalization.token_signal_score(b) >= 0.5:
+                counts[f"{a} {b}"] += 1.25
+        max_count = max(counts.values()) or 1
+        scored = []
+        for term, count in counts.items():
+            if " " in term:
+                specificity = 1.15 + min(normalization.token_signal_score(part) for part in term.split())
+            else:
+                specificity = normalization.token_signal_score(term)
+            scored.append((term, min(1.0, (count / max_count) * specificity)))
+        scored.sort(key=lambda item: (item[1], len(item[0])), reverse=True)
+        return scored[:max_terms]
+
+
+class DomainModelTests(unittest.TestCase):
+    def test_node_and_edge_to_dict_match_dataclass_payload_and_isolate_properties(self) -> None:
+        node = MemoryNode(
+            id="n1",
+            type="Topic",
+            label="node",
+            properties={"nested": {"items": ["a"]}},
+        )
+        edge = MemoryEdge(
+            id="e1",
+            from_id="n1",
+            to_id="n2",
+            type="RELATED_TO",
+            properties={"nested": {"items": ["b"]}},
+        )
+
+        node_payload = node.to_dict()
+        edge_payload = edge.to_dict()
+
+        self.assertEqual(node_payload, asdict(node))
+        self.assertEqual(edge_payload, asdict(edge))
+        node_payload["properties"]["nested"]["items"].append("mutated")
+        edge_payload["properties"]["nested"]["items"].append("mutated")
+        self.assertEqual(node.properties["nested"]["items"], ["a"])
+        self.assertEqual(edge.properties["nested"]["items"], ["b"])
+
+    def test_node_and_edge_to_dict_can_skip_property_copy(self) -> None:
+        node = MemoryNode(id="n1", type="Topic", properties={"nested": {"items": ["a"]}})
+        edge = MemoryEdge(id="e1", from_id="n1", to_id="n2", type="RELATED_TO", properties={"nested": {"items": ["b"]}})
+
+        self.assertIs(node.to_dict(copy_properties=False)["properties"], node.properties)
+        self.assertIs(edge.to_dict(copy_properties=False)["properties"], edge.properties)
+
+    def test_query_to_dict_matches_dataclass_payload_and_isolates_sets(self) -> None:
+        query = MemoryQuery(
+            text="compile artifact",
+            node_types={"Function"},
+            edge_types={"CALLS"},
+            context_scopes={"code"},
+        )
+
+        payload = query.to_dict()
+
+        self.assertEqual(payload, asdict(query))
+        payload["node_types"].add("Class")
+        payload["edge_types"].add("IMPORTS")
+        payload["context_scopes"].add("docs")
+        self.assertEqual(query.node_types, {"Function"})
+        self.assertEqual(query.edge_types, {"CALLS"})
+        self.assertEqual(query.context_scopes, {"code"})
 
 
 class MemoryGraphIntegrationTests(unittest.TestCase):
@@ -75,7 +177,7 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
             label="src/memory/services/retrieval.py",
             text="Retrieval service file.",
             canonical_key="file:retrieval",
-            properties={"relative_path": "src/memory/services/retrieval.py", "path": str(source_path), "project_id": "project:test"},
+            properties={"relative_path": "src/memory/services/retrieval.py", "context_scope": "code", "path": str(source_path), "project_id": "project:test"},
             salience=0.7,
         )
         function_node = MemoryNode(
@@ -87,6 +189,7 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
             canonical_key="src.memory.services.retrieval.RetrievalEngine.query_context",
             properties={
                 "relative_path": "src/memory/services/retrieval.py",
+                "context_scope": "code",
                 "name": "query_context",
                 "qualified_name": "src.memory.services.retrieval.RetrievalEngine.query_context",
                 "line_start": 2,
@@ -103,6 +206,7 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
             canonical_key="finding:retrieval-noise",
             properties={
                 "relative_path": "src/memory/services/retrieval.py",
+                "context_scope": "code",
                 "finding_type": "unused_variable",
                 "symbol_name": "noise",
                 "cleanup_priority": "high",
@@ -122,7 +226,7 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
             label="src/memory/services/retrieval.py#class",
             text=query,
             canonical_key="fragment:retrieval-class",
-            properties={"relative_path": "src/memory/services/retrieval.py", "line_start": 1, "line_end": 1000},
+            properties={"relative_path": "src/memory/services/retrieval.py", "context_scope": "code", "line_start": 1, "line_end": 1000},
             salience=0.95,
         )
         generated_fragment = MemoryNode(
@@ -132,7 +236,7 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
             label="src/reql.egg-info/PKG-INFO#1",
             text=query,
             canonical_key="fragment:generated-pkg-info",
-            properties={"relative_path": "src/reql.egg-info/PKG-INFO", "line_start": 1, "line_end": 3},
+            properties={"relative_path": "src/reql.egg-info/PKG-INFO", "context_scope": "docs", "line_start": 1, "line_end": 3},
             salience=0.95,
         )
         test_noise = MemoryNode(
@@ -144,6 +248,7 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
             canonical_key="tests.test_retrieval.test_query_context_noise",
             properties={
                 "relative_path": "tests/test_retrieval.py",
+                "context_scope": "test",
                 "name": "test_query_context_noise",
                 "qualified_name": "tests.test_retrieval.test_query_context_noise",
                 "line_start": 10,
@@ -158,7 +263,7 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
             label="docs/query_context.md#1",
             text="query_context coding agent minimal files context retrieval noise guide edits",
             canonical_key="fragment:docs-query-context",
-            properties={"relative_path": "docs/query_context.md", "line_start": 1, "line_end": 4},
+            properties={"relative_path": "docs/query_context.md", "context_scope": "docs", "line_start": 1, "line_end": 4},
             salience=0.9,
         )
         for node in (file_node, function_node, finding_node, broad_source_fragment, generated_fragment, test_noise, docs_noise):
@@ -243,6 +348,201 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
         self.assertNotIn("intervention_targets", default_payload)
         self.assertFalse(default_payload["cleanup_candidates"])
 
+    def test_cleanup_query_context_includes_stronger_targeted_read_payload(self) -> None:
+        source_path = Path(self.tmp.name) / "app.py"
+        source_path.write_text(
+            "\n".join(
+                [
+                    "import os",
+                    "import sys",
+                    "",
+                    "def caller():",
+                    "    return os.getcwd()",
+                    "",
+                    "def used():",
+                    "    return caller()",
+                    "",
+                    "used()",
+                    "",
+                    "VALUE = 1",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        import_node = MemoryNode(
+            id="import:sys",
+            type="Import",
+            label="sys",
+            text="import sys",
+            canonical_key="app.py:import:sys",
+            properties={"relative_path": "app.py", "path": str(source_path), "name": "sys", "module": "sys", "line_start": 2, "line_end": 2},
+            salience=0.8,
+        )
+        module_node = MemoryNode(
+            id="module:app",
+            type="Module",
+            label="app",
+            text="module app imports sys",
+            canonical_key="module:app",
+            properties={"relative_path": "app.py", "path": str(source_path), "name": "app", "line_start": 1, "line_end": 12},
+            salience=0.7,
+        )
+        caller_node = MemoryNode(
+            id="function:caller",
+            type="Function",
+            label="caller",
+            text="caller references sys in static graph",
+            canonical_key="app.caller",
+            properties={"relative_path": "app.py", "path": str(source_path), "name": "caller", "qualified_name": "app.caller", "line_start": 4, "line_end": 5},
+            salience=0.7,
+        )
+        docs_node = MemoryNode(
+            id="fragment:docs-sys",
+            type="SourceFragment",
+            label="docs/usage.md#sys",
+            text="Documentation mentions sys cleanup.",
+            canonical_key="docs:sys",
+            properties={"relative_path": "docs/usage.md", "line_start": 3, "line_end": 4},
+            salience=0.4,
+        )
+        test_node = MemoryNode(
+            id="function:test-sys",
+            type="Function",
+            label="test_sys_cleanup",
+            text="test references sys cleanup",
+            canonical_key="tests.test_app.test_sys_cleanup",
+            properties={"relative_path": "tests/test_app.py", "name": "test_sys_cleanup", "qualified_name": "tests.test_app.test_sys_cleanup", "line_start": 7, "line_end": 9},
+            salience=0.4,
+        )
+        importer_node = MemoryNode(
+            id="module:consumer",
+            type="Module",
+            label="consumer",
+            text="consumer imports sys from another file",
+            canonical_key="module:consumer",
+            properties={"relative_path": "pkg/consumer.py", "name": "consumer", "line_start": 1, "line_end": 3},
+            salience=0.4,
+        )
+        finding = MemoryNode(
+            id="finding:unused-sys",
+            type="StaticAnalysisFinding",
+            label="unused_import: sys",
+            text="Import sys has no detected reference in this artifact.",
+            canonical_key="app.py:finding:unused_import:sys",
+            properties={
+                "relative_path": "app.py",
+                "path": str(source_path),
+                "finding_type": "unused_import",
+                "symbol_id": import_node.id,
+                "symbol_type": "Import",
+                "symbol_name": "sys",
+                "qualified_name": "sys",
+                "line_start": 2,
+                "line_end": 2,
+                "cleanup_priority": "high",
+                "cleanup_rank": 3,
+                "confidence": 0.8,
+                "removal_safety": "safe",
+                "removal_reason": "unused_import is local to this artifact with high confidence and no public-surface signal.",
+                "validation_reason": "",
+                "blocking_signals": [],
+                "evidence_scope": "local_artifact",
+            },
+            salience=0.9,
+        )
+        for node in (import_node, module_node, caller_node, docs_node, test_node, importer_node, finding):
+            self.graph.add_node(node)
+        self.graph.add_edge(MemoryEdge(id="edge:module-import", from_id=module_node.id, to_id=import_node.id, type="IMPORTS", properties={"relative_path": "app.py", "line_start": 2, "line_end": 2}))
+        self.graph.add_edge(MemoryEdge(id="edge:consumer-import", from_id=importer_node.id, to_id=import_node.id, type="IMPORTS_FROM", properties={"relative_path": "pkg/consumer.py", "line_start": 1, "line_end": 3}))
+        self.graph.add_edge(MemoryEdge(id="edge:caller-import", from_id=caller_node.id, to_id=import_node.id, type="REFERENCES", properties={"relative_path": "app.py", "line_start": 5, "line_end": 5}))
+        self.graph.add_edge(MemoryEdge(id="edge:docs-import", from_id=docs_node.id, to_id=import_node.id, type="REFERENCES", properties={"relative_path": "docs/usage.md", "line_start": 3, "line_end": 4}))
+        self.graph.add_edge(MemoryEdge(id="edge:test-import", from_id=test_node.id, to_id=import_node.id, type="TESTS", properties={"relative_path": "tests/test_app.py", "line_start": 7, "line_end": 9}))
+        self.graph.add_edge(MemoryEdge(id="edge:import-finding", from_id=import_node.id, to_id=finding.id, type="HAS_FINDING", properties={"relative_path": "app.py", "line_start": 2, "line_end": 2}))
+
+        payload = self.graph.query_context_payload("unused import sys cleanup", top_k=8, max_depth=1, mode="cleanup")
+        reads = payload["targeted_reads"]
+        kinds = {item.get("read_kind") for item in reads}
+
+        self.assertIn("import_block", kinds)
+        self.assertIn("finding_context", kinds)
+        self.assertIn("caller_ref", kinds)
+        self.assertIn("importer_ref", kinds)
+        self.assertIn("doc_ref", kinds)
+        self.assertIn("test_ref", kinds)
+        context_read = next(item for item in reads if item.get("read_kind") == "finding_context")
+        self.assertEqual(context_read["line_start"], 1)
+        self.assertEqual(context_read["line_end"], 7)
+        self.assertEqual(context_read["sufficiency"]["status"], "insufficient")
+        self.assertIn("Reference checks found", context_read["sufficiency"]["reason"])
+        self.assertTrue(any(item["path"] == "app.py" and "import sys" in item["text"] for item in payload["snippets"]))
+
+        rendered = self.graph.query_context("unused import sys cleanup", top_k=8, max_depth=1, mode="cleanup")
+        self.assertIn("## Targeted reads", rendered)
+        self.assertIn("import_block `app.py [2]`", rendered)
+        self.assertIn("## Snippets", rendered)
+        self.assertIn("import sys", rendered)
+
+    def test_cleanup_query_context_filters_risky_findings_by_default(self) -> None:
+        safe = MemoryNode(
+            id="finding:safe-unused",
+            type="StaticAnalysisFinding",
+            label="unused_variable: safe_local",
+            text="safe_local cleanup candidate",
+            properties={
+                "relative_path": "app.py",
+                "finding_type": "unused_variable",
+                "symbol_name": "safe_local",
+                "line_start": 3,
+                "line_end": 3,
+                "cleanup_priority": "high",
+                "cleanup_rank": 3,
+                "confidence": 0.8,
+                "removal_safety": "safe",
+                "removal_reason": "unused_variable is local to this artifact with high confidence and no public-surface signal.",
+                "validation_reason": "",
+                "blocking_signals": [],
+            },
+            salience=0.9,
+        )
+        risky = MemoryNode(
+            id="finding:risky-public-api",
+            type="StaticAnalysisFinding",
+            label="possibly_unused_function: public_api",
+            text="public_api cleanup candidate",
+            properties={
+                "relative_path": "app.py",
+                "finding_type": "possibly_unused_function",
+                "symbol_name": "public_api",
+                "line_start": 8,
+                "line_end": 9,
+                "cleanup_priority": "low",
+                "cleanup_rank": 1,
+                "confidence": 0.4,
+                "removal_safety": "risky",
+                "removal_reason": "possibly_unused_function has no detected local usage, but removal needs validation before editing.",
+                "validation_reason": "Validate public API, callbacks, configuration, and documentation before removing this symbol.",
+                "blocking_signals": ["public_api", "dynamic_reference_unknown"],
+            },
+            salience=0.9,
+        )
+        self.graph.add_node(safe)
+        self.graph.add_node(risky)
+
+        default_payload = self.graph.query_context_payload("cleanup candidate", top_k=8, mode="cleanup")
+        default_ids = {item["id"] for item in default_payload["cleanup_candidates"]}
+        self.assertIn(safe.id, default_ids)
+        self.assertNotIn(risky.id, default_ids)
+        self.assertEqual(default_payload["cleanup_filter"]["mode"], "safe_remove")
+        self.assertEqual(default_payload["cleanup_filter"]["excluded_risky_candidates"], 1)
+        self.assertFalse(any(item.get("finding_id") == risky.id for item in default_payload["targeted_reads"]))
+        self.assertFalse(any(item.get("node_id") == risky.id for item in default_payload["snippets"]))
+
+        risky_payload = self.graph.query_context_payload("cleanup candidate", top_k=8, mode="cleanup", include_risky=True)
+        risky_ids = {item["id"] for item in risky_payload["cleanup_candidates"]}
+        self.assertIn(safe.id, risky_ids)
+        self.assertIn(risky.id, risky_ids)
+        self.assertEqual(risky_payload["cleanup_filter"]["mode"], "include_risky")
+
     def test_query_context_scopes_retrieve_inside_requested_section_before_top_k_cutoff(self) -> None:
         query = "shared scoped query_context target"
         code_node = MemoryNode(
@@ -251,7 +551,7 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
             label="shared_scoped_code",
             text=query,
             canonical_key="src.scoped.shared_scoped_code",
-            properties={"relative_path": "src/scoped.py", "qualified_name": "src.scoped.shared_scoped_code", "line_start": 3, "line_end": 7},
+            properties={"relative_path": "src/scoped.py", "context_scope": "code", "qualified_name": "src.scoped.shared_scoped_code", "line_start": 3, "line_end": 7},
             salience=0.95,
         )
         test_node = MemoryNode(
@@ -260,7 +560,7 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
             label="test_shared_scoped_code",
             text=query,
             canonical_key="tests.test_scoped.test_shared_scoped_code",
-            properties={"relative_path": "tests/test_scoped.py", "qualified_name": "tests.test_scoped.test_shared_scoped_code", "line_start": 10, "line_end": 16},
+            properties={"relative_path": "tests/test_scoped.py", "context_scope": "test", "qualified_name": "tests.test_scoped.test_shared_scoped_code", "line_start": 10, "line_end": 16},
             salience=0.2,
         )
         docs_node = MemoryNode(
@@ -269,7 +569,7 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
             label="docs/scoped.md#1",
             text=query,
             canonical_key="fragment:scoped-docs",
-            properties={"relative_path": "docs/scoped.md", "line_start": 2, "line_end": 4},
+            properties={"relative_path": "docs/scoped.md", "context_scope": "docs", "line_start": 2, "line_end": 4},
             salience=0.1,
         )
         self.graph.add_node(code_node)
@@ -296,6 +596,7 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
             canonical_key="src.memory.database.handle_database_name_not_found",
             properties={
                 "relative_path": "src/memory/database.py",
+                "context_scope": "code",
                 "name": "handle_database_name_not_found",
                 "qualified_name": "src.memory.database.handle_database_name_not_found",
                 "line_start": 12,
@@ -311,6 +612,7 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
             canonical_key="src.agents.install.install",
             properties={
                 "relative_path": "src/agents/install.py",
+                "context_scope": "code",
                 "name": "install",
                 "qualified_name": "src.agents.install.install",
                 "line_start": 40,
@@ -343,6 +645,7 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
             canonical_key="src.memory.services.retrieval.RetrievalEngine._code_targeted_reads",
             properties={
                 "relative_path": "src/memory/services/retrieval.py",
+                "context_scope": "code",
                 "name": "_code_targeted_reads",
                 "qualified_name": "src.memory.services.retrieval.RetrievalEngine._code_targeted_reads",
                 "line_start": 2024,
@@ -356,7 +659,7 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
             label="src/memory/artifacts/compiler.py#noise",
             text="SourceFragment owner symbol targeted reads generic compiler context",
             canonical_key="fragment:compiler-sourcefragment-noise",
-            properties={"relative_path": "src/memory/artifacts/compiler.py", "line_start": 540, "line_end": 856},
+            properties={"relative_path": "src/memory/artifacts/compiler.py", "context_scope": "code", "line_start": 540, "line_end": 856},
             salience=0.95,
         )
         self.graph.add_node(target)
@@ -477,6 +780,38 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
             {"match_score", "coverage", "path_score", "type_bonus", "seed_score", "depth_penalty"},
         )
 
+    def test_free_search_sentence_query_prefers_contiguous_solution_text(self) -> None:
+        target = MemoryNode(
+            id="function:apply-compile-transaction",
+            type="Function",
+            label="apply_compile_transaction",
+            text="compile transaction applies artifact updates before checkpoint and records graph delta",
+            canonical_key="src.memory.services.incremental_compilation.apply_compile_transaction",
+            salience=0.05,
+            properties={"relative_path": "src/memory/services/incremental_compilation.py", "line_start": 207, "line_end": 310},
+        )
+        scattered = MemoryNode(
+            id="function:scattered-compile-helper",
+            type="Function",
+            label="scattered_compile_helper",
+            text="checkpoint helper mentions compile cache records delta and later unrelated artifact transaction updates",
+            canonical_key="src.memory.services.scattered_compile_helper",
+            salience=0.99,
+            properties={"relative_path": "src/memory/services/noise.py", "line_start": 1, "line_end": 20},
+        )
+        self.graph.add_node(target)
+        self.graph.add_node(scattered)
+
+        payload = self.graph.query_memories_payload(
+            "where does compile transaction applies artifact updates before checkpoint",
+            top_k=2,
+            max_depth=0,
+        )
+
+        ranked_nodes = payload["ranked_nodes"]
+        self.assertEqual(ranked_nodes[0]["id"], target.id)
+        self.assertGreater(ranked_nodes[0]["reasons"]["match_score"], ranked_nodes[1]["reasons"]["match_score"])
+
     def test_free_search_ranks_chain_coverage_over_isolated_seed(self) -> None:
         capture = MemoryNode(
             id="function:payment-capture",
@@ -521,7 +856,7 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
             label="query_context_service",
             text="query context service targeted reads snippets",
             canonical_key="src.context.query_context_service",
-            properties={"relative_path": "src/context.py", "line_start": 4, "line_end": 9},
+            properties={"relative_path": "src/context.py", "context_scope": "code", "line_start": 4, "line_end": 9},
         )
         source = MemoryNode(
             id="fragment:query-context-service",
@@ -529,7 +864,7 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
             label="src/context.py#query_context_service",
             text="def query_context_service(): return targeted_reads",
             canonical_key="fragment:query-context-service",
-            properties={"relative_path": "src/context.py", "line_start": 4, "line_end": 9},
+            properties={"relative_path": "src/context.py", "context_scope": "code", "line_start": 4, "line_end": 9},
         )
         self.graph.add_node(service)
         self.graph.add_node(source)
@@ -689,6 +1024,81 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
         self.assertEqual(result.rows[1]["path"], "notes.md")
         self.assertEqual(result.rows[1]["line_start"], 4)
         self.assertEqual(result.rows[1]["line_end"], 4)
+
+    def test_reql_verify_finding_returns_deterministic_bundle(self) -> None:
+        symbol = MemoryNode(
+            id="function:unused-helper",
+            type="Function",
+            label="app.unused_helper",
+            text="def unused_helper(): return 1",
+            canonical_key="app.unused_helper",
+            properties={"relative_path": "app.py", "name": "unused_helper", "qualified_name": "app.unused_helper", "line_start": 4, "line_end": 5},
+        )
+        caller = MemoryNode(
+            id="function:caller",
+            type="Function",
+            label="app.caller",
+            text="def caller(): return unused_helper()",
+            canonical_key="app.caller",
+            properties={"relative_path": "app.py", "name": "caller", "qualified_name": "app.caller", "line_start": 8, "line_end": 9},
+        )
+        source = MemoryNode(
+            id="fragment:unused-helper",
+            type="SourceFragment",
+            label="app.py#unused_helper",
+            text="def unused_helper():\n    return 1",
+            canonical_key="fragment:unused-helper",
+            properties={"artifact_id": "artifact:app", "relative_path": "app.py", "line_start": 4, "line_end": 5},
+        )
+        finding = MemoryNode(
+            id="static-analysis-finding:unused-helper",
+            type="StaticAnalysisFinding",
+            label="possibly_unused_function: app.unused_helper",
+            text="Function unused_helper has no detected internal caller.",
+            canonical_key="artifact:app:finding:possibly_unused_function:app.unused_helper",
+            properties={
+                "artifact_id": "artifact:app",
+                "relative_path": "app.py",
+                "context_scope": "code",
+                "finding_type": "possibly_unused_function",
+                "severity": "info",
+                "reason": "Function unused_helper has no detected internal caller.",
+                "evidence_scope": "public_api_local_artifact",
+                "confidence": 0.4,
+                "cleanup_priority": "low",
+                "cleanup_rank": 1,
+                "removal_safety": "risky",
+                "removal_reason": "Public API candidate.",
+                "validation_reason": "Validate public API, callbacks, configuration, and documentation before removing this symbol.",
+                "blocking_signals": ["public_api", "dynamic_reference_unknown"],
+                "symbol_id": symbol.id,
+                "symbol_type": symbol.type,
+                "symbol_name": "unused_helper",
+                "qualified_name": "app.unused_helper",
+                "line_start": 4,
+                "line_end": 5,
+            },
+        )
+        for node in (symbol, caller, source, finding):
+            self.graph.add_node(node)
+        self.graph.add_edge(MemoryEdge(id="edge:symbol-source", from_id=symbol.id, to_id=source.id, type="EVIDENCED_BY", properties={"relative_path": "app.py", "line_start": 4, "line_end": 5}))
+        self.graph.add_edge(MemoryEdge(id="edge:symbol-finding", from_id=symbol.id, to_id=finding.id, type="HAS_FINDING", properties={"relative_path": "app.py", "line_start": 4, "line_end": 5}))
+        self.graph.add_edge(MemoryEdge(id="edge:caller-symbol", from_id=caller.id, to_id=symbol.id, type="CALLS", properties={"relative_path": "app.py", "line_start": 9, "line_end": 9, "evidence": "unused_helper()"}))
+
+        result = self.graph.query("VERIFY FINDING static-analysis-finding:unused-helper")
+
+        self.assertEqual(result.command, "VERIFY FINDING")
+        self.assertEqual(result.row_count if hasattr(result, "row_count") else len(result.rows), 1)
+        row = result.rows[0]
+        self.assertEqual(row["finding"]["id"], finding.id)
+        self.assertEqual(row["finding"]["symbol"]["id"], symbol.id)
+        self.assertEqual(row["minimal_snippet"]["source_node_id"], source.id)
+        self.assertIn("def unused_helper", row["minimal_snippet"]["text"])
+        self.assertEqual([item["edge_id"] for item in row["uses_found"]], ["edge:caller-symbol"])
+        self.assertEqual(row["uses_found"][0]["direction"], "incoming")
+        self.assertTrue(any(scope["scope"] == "artifact" and scope["evidence_scope"] == "public_api_local_artifact" for scope in row["scopes_checked"]))
+        self.assertIn("deterministic_incoming_usage_edges_present", row["risks"])
+        self.assertIn("Do not remove", row["recommended_action"])
 
 
 if __name__ == "__main__":

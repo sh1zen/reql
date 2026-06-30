@@ -1,7 +1,7 @@
 """Dataclasses and typed payloads for the memory graph."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from .ids import new_id
@@ -31,6 +31,18 @@ EdgeOrigin = Literal[
 ]
 
 
+def copy_memory_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {key: copy_memory_payload(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [copy_memory_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(copy_memory_payload(item) for item in value)
+    if isinstance(value, set):
+        return {copy_memory_payload(item) for item in value}
+    return value
+
+
 @dataclass(slots=True)
 class MemoryNode:
     """A property-graph node with dynamic memory state."""
@@ -58,8 +70,29 @@ class MemoryNode:
     evidence_count: int = 0
     status: NodeStatus = "active"
 
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+    def to_dict(self, *, copy_properties: bool = True) -> dict[str, Any]:
+        return {
+            "type": self.type,
+            "id": self.id,
+            "label": self.label,
+            "text": self.text,
+            "canonical_key": self.canonical_key,
+            "properties": copy_memory_payload(self.properties) if copy_properties else self.properties,
+            "activation": self.activation,
+            "base_activation": self.base_activation,
+            "salience": self.salience,
+            "confidence": self.confidence,
+            "stability": self.stability,
+            "volatility": self.volatility,
+            "utility": self.utility,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "last_activated_at": self.last_activated_at,
+            "last_used_at": self.last_used_at,
+            "usage_count": self.usage_count,
+            "evidence_count": self.evidence_count,
+            "status": self.status,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MemoryNode":
@@ -84,8 +117,22 @@ class MemoryEdge:
     created_at: str = field(default_factory=utcnow_iso)
     updated_at: str = field(default_factory=utcnow_iso)
 
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+    def to_dict(self, *, copy_properties: bool = True) -> dict[str, Any]:
+        return {
+            "from_id": self.from_id,
+            "to_id": self.to_id,
+            "type": self.type,
+            "id": self.id,
+            "weight": self.weight,
+            "confidence": self.confidence,
+            "polarity": self.polarity,
+            "origin": self.origin,
+            "properties": copy_memory_payload(self.properties) if copy_properties else self.properties,
+            "co_activation_count": self.co_activation_count,
+            "last_fired_at": self.last_fired_at,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "MemoryEdge":
@@ -105,6 +152,19 @@ class MemoryQuery:
     edge_types: set[str] | None = None
     context_scopes: set[str] | None = None
     store_trace: bool = True
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "text": self.text,
+            "top_k": self.top_k,
+            "max_depth": self.max_depth,
+            "min_activation": self.min_activation,
+            "include_archived": self.include_archived,
+            "node_types": set(self.node_types) if self.node_types is not None else None,
+            "edge_types": set(self.edge_types) if self.edge_types is not None else None,
+            "context_scopes": set(self.context_scopes) if self.context_scopes is not None else None,
+            "store_trace": self.store_trace,
+        }
 
 
 @dataclass(slots=True)
@@ -126,9 +186,8 @@ class MemorySubgraph:
     trace_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        query_payload = asdict(self.query)
         return {
-            "query": query_payload,
+            "query": self.query.to_dict(),
             "ranked_nodes": [
                 {"node": item.node.to_dict(), "score": item.score, "reasons": item.reasons}
                 for item in self.ranked_nodes

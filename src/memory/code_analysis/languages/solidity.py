@@ -12,7 +12,6 @@ from ..base import (
     _children,
     _column,
     _end_line,
-    _field,
     _first_child_of_type,
     _import,
     _last_quoted,

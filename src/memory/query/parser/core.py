@@ -54,6 +54,8 @@ class REQLParser(CommandParserMixin):
             stmt = self._parse_typed_node_list("DELTAS", ("GraphDelta",), allow_type=False, limit=10)
         elif self.match_keyword("CACHE"):
             stmt = self._parse_cache()
+        elif self.match_keyword("VERIFY"):
+            stmt = self._parse_verify()
         else:
             tok = self.current
             raise REQLSyntaxError(f"Expected command at position {tok.position}; got {tok.value!r}")
@@ -92,12 +94,6 @@ class REQLParser(CommandParserMixin):
         if not self.match_symbol(value):
             raise REQLSyntaxError(f"Expected symbol {value!r} at position {self.current.position}; got {self.current.value!r}")
         return self.tokens[self.pos - 1]
-
-    def match_op(self, value: str) -> bool:
-        if self.current.kind == "OP" and self.current.value == value:
-            self.advance()
-            return True
-        return False
 
     def expect_identifier(self) -> str:
         if self.current.kind in {"IDENT", "KEYWORD"}:

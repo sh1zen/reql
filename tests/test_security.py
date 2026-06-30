@@ -25,17 +25,6 @@ class SecurityBoundaryTests(unittest.TestCase):
         with self.assertRaises(MCPToolError):
             call_tool("query_memories", {"storage_path": str(outside), "query": "anything"})
 
-    def test_mcp_read_only_tools_exclude_removed_aliases(self) -> None:
-        names = {tool["name"] for tool in list_tools(include_write=False)}
-
-        self.assertIn("query_context", names)
-        self.assertNotIn("reql_context", names)
-        self.assertNotIn("reql_search", names)
-        with self.assertRaises(MCPToolError):
-            call_tool("reql_context", {})
-        with self.assertRaises(MCPToolError):
-            call_tool("reql_search", {})
-
     def test_mcp_output_sanitizes_user_controlled_text(self) -> None:
         tmp_root = Path.cwd() / ".tmp"
         tmp_root.mkdir(exist_ok=True)

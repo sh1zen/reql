@@ -102,6 +102,7 @@ def query_context(
     top_k: int = 12,
     max_depth: int = 3,
     max_items: int = 12,
+    include_risky: bool = False,
     config_path: str | None = None,
     config_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -124,7 +125,13 @@ def query_context(
                 context_scopes=set(selected_scopes) if selected_scopes else None,
             )
         )
-        payload = graph.retrieval.query_context_payload(subgraph, max_items=max_items, query_mode=mode, query_scopes=selected_scopes)
+        payload = graph.retrieval.query_context_payload(
+            subgraph,
+            max_items=max_items,
+            query_mode=mode,
+            query_scopes=selected_scopes,
+            include_risky=bool(include_risky),
+        )
         payload.update(
             {
                 "trace_id": subgraph.trace_id,

@@ -190,4 +190,9 @@ class CacheStatus:
     limit: int = 20
 
 
-Statement = FindNodes | FindEdges | Search | Retrieve | Activate | Match | PathQuery | Explain | Stats | Communities | Hubs | TypedNodeList | CacheStatus
+@dataclass(frozen=True, slots=True)
+class VerifyFinding:
+    finding_id: str
+
+
+Statement = FindNodes | FindEdges | Search | Retrieve | Activate | Match | PathQuery | Explain | Stats | Communities | Hubs | TypedNodeList | CacheStatus | VerifyFinding

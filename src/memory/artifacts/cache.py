@@ -90,7 +90,7 @@ class ArtifactCache:
         if self.disk is not None:
             for entry in self.disk.project_entries(project_id, active_only=active_only):
                 entries_by_artifact[entry.artifact_id] = entry
-        for node in self.store.find_nodes_by_property("project_id", project_id, type_="ArtifactCacheEntry", limit=100000):
+        for node in self.store.find_nodes_by_property("project_id", project_id, type_="ArtifactCacheEntry", limit=100000, clone=False):
             if active_only and node.status != "active":
                 continue
             entry = _entry_from_node(node)
@@ -142,7 +142,7 @@ class ArtifactCache:
         for artifact in scan.artifacts:
             if artifact.id not in artifact_ids or artifact.id in entry_map:
                 continue
-            node = self.store.get_node(artifact.id)
+            node = self.store.get_node(artifact.id, clone=False)
             if node is None or node.status != "active":
                 continue
             props = node.properties
@@ -159,7 +159,7 @@ class ArtifactCache:
     def deleted_project_artifact_ids(self, scan: ScanResult) -> set[str]:
         current_artifact_ids = {artifact.id for artifact in scan.artifacts}
         deleted: set[str] = set()
-        for node in self.store.find_nodes_by_property("project_id", scan.project.id, type_="SourceArtifact", limit=100000):
+        for node in self.store.find_nodes_by_property("project_id", scan.project.id, type_="SourceArtifact", limit=100000, clone=False):
             if node.status != "active" or not node.properties.get("last_compiled_at"):
                 continue
             if node.id not in current_artifact_ids:
@@ -182,7 +182,7 @@ class ArtifactCache:
             compiled_at=now,
             status="active",
         )
-        self.store.upsert_node(_entry_node(entry))
+        self.store.upsert_node(_entry_node(entry), return_clone=False)
         if self.disk is not None:
             self.disk.upsert_entry(entry)
         return entry
@@ -197,7 +197,7 @@ class ArtifactCache:
         return count
 
     def archive_entry(self, entry_id: str) -> bool:
-        node = self.store.get_node(entry_id)
+        node = self.store.get_node(entry_id, clone=False)
         if node is None or node.status == "archived":
             return False
         properties = dict(node.properties)

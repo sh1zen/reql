@@ -48,6 +48,42 @@ reql query_memories --query "payment service" --limit 8 --json
 reql query_explore --query "payment service serialization" --view owners --view code
 ```
 
+Create a separate Agent Workspace when a coding agent needs session-scoped
+working memory for plans, findings, decisions, and open tasks:
+
+```bash
+reql agent init
+reql agent bus
+reql agent session start "Focused implementation pass"
+reql agent add "Read src/memory/cli.py and found the argparse command surface"
+reql agent task add "Implement reset for the working graph"
+reql agent decision add "Keep agent memory in .reql/agent.reql"
+reql agent link TASK_ID artifact:app --relation touches
+reql agent link-task --file test-agent/context_savings.py
+reql agent link-many TASK_ID artifact:app function:target --relation implements
+reql agent batch --json agent-ops.json
+reql agent batch --task task="Patch CLI" --decision decision="Use one workspace lock" --link '$task' implements '$decision'
+reql agent map --session current
+reql agent handoff "Implementation notes ready for master review"
+reql agent export --json
+reql agent export --json --metadata
+```
+
+`reql agent init` returns an `agent_id` and makes that private agent memory the
+current one for later `reql agent ...` commands. Parallel agents can use
+`reql agent --agent AGENT_ID ...` or `REQL_AGENT_ID=AGENT_ID`; all agents can
+read `reql agent bus`, publish shared messages, and use `reql agent handoff` to
+return a compact saved working-map snapshot to the master. `agent bus --json`
+omits handoff payload snapshots by default; pass `--include-payloads` only when
+the full saved handoff maps are needed. `agent map`, `agent search`, and
+`agent export` omit metadata by default; use `agent map --session current
+--completed` for a completed session summary after tasks are marked done. Pass
+`--metadata` only when timestamps, storage paths, source fields, or the full
+workspace graph are needed.
+
+`reql agent reset` discards agent-created working notes and re-derives the
+workspace from the current standard graph without modifying `.reql/memory.reql`.
+
 From a source checkout, `python cli.py ...` exposes the same command surface
 without requiring an editable install:
 
@@ -91,6 +127,8 @@ reports, exports, and maintenance workflows.
 - Retrieval with lexical seed nodes, bounded graph expansion, and chain-aware ranking.
 - Compact `query_context`, `query_explore`, `query_graph`, and `query_memories`
   outputs for coding-agent workflows.
+- Separate `reql agent` working graph for agent notes, tasks, decisions,
+  findings, plans, risks, and links without contaminating the standard graph.
 - Local block-file persistence with fixed-size pages, compressed records,
   locking, transactions, and compaction.
 - Incremental compilation cache with persistent compilation runs and graph deltas.
@@ -100,7 +138,9 @@ reports, exports, and maintenance workflows.
   Ruby, C#, Kotlin, Scala, PHP, Swift, Lua, Zig, PowerShell, Elixir, Julia,
   Verilog, Fortran, Bash, SQL, Terraform, Apex, Pascal, Razor, and related
   extensions, with Tree-sitter AST graph extraction for recognized languages.
-- Static-analysis findings for cleanup-oriented queries.
+- Static-analysis findings for cleanup-oriented queries, including aggregated
+  orphan-directory candidates so a detached folder is suggested once instead
+  of file by file.
 - Deterministic community detection, hub analysis, and bridge analysis with
   generic-node penalties.
 - Markdown reports, JSON export, standalone `graph.html`, guided launcher,

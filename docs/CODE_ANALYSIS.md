@@ -167,9 +167,10 @@ also treated as real usage. Local variables that are read only inside their
 owner are summarized instead of persisted as standalone graph nodes; unused
 local variables remain persisted so cleanup queries can target them.
 
-`query_context --cleanup` uses the rationale fields to put direct local cleanup
-first, while API, entrypoint, framework lifecycle, and dynamic-reference
-candidates are marked for validation instead of direct removal.
+`query_context --cleanup` is conservative by default: it shows only safe-remove
+findings. Add `--include-risky` to include API, entrypoint, framework lifecycle,
+test-local, low-confidence, and dynamic-reference candidates marked for
+validation instead of direct removal.
 
 Package `__init__.py` imports are also marked on `Import` nodes with
 `is_re_export=true` and linked from the module with `RE_EXPORTS`, so public API

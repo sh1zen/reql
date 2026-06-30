@@ -7,11 +7,13 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from api import MemoryGraph
 from memory.domain.exceptions import StorageError
 from memory.domain.models import MemoryEdge, MemoryNode
 from memory.storage import BlockGraphStore
+from memory.storage.adapters import block_store as block_store_module
 
 _SUPERBLOCK_HEADER_SIZE = struct.calcsize("<8sIIII32s")
 
@@ -87,6 +89,132 @@ class BlockStorageTests(unittest.TestCase):
                 self.assertEqual(reopened.get_node_by_key("Function", "compile_project").id, "n2")
                 self.assertEqual(reopened.neighbors("n1", edge_types={"DEFINES"})[0][1].id, "n2")
                 self.assertEqual(reopened.lexical_search("compile project", top_k=2)[0][0].id, "n2")
+            finally:
+                reopened.close()
+
+    def test_lexical_search_prefers_free_phrase_order_over_scattered_terms(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = BlockGraphStore(Path(td) / "memory.reql")
+            try:
+                phrase = MemoryNode(
+                    id="function:phrase",
+                    type="Function",
+                    label="apply_compile_transaction_speed",
+                    text="apply compile transaction speed",
+                    canonical_key="src.compiler.apply_compile_transaction_speed",
+                    salience=0.01,
+                )
+                scattered = MemoryNode(
+                    id="function:scattered",
+                    type="Function",
+                    label="transaction helper",
+                    text="compile helper applies unrelated cache then transaction and later speed",
+                    canonical_key="src.compiler.transaction_helper",
+                    salience=0.99,
+                )
+                store.batch_upsert_nodes([phrase, scattered])
+
+                results = store.lexical_search("apply compile transaction speed", top_k=2, node_types={"Function"})
+
+                self.assertEqual(results[0][0].id, phrase.id)
+            finally:
+                store.close()
+
+    def test_internal_no_clone_flags_do_not_change_default_isolation(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "memory.reql"
+            store = BlockGraphStore(path)
+            try:
+                node_results = store.batch_upsert_nodes(
+                    [
+                        MemoryNode(id="n1", type="Topic", label="alpha", properties={"project_id": "p1", "items": ["a"]}),
+                        MemoryNode(id="n2", type="Topic", label="beta", properties={"project_id": "p1"}),
+                    ]
+                )
+                edge_results = store.batch_upsert_edges(
+                    [MemoryEdge(id="e1", from_id="n1", to_id="n2", type="RELATED_TO", properties={"project_id": "p1", "items": ["b"]})]
+                )
+
+                self.assertIsNot(node_results[0][0], store._nodes["n1"])
+                self.assertIsNot(edge_results[0][0], store._edges["e1"])
+                self.assertIsNot(store.get_node("n1"), store._nodes["n1"])
+                self.assertIsNot(store.get_edge("e1"), store._edges["e1"])
+                self.assertIsNot(store.get_edges(from_id="n1")[0], store._edges["e1"])
+                self.assertIsNot(store.incident_edges(["n1"])[0], store._edges["e1"])
+                self.assertIsNot(store.find_nodes_by_property("project_id", "p1")[0], store._nodes["n1"])
+                self.assertIsNot(store.find_edges_by_property("project_id", "p1")[0], store._edges["e1"])
+
+                self.assertIs(store.get_node("n1", clone=False), store._nodes["n1"])
+                self.assertIs(store.get_edge("e1", clone=False), store._edges["e1"])
+                self.assertIs(store.get_edges(from_id="n1", clone=False)[0], store._edges["e1"])
+                self.assertIs(store.incident_edges(["n1"], clone=False)[0], store._edges["e1"])
+                raw_node = store.find_nodes_by_property("project_id", "p1", clone=False)[0]
+                raw_edge = store.find_edges_by_property("project_id", "p1", clone=False)[0]
+                self.assertIs(raw_node, store._nodes[raw_node.id])
+                self.assertIs(raw_edge, store._edges[raw_edge.id])
+
+                raw_node_results = store.batch_upsert_nodes([MemoryNode(id="n3", type="Topic", label="gamma", properties={"project_id": "p2"})], return_clones=False)
+                raw_edge_results = store.batch_upsert_edges(
+                    [MemoryEdge(id="e2", from_id="n2", to_id="n3", type="RELATED_TO", properties={"project_id": "p2"})],
+                    return_clones=False,
+                )
+                self.assertIs(raw_node_results[0][0], store._nodes["n3"])
+                self.assertIs(raw_edge_results[0][0], store._edges["e2"])
+            finally:
+                store.close()
+
+    def test_mmap_backed_lazy_reads_survive_checkpoint_replace(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "memory.reql"
+            store = BlockGraphStore(path)
+            try:
+                store.batch_upsert_nodes(
+                    [
+                        MemoryNode(id="n1", type="Topic", label="alpha", canonical_key="topic:alpha"),
+                        MemoryNode(id="n2", type="Topic", label="beta", canonical_key="topic:beta"),
+                    ]
+                )
+                store.batch_upsert_edges([MemoryEdge(id="e1", from_id="n1", to_id="n2", type="RELATED_TO")])
+                store.compact_storage()
+            finally:
+                store.close()
+
+            reopened = BlockGraphStore(path)
+            try:
+                self.assertIsNotNone(reopened._data_mmap)
+                self.assertEqual(reopened.get_node("n1").label, "alpha")
+                reopened.upsert_node(MemoryNode(id="n3", type="Topic", label="gamma", canonical_key="topic:gamma"))
+                result = reopened.checkpoint_if_needed(wal_bytes_threshold=1)
+                self.assertTrue(result["checkpointed"])
+                self.assertIsNotNone(reopened._data_mmap)
+                self.assertEqual(reopened.get_node("n3").label, "gamma")
+            finally:
+                reopened.close()
+
+    def test_lexical_terms_update_after_lazy_reopen(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "memory.reql"
+            store = BlockGraphStore(path)
+            try:
+                store.upsert_node(
+                    MemoryNode(
+                        id="n1",
+                        type="Topic",
+                        label="original marker",
+                        text="original-only-token",
+                        canonical_key="topic:n1",
+                    )
+                )
+                store.compact_storage()
+            finally:
+                store.close()
+
+            reopened = BlockGraphStore(path)
+            try:
+                self.assertEqual(reopened.lexical_search("original-only-token", top_k=1)[0][0].id, "n1")
+                reopened.update_node_fields("n1", label="replacement marker", text="replacement-only-token")
+                self.assertFalse(reopened.lexical_search("original-only-token", top_k=1))
+                self.assertEqual(reopened.lexical_search("replacement-only-token", top_k=1)[0][0].id, "n1")
             finally:
                 reopened.close()
 
@@ -224,6 +352,42 @@ class BlockStorageTests(unittest.TestCase):
                 self.assertEqual(details["records"]["by_kind"]["node"], 1)
             finally:
                 reopened.close()
+
+    def test_non_lexical_node_updates_skip_term_reindex(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = BlockGraphStore(Path(td) / "memory.reql")
+            try:
+                store.upsert_node(
+                    MemoryNode(
+                        id="n1",
+                        type="Topic",
+                        label="alpha marker",
+                        text="retired-only-token",
+                        canonical_key="topic:alpha",
+                        properties={"project_id": "p1", "name": "alpha", "debug": "before"},
+                    )
+                )
+                before_terms = {term: dict(postings) for term, postings in store._node_terms.items()}
+
+                with patch.object(block_store_module, "keyword_scores", side_effect=AssertionError("unexpected lexical reindex")):
+                    store.update_node_fields(
+                        "n1",
+                        usage_count=3,
+                        properties={"project_id": "p1", "name": "alpha", "debug": "after"},
+                    )
+                    store.update_node_fields("n1", status="archived")
+                    store.update_node_fields("n1", status="active")
+
+                self.assertEqual({term: dict(postings) for term, postings in store._node_terms.items()}, before_terms)
+                self.assertEqual(store.lexical_search("retired-only-token", top_k=1)[0][0].id, "n1")
+
+                with patch.object(block_store_module, "keyword_scores", wraps=block_store_module.keyword_scores) as scorer:
+                    store.update_node_fields("n1", text="changed-only-token")
+                self.assertGreaterEqual(scorer.call_count, 1)
+                self.assertEqual(store.lexical_search("changed-only-token", top_k=1)[0][0].id, "n1")
+                self.assertFalse(store.lexical_search("retired-only-token", top_k=1))
+            finally:
+                store.close()
 
     def test_manifest_checksum_is_validated_on_open(self) -> None:
         with tempfile.TemporaryDirectory() as td:

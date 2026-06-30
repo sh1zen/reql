@@ -111,6 +111,8 @@ class _QueryProfile:
     canonical: str
     tokens: set[str]
     informative_tokens: set[str]
+    ordered_tokens: tuple[str, ...]
+    phrase_terms: set[str]
 
 
 @dataclass(slots=True)
@@ -337,9 +339,16 @@ class RetrievalEngine:
         max_items: int = 20,
         query_mode: str = "informative",
         query_scopes: Sequence[str] | None = None,
+        include_risky: bool = False,
     ) -> str:
         """Render compact agent-ready context from a retrieved subgraph."""
-        payload = self.query_context_payload(subgraph, max_items=max_items, query_mode=query_mode, query_scopes=query_scopes)
+        payload = self.query_context_payload(
+            subgraph,
+            max_items=max_items,
+            query_mode=query_mode,
+            query_scopes=query_scopes,
+            include_risky=include_risky,
+        )
         return self._render_query_context_payload(payload)
 
     def query_context_payload(
@@ -349,19 +358,27 @@ class RetrievalEngine:
         max_items: int = 20,
         query_mode: str = "informative",
         query_scopes: Sequence[str] | None = None,
+        include_risky: bool = False,
     ) -> dict[str, Any]:
         """Return compact structured agent context without duplicated rendered Markdown."""
         query_mode = self._normalize_query_context_mode(query_mode)
         scopes = self._normalize_query_context_scopes(query_scopes)
         subgraph = self._filter_query_context_subgraph(subgraph, scopes)
         if self._should_render_code_context(subgraph, max_items=max_items):
-            payload = self._code_agent_context_payload(subgraph, query_mode=query_mode, max_items=max_items)
+            payload = self._code_agent_context_payload(subgraph, query_mode=query_mode, max_items=max_items, include_risky=include_risky)
         else:
-            payload = self._general_agent_context_payload(subgraph, query_mode=query_mode, max_items=max_items)
+            payload = self._general_agent_context_payload(subgraph, query_mode=query_mode, max_items=max_items, include_risky=include_risky)
         payload["scopes"] = sorted(scopes)
         return payload
 
-    def _general_agent_context_payload(self, subgraph: MemorySubgraph, *, query_mode: str, max_items: int) -> dict[str, Any]:
+    def _general_agent_context_payload(
+        self,
+        subgraph: MemorySubgraph,
+        *,
+        query_mode: str,
+        max_items: int,
+        include_risky: bool = False,
+    ) -> dict[str, Any]:
         buckets: dict[str, list[RankedNode]] = {
             "StaticAnalysisFinding": [],
         }
@@ -372,12 +389,19 @@ class RetrievalEngine:
         best_items = self._general_best_match_items(subgraph, max_items=max_items, prefer_general=has_direct_general_evidence)
         source_items = self._agent_source_payloads(subgraph, max_items=max_items, query_text=subgraph.query.text)
         best_payloads = [self._agent_ranked_payload(item, max_text_chars=220) for item in best_items]
+        cleanup_payloads = [self._agent_ranked_payload(item, max_text_chars=260) for item in buckets["StaticAnalysisFinding"]]
+        cleanup_candidates = self._filter_cleanup_candidate_payloads(cleanup_payloads, include_risky=include_risky)[: min(max_items, 5)]
         return {
             "kind": "general",
             "query": subgraph.query.text,
             "query_mode": query_mode,
             "results": self._general_result_payloads(best_payloads, source_items, max_items=max_items),
-            "cleanup_candidates": [self._agent_ranked_payload(item, max_text_chars=260) for item in buckets["StaticAnalysisFinding"][: min(max_items, 5)]],
+            "cleanup_candidates": cleanup_candidates,
+            "cleanup_filter": self._cleanup_filter_payload(
+                include_risky=include_risky,
+                total_candidates=len(cleanup_payloads),
+                shown_candidates=len(cleanup_candidates),
+            ) if query_mode == "cleanup" else {},
             "graph_links": self._agent_edge_lines(subgraph, max_items=max_items, hide_raw_event_links=True, hide_test_code_links=has_direct_general_evidence),
             "followups": self._agent_follow_up_payload(subgraph, max_items=max_items, ranked_items=best_items),
             "counts": {
@@ -684,10 +708,17 @@ class RetrievalEngine:
         max_items: int = 20,
         query_mode: str = "informative",
         query_scopes: Sequence[str] | None = None,
+        include_risky: bool = False,
     ) -> str:
         """Return the compact deterministic context block for a query."""
         scoped_query = replace(query, context_scopes=set(query_scopes) if query_scopes else query.context_scopes)
-        return self.compose_context(self.retrieve(scoped_query), max_items=max_items, query_mode=query_mode, query_scopes=query_scopes)
+        return self.compose_context(
+            self.retrieve(scoped_query),
+            max_items=max_items,
+            query_mode=query_mode,
+            query_scopes=query_scopes,
+            include_risky=include_risky,
+        )
 
     def query_memories(
         self,
@@ -1091,17 +1122,25 @@ class RetrievalEngine:
         return False
 
     def _query_profile(self, query_text: str) -> _QueryProfile:
-        tokens = set(tokenize(query_text))
+        ordered_tokens = tuple(tokenize(query_text))
+        tokens = set(ordered_tokens)
         informative = {
             token
             for token in tokens
             if len(token) >= 3 or token_signal_score(token) >= 0.85
+        }
+        phrase_terms = {
+            f"{a} {b}"
+            for a, b in zip(ordered_tokens, ordered_tokens[1:])
+            if token_signal_score(a) >= 0.5 and token_signal_score(b) >= 0.5
         }
         return _QueryProfile(
             text=query_text,
             canonical=canonicalize(query_text),
             tokens=tokens,
             informative_tokens=informative or tokens,
+            ordered_tokens=ordered_tokens,
+            phrase_terms=phrase_terms,
         )
 
     def _scoped_lexical_search(
@@ -1337,12 +1376,19 @@ class RetrievalEngine:
         node_tokens = set(tokenize(node_text))
         overlap = query_profile.informative_tokens & node_tokens
         coverage = self._coverage(overlap, query_profile)
+        phrase_coverage = self._phrase_coverage(node_key, query_profile)
+        coverage = max(coverage, phrase_coverage)
         if f" {query_key} " in f" {node_key} ":
             return {"match_score": 0.86, "coverage": max(coverage, 0.90)}
         if node_key.startswith(query_key) or any(part.startswith(query_key) for part in canonical_parts):
             return {"match_score": 0.78, "coverage": max(coverage, 0.80)}
         if query_profile.informative_tokens and query_profile.informative_tokens.issubset(node_tokens):
-            return {"match_score": 0.70, "coverage": 1.0}
+            score = 0.76 if phrase_coverage >= 0.50 else 0.70
+            return {"match_score": score, "coverage": 1.0}
+        if phrase_coverage >= 0.75 and coverage >= 0.50:
+            return {"match_score": 0.68, "coverage": coverage}
+        if phrase_coverage >= 0.50 and coverage >= 0.40:
+            return {"match_score": 0.58, "coverage": coverage}
         if self._has_strong_identifier_overlap(overlap):
             return {"match_score": 0.64, "coverage": max(coverage, 0.55)}
         if coverage >= 0.75:
@@ -1350,7 +1396,8 @@ class RetrievalEngine:
         if coverage >= 0.50:
             return {"match_score": 0.40, "coverage": coverage}
         if coverage > 0:
-            return {"match_score": 0.16 * coverage, "coverage": coverage}
+            phrase_bonus = 0.18 * phrase_coverage
+            return {"match_score": min(0.38, (0.16 * coverage) + phrase_bonus), "coverage": coverage}
         source = str(node.properties.get("relative_path") or node.properties.get("path") or "")
         source_tokens = set(tokenize(source.replace("\\", "/").replace("/", " ").replace(".", " ")))
         source_overlap = query_profile.informative_tokens & source_tokens
@@ -1364,6 +1411,14 @@ class RetrievalEngine:
         if not query_profile.informative_tokens:
             return 0.0
         return min(1.0, len(tokens & query_profile.informative_tokens) / len(query_profile.informative_tokens))
+
+    @staticmethod
+    def _phrase_coverage(node_key: str, query_profile: _QueryProfile) -> float:
+        if not query_profile.phrase_terms:
+            return 0.0
+        haystack = f" {node_key} "
+        matched = sum(1 for phrase in query_profile.phrase_terms if f" {phrase} " in haystack)
+        return min(1.0, matched / len(query_profile.phrase_terms))
 
     @staticmethod
     def _retrieval_type_bonus(node: MemoryNode, match_score: float) -> float:
@@ -1388,6 +1443,12 @@ class RetrievalEngine:
                 for token in query_tokens
                 if len(token) >= 3 or token_signal_score(token) >= 0.85
             } or query_tokens
+            profile.ordered_tokens = tuple(token for token in profile.ordered_tokens if token in query_tokens)
+            profile.phrase_terms = {
+                f"{a} {b}"
+                for a, b in zip(profile.ordered_tokens, profile.ordered_tokens[1:])
+                if token_signal_score(a) >= 0.5 and token_signal_score(b) >= 0.5
+            }
         return self._node_match_metrics(node, profile)["match_score"]
 
     def _is_weak_multiterm_match(
@@ -1501,28 +1562,6 @@ class RetrievalEngine:
         lines.append(f"- edges: {len(edges)}")
         lines.append(f"- sources: {len(sources)}")
         return "\n".join(lines).strip()
-
-    def compose_query_context(
-        self,
-        query_text: str,
-        *,
-        seed_nodes: list[MemoryNode],
-        ranked_nodes: list[RankedNode],
-        nodes: list[MemoryNode],
-        edges: list[MemoryEdge],
-        sources: list[MemoryNode],
-        max_items: int = 18,
-    ) -> str:
-        """Compatibility wrapper for the old query_context renderer name."""
-        return self.compose_query_graph(
-            query_text,
-            seed_nodes=seed_nodes,
-            ranked_nodes=ranked_nodes,
-            nodes=nodes,
-            edges=edges,
-            sources=sources,
-            max_items=max_items,
-        )
 
     def _node_context_payload(self, node: MemoryNode, subgraph: MemorySubgraph) -> dict[str, Any]:
         ranked = next((item for item in subgraph.ranked_nodes if item.node.id == node.id), None)
@@ -2091,7 +2130,14 @@ class RetrievalEngine:
         normalized = path.replace("\\", "/").casefold()
         return node.type in {"Docstring", "Comment"} or normalized.startswith("docs/") or normalized == "readme.md" or "/docs/" in normalized
 
-    def _code_agent_context_payload(self, subgraph: MemorySubgraph, *, query_mode: str, max_items: int) -> dict[str, Any]:
+    def _code_agent_context_payload(
+        self,
+        subgraph: MemorySubgraph,
+        *,
+        query_mode: str,
+        max_items: int,
+        include_risky: bool = False,
+    ) -> dict[str, Any]:
         compact_items = min(max_items, 6)
         ranked = [item for item in subgraph.ranked_nodes if self._is_code_context_node(item.node)]
         path_rows = self._code_working_set_rows(ranked, list(subgraph.nodes), query_text=subgraph.query.text, max_items=max_items)
@@ -2114,9 +2160,18 @@ class RetrievalEngine:
                 )
             )
         ]
-        targeted_reads = self._code_targeted_reads(display_ranked, subgraph, working_paths, query_text=subgraph.query.text, max_items=compact_items)
+        cleanup_candidates = self._code_cleanup_candidates(
+            display_ranked,
+            subgraph,
+            max_items=compact_items,
+            include_risky=include_risky,
+        ) if query_mode == "cleanup" else []
+        if query_mode == "cleanup":
+            cleanup_reads = self._code_cleanup_targeted_reads(cleanup_candidates, subgraph, working_paths, max_items=compact_items)
+            targeted_reads = self._merge_targeted_reads(cleanup_reads, max_items=max(compact_items * 4, 12))
+        else:
+            targeted_reads = self._code_targeted_reads(display_ranked, subgraph, working_paths, query_text=subgraph.query.text, max_items=compact_items)
         snippets = self._code_snippet_payload(targeted_reads, subgraph, max_items=max_items) if query_mode == "cleanup" else []
-        cleanup_candidates = self._code_cleanup_candidates(display_ranked, subgraph, max_items=compact_items) if query_mode == "cleanup" else []
         cleanup_plan = self._code_cleanup_plan_lines(cleanup_candidates, path_rows, max_items=compact_items) if query_mode == "cleanup" else []
         followups = (
             self._code_follow_up_payload(subgraph, path_rows, max_items=max_items)
@@ -2133,6 +2188,11 @@ class RetrievalEngine:
             "kind": "code",
             "query": subgraph.query.text,
             "query_mode": query_mode,
+            "cleanup_filter": self._cleanup_filter_payload(
+                include_risky=include_risky,
+                total_candidates=self._cleanup_candidate_count(display_ranked, subgraph),
+                shown_candidates=len(cleanup_candidates),
+            ) if query_mode == "cleanup" else {},
             "usage_guidance": self._code_usage_guidance_payload(query_mode=query_mode, snippets=snippets, targeted_reads=targeted_reads),
             "owner_candidates": owner_candidates,
             "cleanup_candidates": cleanup_candidates,
@@ -2447,22 +2507,8 @@ class RetrievalEngine:
         )
 
     def _node_matches_query_context_scope(self, node: MemoryNode, scopes: set[str]) -> bool:
-        node_scope = self._query_context_node_scope(node)
-        return node_scope in scopes
-
-    def _query_context_node_scope(self, node: MemoryNode) -> str:
         explicit = str(node.properties.get("context_scope") or "").strip().casefold()
-        if explicit in QUERY_CONTEXT_SCOPES:
-            return explicit
-        path = self._node_relative_path(node) or ""
-        normalized = path.replace("\\", "/").lstrip("/").casefold()
-        if normalized and self._is_test_context_path(normalized):
-            return "test"
-        if normalized.startswith("docs/") or "/docs/" in normalized or normalized == "readme.md" or normalized.endswith(".md"):
-            return "docs"
-        if self._is_code_context_node(node):
-            return "code"
-        return "docs"
+        return explicit in scopes
 
     @staticmethod
     def _code_context_needs_followups(
@@ -2708,12 +2754,283 @@ class RetrievalEngine:
                 break
         return list(reads.values())[: min(max_items, 10)]
 
+    def _code_cleanup_targeted_reads(
+        self,
+        cleanup_candidates: list[dict[str, Any]],
+        subgraph: MemorySubgraph,
+        working_paths: set[str],
+        *,
+        max_items: int,
+    ) -> list[dict[str, Any]]:
+        nodes: dict[str, MemoryNode] = {item.node.id: item.node for item in subgraph.ranked_nodes}
+        nodes.update({node.id: node for node in subgraph.nodes})
+        reads: list[dict[str, Any]] = []
+        for candidate in cleanup_candidates[: min(max_items, 6)]:
+            finding = self.store.get_node(str(candidate.get("id") or ""))
+            if finding is None or finding.type != "StaticAnalysisFinding":
+                continue
+            nodes.setdefault(finding.id, finding)
+            symbol = self._cleanup_finding_symbol(finding)
+            if symbol is not None:
+                nodes.setdefault(symbol.id, symbol)
+            reference_reads = self._cleanup_reference_reads(finding, symbol, nodes, max_items=max_items)
+            sufficient, reason = self._cleanup_read_sufficiency(finding, symbol, reference_reads)
+            reads.extend(self._cleanup_primary_reads(finding, symbol, working_paths, sufficient=sufficient, reason=reason))
+            reads.extend(reference_reads)
+        return self._merge_targeted_reads(reads, max_items=max(max_items * 4, 12))
+
+    def _cleanup_primary_reads(
+        self,
+        finding: MemoryNode,
+        symbol: MemoryNode | None,
+        working_paths: set[str],
+        *,
+        sufficient: bool,
+        reason: str,
+    ) -> list[dict[str, Any]]:
+        reads: list[dict[str, Any]] = []
+        sufficiency = {
+            "status": "sufficient" if sufficient else "insufficient",
+            "reason": reason,
+        }
+        symbol_path = self._node_relative_path(symbol) if symbol is not None else None
+        if symbol is not None and symbol_path and (not working_paths or symbol_path in working_paths):
+            line_start, line_end = self._line_span(symbol)
+            if line_start is not None:
+                symbol_type = str(symbol.type)
+                read_kind = "import_block" if symbol_type == "Import" else "symbol_body"
+                reads.append(
+                    {
+                        "path": symbol_path,
+                        "line_start": line_start,
+                        "line_end": line_end,
+                        "node_id": symbol.id,
+                        "type": symbol.type,
+                        "label": self._compact_text(self._node_label(symbol), max_chars=100),
+                        "reason": "import block for cleanup candidate" if read_kind == "import_block" else "symbol body for cleanup candidate",
+                        "read_kind": read_kind,
+                        "finding_id": finding.id,
+                        "sufficiency": sufficiency,
+                    }
+                )
+        finding_path = self._node_relative_path(finding) or symbol_path
+        finding_line_start, finding_line_end = self._line_span(finding)
+        if finding_path and finding_line_start is not None:
+            context_start = max(1, finding_line_start - 5)
+            context_end = max(finding_line_end or finding_line_start, finding_line_start + 5)
+            reads.append(
+                {
+                    "path": finding_path,
+                    "line_start": context_start,
+                    "line_end": context_end,
+                    "node_id": finding.id,
+                    "type": finding.type,
+                    "label": self._compact_text(self._node_label(finding), max_chars=100),
+                    "reason": "5-10 lines around cleanup finding",
+                    "read_kind": "finding_context",
+                    "finding_id": finding.id,
+                    "sufficiency": sufficiency,
+                }
+            )
+        return reads
+
+    def _cleanup_reference_reads(
+        self,
+        finding: MemoryNode,
+        symbol: MemoryNode | None,
+        nodes: dict[str, MemoryNode],
+        *,
+        max_items: int,
+    ) -> list[dict[str, Any]]:
+        if symbol is None:
+            return []
+        refs: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        target_ids = {symbol.id, finding.id}
+        reference_edge_types = {
+            "CALLS",
+            "USES",
+            "REFERENCES",
+            "READS",
+            "RETURNS",
+            "RAISES",
+            "INSTANTIATES",
+            "IMPORTS",
+            "IMPORTS_FROM",
+            "RE_EXPORTS",
+            "TESTS",
+        }
+        for edge in self.store.all_edges():
+            if edge.type not in reference_edge_types:
+                continue
+            if edge.from_id not in target_ids and edge.to_id not in target_ids:
+                continue
+            other_id = edge.to_id if edge.from_id in target_ids else edge.from_id
+            other = nodes.get(other_id) or self.store.get_node(other_id)
+            if other is None:
+                continue
+            if self._is_structural_import_reference(finding, symbol, edge, other):
+                continue
+            path = self._node_relative_path(other) or self._edge_relative_path(edge)
+            if not path or self._is_generated_context_path(path):
+                continue
+            line_start, line_end = self._line_span(other)
+            if line_start is None:
+                line_start, line_end = self._edge_line_span(edge)
+            if line_start is None:
+                continue
+            read_kind = self._cleanup_reference_read_kind(edge, other, path)
+            key = (read_kind, other.id)
+            if key in seen:
+                continue
+            seen.add(key)
+            refs.append(
+                {
+                    "path": path,
+                    "line_start": line_start,
+                    "line_end": line_end,
+                    "node_id": other.id,
+                    "type": other.type,
+                    "label": self._compact_text(self._node_label(other), max_chars=100),
+                    "reason": f"{read_kind.replace('_', ' ')} for cleanup candidate",
+                    "read_kind": read_kind,
+                    "finding_id": finding.id,
+                    "edge_id": edge.id,
+                    "edge_type": edge.type,
+                    "sufficiency": {
+                        "status": "insufficient",
+                        "reason": "A deterministic reference edge exists; inspect this reference before removing the candidate.",
+                    },
+                }
+            )
+            if len(refs) >= min(max_items, 8):
+                break
+        refs.sort(key=lambda item: (self._cleanup_read_kind_order(str(item.get("read_kind") or "")), str(item.get("path") or ""), int(item.get("line_start") or 0)))
+        return refs
+
+    def _is_structural_import_reference(
+        self,
+        finding: MemoryNode,
+        symbol: MemoryNode,
+        edge: MemoryEdge,
+        other: MemoryNode,
+    ) -> bool:
+        if symbol.type != "Import" or edge.type not in {"IMPORTS", "IMPORTS_FROM"}:
+            return False
+        symbol_path = self._node_relative_path(symbol)
+        finding_path = self._node_relative_path(finding)
+        other_path = self._node_relative_path(other) or self._edge_relative_path(edge)
+        if not symbol_path or not other_path:
+            return False
+        return other_path == symbol_path or (finding_path is not None and other_path == finding_path)
+
+    def _cleanup_finding_symbol(self, finding: MemoryNode) -> MemoryNode | None:
+        symbol_id = finding.properties.get("symbol_id")
+        if symbol_id:
+            symbol = self.store.get_node(str(symbol_id))
+            if symbol is not None:
+                return symbol
+        for edge in self.store.all_edges():
+            if edge.to_id != finding.id or edge.type != "HAS_FINDING":
+                continue
+            node = self.store.get_node(edge.from_id)
+            if node is not None and node.type not in {"SourceArtifact", "File"}:
+                return node
+        return None
+
+    def _cleanup_read_sufficiency(
+        self,
+        finding: MemoryNode,
+        symbol: MemoryNode | None,
+        reference_reads: list[dict[str, Any]],
+    ) -> tuple[bool, str]:
+        props = finding.properties
+        if symbol is None:
+            return False, "The finding has no resolved symbol node, so the targeted read cannot prove the removal boundary."
+        if reference_reads:
+            kinds = sorted({str(item.get("read_kind") or "reference") for item in reference_reads})
+            return False, f"Reference checks found {', '.join(kinds)}; inspect them before removal."
+        blocking = [str(item) for item in props.get("blocking_signals") or []]
+        validation = str(props.get("validation_reason") or "").strip()
+        if blocking or validation:
+            reason = validation or f"Blocking signals remain: {', '.join(blocking)}."
+            return False, reason
+        safety = str(props.get("removal_safety") or "")
+        if safety == "safe":
+            return True, "The symbol/import block plus local finding context are enough for a deterministic safe cleanup candidate; no graph references were found."
+        return False, f"Removal safety is {safety or 'unknown'}; validate beyond the local read before editing."
+
+    @staticmethod
+    def _cleanup_reference_read_kind(edge: MemoryEdge, node: MemoryNode, path: str) -> str:
+        normalized = path.replace("\\", "/").casefold()
+        if normalized.startswith("tests/") or "/tests/" in normalized or edge.type == "TESTS":
+            return "test_ref"
+        if normalized.startswith("docs/") or "/docs/" in normalized or normalized == "readme.md" or node.type in {"Docstring", "Comment"}:
+            return "doc_ref"
+        if edge.type in {"IMPORTS", "IMPORTS_FROM", "RE_EXPORTS"}:
+            return "importer_ref"
+        return "caller_ref"
+
+    @staticmethod
+    def _cleanup_read_kind_order(read_kind: str) -> int:
+        return {
+            "import_block": 0,
+            "symbol_body": 1,
+            "finding_context": 2,
+            "caller_ref": 3,
+            "importer_ref": 4,
+            "doc_ref": 5,
+            "test_ref": 6,
+        }.get(read_kind, 9)
+
+    @staticmethod
+    def _merge_targeted_reads(reads: list[dict[str, Any]], *, max_items: int) -> list[dict[str, Any]]:
+        merged: OrderedDict[tuple[Any, Any, Any, Any, Any], dict[str, Any]] = OrderedDict()
+        spans: set[tuple[Any, Any, Any, Any]] = set()
+        for read in reads:
+            span_key = (
+                read.get("path"),
+                read.get("line_start"),
+                read.get("line_end"),
+                read.get("node_id"),
+            )
+            if not read.get("read_kind") and span_key in spans:
+                continue
+            key = (
+                read.get("path"),
+                read.get("line_start"),
+                read.get("line_end"),
+                read.get("node_id"),
+                read.get("read_kind") or read.get("reason"),
+            )
+            if key not in merged:
+                merged[key] = read
+                spans.add(span_key)
+        return list(merged.values())[:max_items]
+
+    @staticmethod
+    def _edge_relative_path(edge: MemoryEdge) -> str | None:
+        value = edge.properties.get("relative_path") or edge.properties.get("source_file") or edge.properties.get("path")
+        return str(value) if value else None
+
+    @staticmethod
+    def _edge_line_span(edge: MemoryEdge) -> tuple[int | None, int | None]:
+        start = edge.properties.get("line_start", edge.properties.get("start_line"))
+        end = edge.properties.get("line_end", edge.properties.get("end_line", start))
+        try:
+            parsed_start = int(start) if start is not None else None
+            parsed_end = int(end) if end is not None else parsed_start
+        except (TypeError, ValueError):
+            return None, None
+        return parsed_start, parsed_end
+
     def _code_cleanup_candidates(
         self,
         ranked: list[RankedNode],
         subgraph: MemorySubgraph,
         *,
         max_items: int,
+        include_risky: bool = False,
     ) -> list[dict[str, Any]]:
         ranked_by_id = {item.node.id: item for item in ranked}
         query_tokens = set(tokenize(subgraph.query.text))
@@ -2723,6 +3040,8 @@ class RetrievalEngine:
             if node.id in seen or node.type != "StaticAnalysisFinding":
                 continue
             seen.add(node.id)
+            if not include_risky and not self._is_safe_cleanup_candidate(node) and not self._is_aggregate_cleanup_candidate(node):
+                continue
             if query_tokens and not self._cleanup_finding_matches_query(node, query_tokens):
                 continue
             item = ranked_by_id.get(node.id)
@@ -2742,9 +3061,57 @@ class RetrievalEngine:
             payload["validation_reason"] = props.get("validation_reason")
             payload["blocking_signals"] = list(props.get("blocking_signals") or [])
             payload["symbol_name"] = props.get("symbol_name") or props.get("qualified_name") or node.label
+            payload["directory"] = props.get("directory")
+            payload["file_count"] = props.get("file_count")
+            payload["files"] = list(props.get("files") or [])
             candidates.append(payload)
         candidates.sort(key=self._cleanup_candidate_sort_key)
         return candidates[: min(max_items, 8)]
+
+    def _cleanup_candidate_count(self, ranked: list[RankedNode], subgraph: MemorySubgraph) -> int:
+        seen: set[str] = set()
+        count = 0
+        for node in [*(item.node for item in ranked), *subgraph.nodes]:
+            if node.id in seen or node.type != "StaticAnalysisFinding":
+                continue
+            seen.add(node.id)
+            count += 1
+        return count
+
+    @staticmethod
+    def _is_safe_cleanup_candidate(node: MemoryNode) -> bool:
+        return (
+            node.type == "StaticAnalysisFinding"
+            and str(node.properties.get("removal_safety") or "").casefold() == "safe"
+            and not list(node.properties.get("blocking_signals") or [])
+        )
+
+    @staticmethod
+    def _is_aggregate_cleanup_candidate(node: MemoryNode) -> bool:
+        return (
+            node.type == "StaticAnalysisFinding"
+            and node.properties.get("finding_type") == "possibly_orphan_directory"
+            and str(node.properties.get("cleanup_priority") or "").casefold() in {"high", "medium"}
+        )
+
+    def _filter_cleanup_candidate_payloads(self, candidates: list[dict[str, Any]], *, include_risky: bool) -> list[dict[str, Any]]:
+        if include_risky:
+            return candidates
+        safe: list[dict[str, Any]] = []
+        for item in candidates:
+            node = self.store.get_node(str(item.get("id") or ""))
+            if node is not None and (self._is_safe_cleanup_candidate(node) or self._is_aggregate_cleanup_candidate(node)):
+                safe.append(item)
+        return safe
+
+    @staticmethod
+    def _cleanup_filter_payload(*, include_risky: bool, total_candidates: int, shown_candidates: int) -> dict[str, Any]:
+        return {
+            "mode": "include_risky" if include_risky else "safe_remove",
+            "include_risky": include_risky,
+            "shown_candidates": shown_candidates,
+            "excluded_risky_candidates": max(0, total_candidates - shown_candidates) if not include_risky else 0,
+        }
 
     @staticmethod
     def _cleanup_finding_matches_query(node: MemoryNode, query_tokens: set[str]) -> bool:
@@ -2786,6 +3153,9 @@ class RetrievalEngine:
             name = item.get("symbol_name") or item.get("label") or item.get("id")
             reason = item.get("removal_reason") or item.get("validation_reason") or "review candidate before removal"
             lines.append(f"- `{name}` safety={safety}: {reason}")
+        if not cleanup_candidates:
+            lines.append("- No safe-remove cleanup candidate matched this query; rerun with `--include-risky` only when validation candidates are intentionally in scope.")
+            return lines
         for row in path_rows[: min(max_items, 4)]:
             path = row.get("path")
             if path:
@@ -2808,6 +3178,7 @@ class RetrievalEngine:
         ordered_reads = sorted(
             targeted_reads,
             key=lambda item: (
+                self._cleanup_read_kind_order(str(item.get("read_kind") or "")),
                 0 if item.get("type") in primary_types and item.get("reason") == "owner symbol" else 1,
                 1 if item.get("type") in SOURCE_NODE_TYPES else 0,
             ),
@@ -3106,6 +3477,12 @@ class RetrievalEngine:
 
     def _render_cleanup_context_payload(self, payload: dict[str, Any]) -> str:
         lines = self._render_context_header(payload, title="# REQL Cleanup Context")
+        cleanup_filter = payload.get("cleanup_filter") or {}
+        if cleanup_filter:
+            mode = cleanup_filter.get("mode") or "safe_remove"
+            excluded = cleanup_filter.get("excluded_risky_candidates", 0)
+            include_note = "use --include-risky to include validate/risky findings" if not cleanup_filter.get("include_risky") else "validate/risky findings included"
+            self._append_section(lines, "Cleanup filter", [f"- mode={mode}; shown={cleanup_filter.get('shown_candidates', 0)}; excluded_risky={excluded}; {include_note}"])
         cleanup = list(payload.get("cleanup_candidates") or [])
         result_lines: list[str] = []
         if not cleanup:
@@ -3120,6 +3497,23 @@ class RetrievalEngine:
             validation = f"; validate={item.get('validation_reason')}" if item.get("validation_reason") else ""
             result_lines.append(f"- cleanup `{item['id']}` {name}{location}{finding_type}{priority}{safety}{reason}{validation}")
         self._append_section(lines, "Cleanup candidates", result_lines)
+        read_lines: list[str] = []
+        for item in list(payload.get("targeted_reads") or [])[:12]:
+            location = self._format_path_bracket_span(item.get("path"), item.get("line_start"), item.get("line_end"))
+            kind = item.get("read_kind") or "read"
+            sufficiency = item.get("sufficiency") or {}
+            status = sufficiency.get("status")
+            status_text = f"; {status}: {sufficiency.get('reason')}" if status else ""
+            read_lines.append(f"- {kind} `{location}` from `{item.get('node_id')}` [{item.get('type')}] {item.get('reason')}{status_text}")
+        self._append_section(lines, "Targeted reads", read_lines)
+        snippet_lines: list[str] = []
+        for item in list(payload.get("snippets") or [])[:3]:
+            location = self._format_path_bracket_span(item.get("path"), item.get("line_start"), item.get("line_end"))
+            snippet_lines.append(f"- `{location}` ({item.get('type')}; {item.get('source')})")
+            text = str(item.get("text") or "")
+            if text:
+                snippet_lines.extend(f"  {line}" for line in text.splitlines()[:12])
+        self._append_section(lines, "Snippets", snippet_lines)
         self._append_section(lines, "Research queries", self._render_research_refs(payload))
         self._append_section(lines, "Summary", self._render_compact_counts(payload))
         return "\n".join(lines).strip()
