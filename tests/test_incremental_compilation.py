@@ -311,19 +311,21 @@ class IncrementalCompilationTests(unittest.TestCase):
         self.assertFalse(active_code_edges)
 
     def test_compile_uses_config_exclude_rules(self) -> None:
-        (self.root / "vendor").mkdir()
-        (self.root / "vendor" / "package.py").write_text("value = 'ignored'\n", encoding="utf-8")
+        (self.root / "generated").mkdir()
+        (self.root / "generated" / "package.py").write_text("value = 'ignored'\n", encoding="utf-8")
 
-        result = self.graph.compile_project(self.root, exclude_patterns=["vendor/"])
+        result = self.graph.compile_project(self.root, exclude_patterns=["generated/"])
         relative_paths = {artifact.relative_path for artifact in result.scan.artifacts}
         skipped_paths = {item.relative_path for item in result.scan.skipped_files}
 
-        self.assertNotIn("vendor/package.py", relative_paths)
-        self.assertIn("vendor", skipped_paths)
+        self.assertNotIn("generated/package.py", relative_paths)
+        self.assertIn("generated", skipped_paths)
 
     def test_compile_applies_default_ignores(self) -> None:
         (self.root / ".git" / "objects" / "ab").mkdir(parents=True)
         (self.root / ".git" / "objects" / "ab" / "packed").write_bytes(b"git object")
+        (self.root / ".cache").mkdir(exist_ok=True)
+        (self.root / ".cache" / "artifact.json").write_text("{}", encoding="utf-8")
         (self.root / ".reql").mkdir(exist_ok=True)
         (self.root / ".reql" / "artifact-cache.json").write_text("{}", encoding="utf-8")
         (self.root / "__pycache__").mkdir(exist_ok=True)
@@ -334,15 +336,19 @@ class IncrementalCompilationTests(unittest.TestCase):
         skipped_paths = {item.relative_path for item in result.scan.skipped_files}
 
         self.assertNotIn(".git/objects/ab/packed", relative_paths)
+        self.assertNotIn(".cache/artifact.json", relative_paths)
         self.assertNotIn(".reql/artifact-cache.json", relative_paths)
         self.assertNotIn("__pycache__/a.cpython-314.pyc", relative_paths)
         self.assertIn(".git", skipped_paths)
+        self.assertIn(".cache", skipped_paths)
         self.assertIn(".reql", skipped_paths)
         self.assertIn("__pycache__", skipped_paths)
 
     def test_cache_status_applies_default_ignores(self) -> None:
         (self.root / ".git" / "objects" / "ab").mkdir(parents=True)
         (self.root / ".git" / "objects" / "ab" / "packed").write_bytes(b"git object")
+        (self.root / ".cache").mkdir(exist_ok=True)
+        (self.root / ".cache" / "artifact.json").write_text("{}", encoding="utf-8")
         (self.root / "__pycache__").mkdir(exist_ok=True)
         (self.root / "__pycache__" / "a.cpython-314.pyc").write_bytes(b"bytecode")
 

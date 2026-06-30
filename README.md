@@ -1,12 +1,27 @@
 # REQL
 
-REQL is a local repository context index for coding agents and developer tools.
-It compiles source files and supported documents into a property graph, then
-answers bounded queries over code, symbols, tests, documents, dependencies,
-findings, and provenance.
+REQL is a local repository context and working-memory layer for coding agents
+and developer tools. It compiles source files and supported documents into a
+property graph, then answers bounded queries over code, symbols, tests,
+documents, dependencies, findings, and provenance.
 
-The important part is that REQL turns a repository into queryable structure
-before an agent starts editing:
+In the intended coding-agent integration, the user does not treat REQL as a
+separate manual workflow. After the assistant instructions or skill are
+installed for Codex, Claude, Gemini, Cursor, or another agent environment, the
+agent uses REQL while it works: it compiles or refreshes the repository graph,
+retrieves compact source-backed context, records task-local notes and
+decisions, links work back to files and symbols, and reconstructs that working
+set after context loss.
+
+**Token and reasoning budget:** REQL helps coding agents spend fewer tokens on
+repository discovery and more tokens on the actual change. Bounded retrieval
+returns the files, symbols, relationships, and source spans that matter for the
+current task, while Agent Workspace preserves the task map, decisions, risks,
+and handoffs needed to reason through complex or large implementations across
+context windows.
+
+The important part is that REQL gives the agent deterministic repository memory
+before and during edits:
 
 - `project compile` scans the project, fingerprints artifacts, parses supported
   code and documents, and writes graph nodes, edges, cache records, compilation
@@ -16,6 +31,11 @@ before an agent starts editing:
   neighborhood, rank the result, and return compact source-backed context;
 - every result can point back to paths, line ranges, relationships, evidence,
   and graph provenance instead of relying on broad source dumps;
+- `reql agent` maintains per-agent working memory for plans, findings,
+  decisions, tasks, risks, file links, and handoffs without changing the
+  canonical project graph;
+- compact context and saved working maps reduce repeated source reading, which
+  helps preserve token budget and keeps large, multi-step tasks coherent;
 - incremental compile and watch mode keep the graph current without rebuilding
   unchanged files.
 
@@ -39,7 +59,17 @@ For local development from a checkout, install it in editable mode:
 python -m pip install -e .
 ```
 
-Compile a project and retrieve context:
+Install assistant instructions for the coding-agent environment:
+
+```bash
+reql install codex
+```
+
+Replace `codex` with another supported agent platform, or let interactive
+install auto-detect one. The installed instructions make REQL part of the
+agent's normal repository workflow. The commands below are the operations the
+agent integration uses to bootstrap context, retrieve focused evidence, and
+keep working memory:
 
 ```bash
 reql project compile .
@@ -48,8 +78,8 @@ reql query_memories --query "payment service" --limit 8 --json
 reql query_explore --query "payment service serialization" --view owners --view code
 ```
 
-Create a separate Agent Workspace when a coding agent needs session-scoped
-working memory for plans, findings, decisions, and open tasks:
+Agent Workspace commands store the agent's session-scoped working state while
+it implements, reviews, or documents a repository:
 
 ```bash
 reql agent init
@@ -108,10 +138,9 @@ finally:
     graph.close()
 ```
 
-Install assistant instructions and start MCP when needed:
+Start MCP when an integration needs a tool server:
 
 ```bash
-reql install codex
 reql-mcp --read-only
 ```
 

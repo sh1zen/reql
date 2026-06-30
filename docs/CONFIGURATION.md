@@ -30,6 +30,7 @@ scan:
   exclude:
     - "__pycache__/"
     - ".reql/"
+    - ".cache/"
     - ".tmp/"
     - ".git"
 

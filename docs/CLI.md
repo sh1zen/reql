@@ -20,7 +20,7 @@ reql query_graph --query "payment service" --max-depth 2 --json
 reql query_memories --query "payment service" --limit 8 --json
 reql inspect --node-id NODE_ID --json
 
-# Keep agent working memory separate from the standard graph
+# Coding-agent working memory, kept separate from the standard graph
 reql agent init
 reql agent bus
 reql agent sync
@@ -85,17 +85,22 @@ reql query_context --help
 
 ## Agent Workspace
 
-`reql agent` creates project-local Agent Workspaces, also called Agent Working
-Graphs. Each CLI agent gets its own private working graph under `.reql/agents/`
-and all agents share a small internal bus in `.reql/agent-bus.reql`. The Python
-API follows the bus current agent when one exists, and otherwise falls back to
-the compatible `master` workspace at `.reql/agent.reql`.
+`reql agent` is the working-memory layer used by REQL-aware coding-agent
+integrations. It creates project-local Agent Workspaces, also called Agent
+Working Graphs. Each CLI agent gets its own private working graph under
+`.reql/agents/` and all agents share a small internal bus in
+`.reql/agent-bus.reql`. The Python API follows the bus current agent when one
+exists, and otherwise falls back to the compatible `master` workspace at
+`.reql/agent.reql`.
 The standard graph remains the stable project memory in `.reql/memory.reql`;
 `reql agent init` and `reql agent reset` derive reference nodes and relations
 from that graph without modifying it.
 
-Use it when a coding agent needs working memory that can outlive the current
-context window:
+When assistant instructions or a REQL skill are installed, these commands are
+normally invoked by the coding agent as part of its repository workflow. They
+let the agent keep plans, findings, decisions, open tasks, risks, file links,
+and handoff summaries outside the model context window while still grounding
+that work in the deterministic project graph:
 
 ```bash
 reql project compile .
@@ -107,13 +112,14 @@ reql agent session start "Focused implementation pass"
 ```
 
 `reql agent init` returns an `agent_id`, records it on the internal bus, and
-makes it the current agent for later commands in the same project. A normal
-single-agent workflow can keep using `reql agent ...` with no extra flags. For
-parallel workers, pass `reql agent --agent AGENT_ID ...` or set
-`REQL_AGENT_ID=AGENT_ID` so each worker writes to its own private memory while
-still reading shared bus messages and handoffs.
+makes it the current agent for later commands in the same project. In a normal
+single-agent integration, the installed instructions keep using
+`reql agent ...` with no extra flags. For parallel workers, pass
+`reql agent --agent AGENT_ID ...` or set `REQL_AGENT_ID=AGENT_ID` so each worker
+writes to its own private memory while still reading shared bus messages and
+handoffs.
 
-Save observations while analyzing code:
+The agent saves observations while analyzing code:
 
 ```bash
 reql agent add "Read src/memory/cli.py; argparse owns the command surface"
@@ -121,8 +127,8 @@ reql agent finding add "agent commands should run before opening the main graph 
 reql agent decision add "Store the working graph in .reql/agent.reql"
 ```
 
-Create a task map and link work to standard graph references. IDs printed by
-retrieval, `inspect`, or `agent list` can be used directly:
+The agent creates a task map and links work to standard graph references. IDs
+printed by retrieval, `inspect`, or `agent list` can be used directly:
 
 ```bash
 reql agent task add "Implement agent reset"
@@ -192,8 +198,8 @@ reql agent export --json
 reql agent export --json --metadata
 ```
 
-Read or write the shared bus when agents need to coordinate without merging
-their private working graphs:
+Agents read or write the shared bus to coordinate without merging their private
+working graphs:
 
 ```bash
 reql agent bus
