@@ -2,12 +2,13 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 from ..diagnostics import PerformanceLogger
 from ..artifacts.cache import ArtifactCache, ArtifactCacheEntry, DirtySet, artifact_cache_path
+from ..artifacts.compile_summary import CompilationSummary, build_compilation_summary
 from ..artifacts.compiler import ArtifactCompilationResult, ArtifactCompiler, archive_artifact_fragments, link_document_fragments_to_code
 from ..artifacts.context_scope import artifact_context_scope
 from ..artifacts.delta import CompilationRun, DeltaRepository, GraphDelta
@@ -63,6 +64,7 @@ class CompileProjectResult:
     run: CompilationRun
     delta: GraphDelta
     revision: ProjectRevision | None = None
+    summary: CompilationSummary = field(default_factory=CompilationSummary)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -71,6 +73,7 @@ class CompileProjectResult:
             "run": self.run.to_dict(),
             "delta": self.delta.to_dict(),
             "revision": self.revision.to_dict(include_manifest=False) if self.revision else None,
+            "summary": self.summary.to_dict(),
         }
 
 
@@ -201,7 +204,8 @@ class IncrementalCompilationService:
                 errors=len(run.errors),
                 checkpointed=bool(checkpoint.get("checkpointed")) if checkpoint else False,
             )
-        return CompileProjectResult(scan=scan, dirty_set=dirty, run=run, delta=delta, revision=revision)
+        summary = build_compilation_summary(self.store, revision=revision, delta=delta)
+        return CompileProjectResult(scan=scan, dirty_set=dirty, run=run, delta=delta, revision=revision, summary=summary)
 
     def _checkpoint_store_if_needed(self, profile: PerformanceLogger | None) -> dict[str, Any]:
         checkpoint = getattr(self.store, "checkpoint_if_needed", None)

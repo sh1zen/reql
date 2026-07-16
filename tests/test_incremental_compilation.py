@@ -127,6 +127,29 @@ class IncrementalCompilationTests(unittest.TestCase):
         self.assertNotEqual(second.revision.tree_hash, first.revision.tree_hash)
         self.assertEqual([item.id for item in self.graph.project_history(self.root)], [second.revision.id, first.revision.id])
 
+    def test_compile_summary_keeps_unchanged_associated_test_for_modified_source(self) -> None:
+        source = self.root / "calculator.py"
+        test_dir = self.root / "tests"
+        test_dir.mkdir()
+        test_path = test_dir / "test_calculator.py"
+        source.write_text("def add(left, right):\n    return left + right\n", encoding="utf-8")
+        test_path.write_text(
+            "from calculator import add\n\n"
+            "def test_add():\n"
+            "    assert add(1, 2) == 3\n",
+            encoding="utf-8",
+        )
+        (test_dir / "test_unrelated.py").write_text("def test_unrelated():\n    assert True\n", encoding="utf-8")
+        self.graph.compile_project(self.root)
+
+        source.write_text("def add(left, right):\n    return int(left) + int(right)\n", encoding="utf-8")
+        result = self.graph.compile_project(self.root)
+
+        self.assertEqual([item["path"] for item in result.summary.changed_files], ["calculator.py"])
+        self.assertIn("add", {item.name.rsplit(".", 1)[-1] for item in result.summary.updated_symbols})
+        self.assertEqual([item.path for item in result.summary.associated_tests], ["tests/test_calculator.py"])
+        self.assertIn("summary", result.to_dict())
+
     def test_code_context_omits_automatic_revision_section(self) -> None:
         self.graph.compile_project(self.root)
 

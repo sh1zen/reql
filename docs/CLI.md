@@ -245,7 +245,15 @@ the current working session without remembering a task id. Use `agent map
 session summary that keeps completed tasks and their operational relations.
 Use `agent map --since TIMESTAMP` to show only agent items or relations updated
 inside a time window. If another process holds the agent store lock, commands
-retry briefly and then report that the Agent Workspace is busy.
+retry briefly and then report that the Agent Workspace is busy, including the
+lock wait budget that was exhausted.
+
+Agent commands emit lifecycle progress on stderr: an immediate `started` line,
+periodic `still running` heartbeats, and a terminal `completed` or `failed`
+line with elapsed time. Completions after eight seconds are explicitly marked
+as late but final, so a slow storage open is not mistaken for an unfinished
+operation. JSON remains isolated on stdout. Use `reql agent --no-progress
+COMMAND ...` when a caller requires silent stderr.
 
 Use `agent map --metadata`, `agent search --metadata`, or `agent export
 --metadata` only when a coding agent needs timestamps, source fields, storage
@@ -569,6 +577,12 @@ No-op compiles do not create revisions. Use `project history` for the
 newest-first chain and `project diff` (optionally `--revision ID`) for one
 revision's file changes. This is revision metadata for context and auditing; it
 does not store file contents or modify the repository's own Git history.
+
+After each compile or watch update, the CLI also prints a bounded verification
+summary with changed files, added/updated/archived code symbols, and associated
+test files. Test associations come from compiled graph relationships and the
+conventional `tests/test_<module>.py` path when present. The complete structured
+summary is available as `CompileProjectResult.to_dict()["summary"]`.
 
 When `reql.conf` is present, project compile/update, watch mode, and cache
 status apply configured `scan.include` and `scan.exclude` patterns. Compile

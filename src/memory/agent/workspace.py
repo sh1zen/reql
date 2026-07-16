@@ -40,6 +40,14 @@ AGENT_RELATIONS = {
     "replaces",
     "conflicts_with",
 }
+
+
+def _agent_lock_wait_budget(*, read_only: bool) -> float:
+    lock_timeout = AGENT_READ_LOCK_TIMEOUT_SECONDS if read_only else AGENT_LOCK_TIMEOUT_SECONDS
+    retry_delays = max(0, AGENT_LOCK_RETRY_ATTEMPTS - 1) * AGENT_LOCK_RETRY_DELAY_SECONDS
+    return max(0.0, AGENT_LOCK_RETRY_ATTEMPTS * lock_timeout + retry_delays)
+
+
 SYMBOL_TYPES = {
     "Class",
     "Function",
@@ -1223,6 +1231,7 @@ class AgentWorkspace:
             if "locked" in str(exc).casefold():
                 raise ValueError(
                     f"Agent bus is busy; could not read current agent id from {bus_storage}. "
+                    f"The read lock wait ended after {AGENT_READ_LOCK_TIMEOUT_SECONDS:.2f}s. "
                     "Retry the command, or pass `--agent AGENT_ID`/`REQL_AGENT_ID` explicitly."
                 ) from exc
             return None
@@ -1336,6 +1345,7 @@ class AgentWorkspace:
         mode = "read" if read_only else "write"
         raise ValueError(
             f"Agent workspace is busy; could not acquire {mode} access to {self.paths.agent_storage}. "
+            f"The lock wait budget of {_agent_lock_wait_budget(read_only=read_only):.2f}s was exhausted. "
             "Retry the command, or avoid running multiple `reql agent` commands in parallel."
         ) from last_error
 
@@ -1375,6 +1385,7 @@ class AgentWorkspace:
         mode = "read" if read_only else "write"
         raise ValueError(
             f"Agent bus is busy; could not acquire {mode} access to {self.paths.bus_storage}. "
+            f"The lock wait budget of {_agent_lock_wait_budget(read_only=read_only):.2f}s was exhausted. "
             "Retry the command, or avoid running multiple `reql agent` bus writes in parallel."
         ) from last_error
 

@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .agent.progress import ProgressingAgentWorkspace
 from .config import PROJECT_CONFIG_FILENAME, ConfigError, REQLConfig, load_effective_config, load_project_config_data, parse_config_override_assignments, write_sample_config
 from .diagnostics import PerformanceLogger
 from .domain.exceptions import StorageError
@@ -60,6 +61,16 @@ def _format_storage_error(error: StorageError) -> str:
     return f"reql: {message}"
 
 
+def _agent_progress_label(args: argparse.Namespace) -> str:
+    parts = ["agent", str(args.agent_command)]
+    for field in ("agent_task_command", "agent_decision_command", "agent_finding_command", "agent_session_command"):
+        value = getattr(args, field, None)
+        if value:
+            parts.append(str(value))
+            break
+    return " ".join(parts)
+
+
 def _print_compile_result(result: Any) -> None:
     run = result.run
     print(f"Project: {result.scan.project.name}")
@@ -74,10 +85,36 @@ def _print_compile_result(result: Any) -> None:
     print(f"Delta: {result.delta.id}")
     if result.revision is not None:
         print(f"Revision: {result.revision.id} ({len(result.revision.changes)} file changes)")
+    _print_compile_summary(result.summary)
     if run.errors:
         print("Errors:")
         for error in run.errors:
             print(f"  {error}")
+
+
+def _print_compile_summary(summary: Any, *, limit: int = 20) -> None:
+    changed_files = summary.changed_files
+    updated_symbols = summary.updated_symbols
+    associated_tests = summary.associated_tests
+    print("Summary:")
+    print(f"  Changed files ({len(changed_files)}):")
+    for item in changed_files[:limit]:
+        print(f"    {str(item.get('status') or 'changed'):8} {item.get('path')}")
+    if len(changed_files) > limit:
+        print(f"    ... {len(changed_files) - limit} more")
+    print(f"  Updated symbols ({len(updated_symbols)}):")
+    for item in updated_symbols[:limit]:
+        location = item.relative_path
+        if item.line_start is not None:
+            location = f"{location}:{item.line_start}"
+        print(f"    {item.status:8} {item.type} {item.name} @ {location}")
+    if len(updated_symbols) > limit:
+        print(f"    ... {len(updated_symbols) - limit} more")
+    print(f"  Associated tests ({len(associated_tests)}):")
+    for item in associated_tests[:limit]:
+        print(f"    {item.path} ({item.reason})")
+    if len(associated_tests) > limit:
+        print(f"    ... {len(associated_tests) - limit} more")
 
 
 def _available_disk_roots() -> list[str]:
@@ -803,6 +840,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Isolate the current session for one activity; defaults to REQL_AGENT_ACTIVITY_ID or CODEX_THREAD_ID",
     )
+    agent.add_argument("--no-progress", action="store_true", help="Disable Agent Workspace progress messages on stderr")
     parser.add_argument(
         "--snapshot",
         action="store_true",
@@ -1300,7 +1338,12 @@ def _main(argv: list[str] | None = None) -> int:
         agent_id = args.agent_id or os.environ.get("REQL_AGENT_ID")
         if args.agent_command == "init" and not agent_id:
             agent_id = AgentWorkspace.new_agent_id()
-        workspace = AgentWorkspace(args.storage, agent_id=agent_id, activity_id=args.activity_id, config=config)
+        raw_workspace = AgentWorkspace(args.storage, agent_id=agent_id, activity_id=args.activity_id, config=config)
+        workspace = ProgressingAgentWorkspace(
+            raw_workspace,
+            label=_agent_progress_label(args),
+            enabled=not args.no_progress,
+        )
         try:
             if args.agent_command == "init":
                 result = workspace.init()

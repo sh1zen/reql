@@ -605,7 +605,7 @@ class AgentWorkspaceTests(unittest.TestCase):
                 workspace_module.AGENT_READ_LOCK_TIMEOUT_SECONDS = 0.01
                 workspace_module.AGENT_LOCK_RETRY_ATTEMPTS = 2
                 workspace_module.AGENT_LOCK_RETRY_DELAY_SECONDS = 0.01
-                with self.assertRaisesRegex(ValueError, "Agent workspace is busy"):
+                with self.assertRaisesRegex(ValueError, r"Agent workspace is busy;.*lock wait budget of 0\.03s"):
                     workspace.add_note("parallel write")
             finally:
                 locked.close()
@@ -635,7 +635,7 @@ class AgentWorkspaceTests(unittest.TestCase):
                 check=True,
             )
             status = subprocess.run(
-                [sys.executable, "-m", "memory.cli", "--storage", str(storage), "agent", "status", "--json"],
+                [sys.executable, "-m", "memory.cli", "--storage", str(storage), "agent", "--no-progress", "status", "--json"],
                 capture_output=True,
                 text=True,
                 env=env,
@@ -645,6 +645,9 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertEqual(json.loads(init.stdout)["derived_nodes"], 3)
             self.assertEqual(json.loads(add.stdout)["node"]["type"], "task")
             self.assertEqual(json.loads(status.stdout)["agent_nodes"], 1)
+            self.assertIn("[agent] agent init: started", init.stderr)
+            self.assertIn("[agent] agent init: completed in", init.stderr)
+            self.assertEqual(status.stderr, "")
 
     def test_cli_map_can_filter_by_task(self) -> None:
         with tempfile.TemporaryDirectory() as td:

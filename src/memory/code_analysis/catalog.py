@@ -120,8 +120,22 @@ def load_tree_sitter_language(tree_sitter: Any, language: str) -> Any:
         raise ValueError(f"Unsupported Tree-sitter language: {language}")
     try:
         return language_cls(raw)
+    except OverflowError:
+        if not isinstance(raw, int):
+            raise
+        return language_cls(_tree_sitter_language_capsule(raw))
     except TypeError:
         return raw
+
+
+def _tree_sitter_language_capsule(pointer: int) -> Any:
+    """Wrap legacy integer grammar pointers for 64-bit Windows runtimes."""
+    import ctypes
+
+    capsule_new = ctypes.pythonapi.PyCapsule_New
+    capsule_new.restype = ctypes.py_object
+    capsule_new.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+    return capsule_new(ctypes.c_void_p(pointer), b"tree_sitter.Language", None)
 
 
 def _load_direct_language(language: str) -> Any | None:

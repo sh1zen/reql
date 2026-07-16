@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -29,6 +30,24 @@ class _InterruptingInput(io.StringIO):
 
 
 class CLITests(unittest.TestCase):
+    def test_agent_command_progress_reports_heartbeat_and_late_completion(self) -> None:
+        from memory.agent.progress import AgentCommandProgress
+
+        stream = io.StringIO()
+        with AgentCommandProgress(
+            "agent sync",
+            initial_delay_seconds=0.01,
+            interval_seconds=0.01,
+            late_threshold_seconds=0.02,
+            stream=stream,
+        ):
+            time.sleep(0.035)
+
+        output = stream.getvalue()
+        self.assertIn("[agent] agent sync: started", output)
+        self.assertIn("still running after", output)
+        self.assertIn("late completion; result is final", output)
+
     def test_storage_lock_error_is_reported_without_traceback(self) -> None:
         from memory import cli as cli_mod
 
@@ -721,6 +740,9 @@ class CLITests(unittest.TestCase):
             root = Path(td) / "project"
             root.mkdir()
             (root / "app.py").write_text("def build():\n    return 'ok'\n", encoding="utf-8")
+            tests_dir = root / "tests"
+            tests_dir.mkdir()
+            (tests_dir / "test_app.py").write_text("from app import build\n\ndef test_build():\n    assert build() == 'ok'\n", encoding="utf-8")
             command = [sys.executable, "-m", "memory.cli", "project", "compile", str(root)]
 
             subprocess.run(command, check=True, capture_output=True, text=True)
@@ -735,6 +757,10 @@ class CLITests(unittest.TestCase):
 
             self.assertIn("Changed: 1", changed.stdout)
             self.assertIn("Delta:", changed.stdout)
+            self.assertIn("Changed files (1):", changed.stdout)
+            self.assertIn("Updated symbols", changed.stdout)
+            self.assertIn("Associated tests (1):", changed.stdout)
+            self.assertIn("tests/test_app.py", changed.stdout)
 
     def test_cache_status_defaults_to_current_path(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -846,47 +872,41 @@ class CLITests(unittest.TestCase):
             self.assertIn("REQL Project", codex_project_skill)
             self.assertIn("Installed for: codex (project-local).", codex_project_skill)
             self.assertIn(str(command_path), codex_project_skill)
-            self.assertIn("Use this skill for REQL project mode and Agent Workspace mode", codex_project_skill)
-            self.assertIn("optional planning layer for multi-step, cross-file", codex_project_skill)
-            self.assertLess(len(codex_project_skill), 14000)
+            self.assertIn("local deterministic repository index", codex_project_skill)
+            self.assertIn("optional durable planning for complex work", codex_project_skill)
+            self.assertLess(len(codex_project_skill), 9000)
             workflow_lines = [line for line in codex_project_skill.splitlines() if line.partition(".")[0].isdigit()]
-            self.assertGreaterEqual(len(workflow_lines), 10)
-            self.assertLessEqual(len(workflow_lines), 15)
+            self.assertEqual(len(workflow_lines), 6)
+            self.assertIn("## Core Commands", codex_project_skill)
+            self.assertIn("## Core Coding Workflow", codex_project_skill)
+            self.assertIn("## Special-Case References", codex_project_skill)
             self.assertIn("project status .", codex_project_skill)
             self.assertIn("Project not found", codex_project_skill)
-            self.assertIn("project compile . --watch", codex_project_skill)
-            self.assertIn("one-shot compile", codex_project_skill)
-            self.assertIn("Use REQL as the repository context index", codex_project_skill)
-            self.assertIn("Do not run broad `rg`", codex_project_skill)
-            self.assertIn("`find`, `grep -R`", codex_project_skill)
-            self.assertIn("file-scoped `rg`/symbol searches", codex_project_skill)
-            self.assertIn("lightweight path", codex_project_skill)
-            self.assertIn("Do not initialize Agent Workspace", codex_project_skill)
-            self.assertIn("Document processing is local", codex_project_skill)
+            self.assertIn("one-file or exact-symbol edit", codex_project_skill)
+            self.assertIn("do not initialize Agent Workspace", codex_project_skill)
+            self.assertIn("`Local configuration required`", codex_project_skill)
             self.assertIn("file spans", codex_project_skill)
-            self.assertIn("targeted reads", codex_project_skill)
-            self.assertIn("read_plan", codex_project_skill)
-            self.assertIn("change_chain", codex_project_skill)
-            self.assertIn("contracts", codex_project_skill)
             self.assertIn("impact", codex_project_skill)
             self.assertIn("--code", codex_project_skill)
             self.assertIn("--docs", codex_project_skill)
             self.assertIn("--test", codex_project_skill)
-            self.assertIn('query_context --query "<terms from user request>" --cleanup', codex_project_skill)
-            self.assertIn('query_context --query "<exact term>"', codex_project_skill)
-            self.assertIn("RETURN id,type,text,score,relative_path,line_start,line_end", codex_project_skill)
-            self.assertIn("source/code text with exact locations", codex_project_skill)
-            self.assertNotIn("`--edit`", codex_project_skill)
-            self.assertIn("`--cleanup`", codex_project_skill)
-            self.assertIn("unused-code or dead-code requests", codex_project_skill)
-            self.assertIn("Reference Routing", codex_project_skill)
             self.assertIn("references/bootstrap.md", codex_project_skill)
             self.assertIn("references/agent-workspace.md", codex_project_skill)
             self.assertIn('query_context --query "<terms from user request>"', codex_project_skill)
-            self.assertIn('query_explore --query "<terms from user request>"', codex_project_skill)
-            self.assertNotIn('retrieve --query "<terms from user request>"', codex_project_skill)
-            self.assertNotIn("## Watch Mode", codex_project_skill)
-            self.assertEqual(codex_project_skill.count("Use REQL as the repository context index"), 1)
+            self.assertNotIn("project compile . --watch", codex_project_skill)
+            self.assertNotIn("query_explore --query", codex_project_skill)
+            self.assertNotIn("RETRIEVE ", codex_project_skill)
+            self.assertNotIn("agent batch", codex_project_skill)
+            self.assertNotIn("reql-mcp", codex_project_skill)
+            for reference_path in (
+                "references/bootstrap.md",
+                "references/query.md",
+                "references/update-watch.md",
+                "references/reports-exports.md",
+                "references/document-semantics.md",
+                "references/agent-workspace.md",
+            ):
+                self.assertEqual(codex_project_skill.count(reference_path), 1)
             bootstrap_reference = (project / ".codex" / "skills" / "reql-agent" / "references" / "bootstrap.md").read_text(encoding="utf-8")
             query_reference = (project / ".codex" / "skills" / "reql-agent" / "references" / "query.md").read_text(encoding="utf-8")
             update_watch_reference = (project / ".codex" / "skills" / "reql-agent" / "references" / "update-watch.md").read_text(encoding="utf-8")
@@ -937,6 +957,10 @@ class CLITests(unittest.TestCase):
             self.assertIn("StaticAnalysisFinding", query_reference)
             self.assertIn("framework callbacks", query_reference)
             self.assertIn("Before the final response for any task that changed files", update_watch_reference)
+            self.assertIn("## Final change classification", update_watch_reference)
+            self.assertIn("`Versioned functional changes`", update_watch_reference)
+            self.assertIn("the user's personal `config.json` must supply it", update_watch_reference)
+            self.assertIn("`Local configuration required: none`", update_watch_reference)
             self.assertIn("display_name: REQL Project", openai_yaml)
             self.assertIn("agent memory", openai_yaml)
             self.assertIn("Agent Workspace", agent_reference)
@@ -954,11 +978,9 @@ class CLITests(unittest.TestCase):
             self.assertIn("After `reql project compile .` adds new files, run `reql agent sync` before linking", agent_reference)
             self.assertIn("After compile with new files, run sync before linking new standard nodes", agent_reference)
             self.assertIn("code notes, files, symbols", agent_reference)
-            self.assertIn("Plan: use", codex_project_skill)
-            self.assertIn("Task build:", codex_project_skill)
-            self.assertIn("Quick review:", codex_project_skill)
-            self.assertIn("Code linking:", codex_project_skill)
-            self.assertIn("Write: edit the project files", codex_project_skill)
+            self.assertNotIn("Plan: use", codex_project_skill)
+            self.assertNotIn("Task build:", codex_project_skill)
+            self.assertNotIn("Quick review:", codex_project_skill)
             generated_skill_text = "\n".join(
                 [
                     codex_project_skill,
@@ -1098,12 +1120,13 @@ class CLITests(unittest.TestCase):
                 self.assertIn("REQL-INSTALL:START", content)
                 self.assertIn("project status .", content)
                 self.assertIn("project compile .", content)
-                self.assertIn("broad `rg`", content)
-                self.assertIn("confirm the update before the final response", content)
-                self.assertIn("one-shot bootstrap compile", content)
-                self.assertIn("Project not found", content)
+                self.assertIn("broad repository scans", content)
+                self.assertIn("run documented tests", content)
+                self.assertIn("bootstrap with `project compile .` only when the project is missing", content)
+                self.assertIn("updated symbols, associated tests, and test results", content)
                 self.assertIn("document processing runs in the local compiler", content)
-                self.assertEqual(content.count("Start with `reql project status .`"), 1)
+                self.assertEqual(content.count("project status ."), 1)
+                self.assertLessEqual(len([line for line in content.splitlines() if line.startswith("- ")]), 8)
 
     def test_install_user_scope_writes_profile_instructions_for_supported_agents(self) -> None:
         tmp_root = Path.cwd() / ".tmp"
@@ -1170,9 +1193,13 @@ class CLITests(unittest.TestCase):
                 content = path.read_text(encoding="utf-8")
                 self.assertIn("When the user types `/reql`", content)
                 self.assertIn("project status .", content)
-                self.assertIn("generated `references/` files", content)
+                self.assertIn("generated `references/` file", content)
                 self.assertIn("document processing runs in the local compiler", content)
                 self.assertIn("document processing", content)
+                rule_lines = [line for line in content.splitlines() if line.startswith("- ")]
+                self.assertLessEqual(len(rule_lines), 8)
+                self.assertNotIn("query_explore --query", content)
+                self.assertNotIn("agent batch", content)
 
             self.assertTrue((fake_home / ".cursor" / "rules" / "reql.mdc").exists())
             self.assertTrue((fake_home / ".github" / "instructions" / "reql.instructions.md").exists())

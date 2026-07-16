@@ -33,128 +33,69 @@ PROJECT_SKILL_SOURCE = SkillSource(
     name="reql-agent",
     title="REQL Project",
     description=(
-        "A Python graph-native and storage-agnostic memory engine. Use when {platform_name} "
-        "needs to implement, review, document, inspect, or extend a project with bounded "
-        "repository graph context, or when {platform_name} needs persistent coding-agent "
-        "working memory with `reql agent` for tasks, notes, decisions, findings, risks, "
-        "plans, links, recovery, and export, while preserving deterministic core behavior."
+        "Use when {platform_name} needs bounded REQL repository context for coding work or durable "
+        "Agent Workspace planning for a multi-step task. Guides graph-first discovery, targeted edits, "
+        "verification, and final graph refresh without requiring LLM calls."
     ),
     summary=(
-        "Use this skill for REQL project mode and Agent Workspace mode. REQL is the local deterministic project graph; "
-        "Agent Workspace is the optional planning layer for multi-step, cross-file, recoverable, or delegated work."
+        "REQL is the local deterministic repository index. Agent Workspace is optional durable planning for complex work. "
+        "Follow the core workflow below and load only the one reference that covers a special case."
     ),
     command_examples=(
         CommandExample("project status .", "check whether this project has a compiled REQL graph"),
         CommandExample("project compile .", "bootstrap or refresh the graph, including once after edits"),
-        CommandExample("project compile . --watch", "keep one incremental monitor running when continuous updates are appropriate"),
-        CommandExample("project history . --limit 5", "inspect the latest immutable project revisions"),
-        CommandExample("project diff .", "show file-level hash transitions in the latest revision"),
-        CommandExample('locate "path/to/known/readme"', "resolve an exact project-relative path without semantic ranking"),
         CommandExample('query_context --query "<terms from user request>"', "compact informative context"),
         CommandExample('query_context --query "<terms from user request>" --code', "compact code-scoped context with files, symbols, and targeted reads"),
-        CommandExample('query_context --query "<terms from user request>" --cleanup', "safe-remove cleanup findings matching the query"),
-        CommandExample('query_explore --query "<terms from user request>" --view owners --view code', "function-level owner/code slices for coding agents"),
-        CommandExample("inspect --node-id NODE_ID --json", "resolve a node id to location, sources, and neighbors"),
-        CommandExample('query "RETRIEVE \\"<terms from user request>\\" LIMIT 8 RETURN id,type,text,score,relative_path,line_start,line_end"', "source/code text with exact locations"),
-        CommandExample("agent status", "show whether the Agent Workspace exists and what it derives from"),
-        CommandExample("agent init", "create a private workspace when multi-step work needs durable planning context"),
-        CommandExample('agent session start "Focused implementation pass"', "start a current Agent Workspace session"),
-        CommandExample("agent batch --task task=\"Patch CLI\" --decision decision=\"Use one lock\" --link '$task' implements '$decision'", "apply a small inline planning batch without a JSON file"),
-        CommandExample("agent map --session current --json", "summarize the current Agent Workspace session"),
-        CommandExample("agent sync", "refresh standard graph references after compile adds files"),
-        CommandExample("agent export --json", "export the Agent Workspace for another coding agent"),
+        CommandExample("agent status", "check whether optional durable planning is already initialized"),
     ),
     workflow_steps=(
         (
             "Start with `{command_name} project status .`. If it reports `Project not found`, immediately run "
-            "`{command_name} project compile .`; if compile fails, report it and fall back to targeted raw reads."
-        ),
-        (
-            "For an active graph, query before browsing source. Use informative `query_context` for project knowledge; "
-            "use `--code`, `--docs`, or `--test` for scoped context, `--cleanup` for removal candidates, and "
-            "`query_explore --view owners --view code` when dependency context is noisy."
-        ),
-        (
-            "Use a lightweight path for a clear one-file or exact-symbol edit: status, one focused query, then the returned "
-            "file spans or targeted reads. A short `{command_name} query_context --query \"<exact term>\"` is preferred "
-            "over a synthetic query. Do not initialize Agent Workspace for this case."
-        ),
-        (
-            "For code edits, treat `owner_candidates`, `read_plan`, `change_chain`, `contracts`, `impact`, `targeted_reads`, "
-            "and `test_targets` as evidence. Use `inspect` or bounded `RETRIEVE` rows only to fill missing locations; use the "
-            "repository's documented tests and state the REQL query plus why each raw file is opened."
-        ),
-        (
-            "Use REQL as the repository context index. Do not run broad `rg`, recursive listings, `find`, `grep -R`, or custom "
-            "crawlers to rediscover its results. Raw tools are for user-named paths, REQL-returned paths, and targeted test/debug work; "
-            "prefer file-scoped `rg`/symbol searches and refine the query before opening more than three files or about 200 lines."
-        ),
-        (
-            "For unused-code or dead-code requests, start with cleanup findings. Remove only high-confidence local findings; "
-            "treat public APIs, hooks, serializers, tests, re-exports, and CLI/MCP commands as review-needed. Detailed query shapes live in `references/query.md`."
-        ),
-        (
-            "Add exclusions only when explicit or clearly dependency/cache/build output. Never exclude framework/source roots, "
-            "never use workspace-wide patterns, and pass all patterns to one `{command_name} project exclude` call."
-        ),
-        (
-            "Use at most one `{command_name} project compile . --watch` process, and ask before starting it or other long-running/non-bootstrap writes. "
-            "The required first-time one-shot compile after `Project not found` does not need confirmation. If a watcher already exists, query its maintained graph; "
-            "otherwise run one `{command_name} project compile .` after edits."
-        ),
-        (
-            "Before the final response for changed files, confirm and report that the watcher captured them or that the one-shot compile completed. "
-            "Document processing is local and part of compile; REQL remains optional and deterministic without mandatory LLM calls."
-        ),
-        (
-            "Use Agent Workspace only for multi-step, cross-file, ambiguous, recoverable, or delegated work. Check `agent status`; initialize it only after "
-            "the standard graph exists, and start a focused session when older history would make the map noisy."
-        ),
-        (
-            "Plan: use compact notes, decisions, and findings. Task build: create executable tasks, preferably with one `agent batch`. "
-            "Quick review: inspect `agent map --session current`. Code linking: connect tasks to REQL-returned files or symbols. "
-            "Write: edit the project files and mark completed tasks done."
-        ),
-        (
-            "After `{command_name} project compile .` adds new files, run `{command_name} agent sync` before linking them. "
-            "Use `agent map` after context loss, private workspaces per parallel worker, and never run Agent Workspace writes in parallel."
-        ),
-        (
-            "Use `agent handoff` to return saved context, `agent export --json` for transfer, and `agent reset` only to intentionally discard temporary memory. "
-            "Canonical project facts belong in the standard graph, not Agent Workspace."
-        ),
-    ),
-    rule_points=(
-        "Prefer `{command_name}`. If it is not on `PATH`, use `{command_path}`. If that is unavailable, use `{fallback_command}`.",
-        (
-            "Start with `{command_name} project status .`. If status reports `Project not found`, immediately run "
             "`{command_name} project compile .`; if compile fails, report it and use targeted raw reads."
         ),
         (
-            "For an active graph, build a short query from the user's feature, behavior, file, command, error, field, endpoint, API, or symbol terms. "
-            "Use `query_context --code` for implementation, `--cleanup` for dead code, and `query_explore --view owners --view code` when context is noisy."
+            "For an active graph, query with terms from the user's request before browsing source. Use `query_context` and the "
+            "smallest relevant scope (`--code`, `--docs`, or `--test`)."
         ),
         (
-            "Do not duplicate REQL context with broad `rg`, recursive listings, `find`, `grep -R`, or custom crawlers. Read only user-named or "
-            "REQL-returned paths and spans; refine the query before expanding beyond three files or about 200 lines."
+            "Use returned owners, file spans, impact, and test targets to read only the code needed for the change. For a clear "
+            "one-file or exact-symbol edit, stop after one sufficient query and targeted read; do not initialize Agent Workspace."
         ),
         (
-            "For code edits, use returned owners, read plans, change chains, file spans, targeted reads, impact, and tests as evidence. "
-            "State the query and why each raw file is needed; use bounded `inspect` or `RETRIEVE` only for missing locations."
+            "Implement in the existing owner, preserve public contracts unless change is required, and run the repository's documented "
+            "tests. Treat REQL as evidence and source inspection plus tests as verification."
         ),
         (
-            "For cleanup, remove only high-confidence local findings and review public APIs, hooks, serializers, tests, re-exports, and CLI/MCP commands. "
-            "For exclusions, never exclude source roots or use workspace-wide patterns; make one bounded exclude call."
+            "After edits, use an existing watcher or run one `{command_name} project compile .`; do not start a watcher unless continuous "
+            "monitoring was requested. Report versioned files, updated symbols, associated tests, test results, and any separate "
+            "`Local configuration required` action."
         ),
         (
-            "Use one `{command_name} project compile . --watch` process at most and ask before starting long-running/non-bootstrap writes, but not before the required "
-            "one-shot bootstrap compile. After edits, let the watcher update the graph or run one compile; confirm the update before the final response."
+            "Use Agent Workspace only when the task is multi-step, cross-file, ambiguous, recoverable, or delegated; otherwise keep "
+            "the standard graph as the only REQL state."
+        ),
+    ),
+    rule_points=(
+        (
+            "Prefer `{command_name}`; fall back to `{command_path}`, then `{fallback_command}`. Start with `project status .`; "
+            "bootstrap with `project compile .` only when the project is missing."
         ),
         (
-            "Use Agent Workspace only when multi-step work needs persistent planning or handoff. Follow plan, task build, quick review, code linking, and write; "
-            "sync after compile adds files, hand off when done, and keep project facts in the standard graph."
+            "Query the active graph with terms from the user's request before raw exploration. Use returned paths and spans for targeted "
+            "reads; do not duplicate graph context with broad repository scans."
         ),
-        "Detailed bootstrap, query, update/watch, reporting, document, and Agent Workspace procedures live in the generated `references/` files; load only the reference relevant to the task.",
+        (
+            "Edit the existing owner, run documented tests, then let an existing watcher refresh the graph or run one `project compile .`. "
+            "Do not start watch mode unless continuous monitoring was requested."
+        ),
+        (
+            "In the final handoff, report versioned files, updated symbols, associated tests, and test results. Keep any required personal "
+            "`config.json` action separate and never edit that file unless requested."
+        ),
+        (
+            "Use Agent Workspace only for complex work needing durable planning or handoff. Keep canonical project facts in the standard graph."
+        ),
+        "Load only the generated `references/` file relevant to the current special case; do not preload or restate all references.",
     ),
     deterministic_requirement="Keep REQL optional and deterministic; document processing runs in the local compiler, and Agent Workspace operations stay local and separate from the standard REQL graph.",
 )
@@ -223,7 +164,6 @@ def skill_markdown(
     usage = _command_usage(command_name=command_name, command_path=command_path, fallback_command=fallback_command)
     examples = _format_examples(source, command_name)
     workflow = _numbered(source.workflow_steps, command_name=command_name)
-    workflow_heading = "Required Project and Agent Workspace Workflow" if source.name == PROJECT_SKILL_SOURCE.name else "Required Agent Workflow"
     reference_routing = _reference_routing(source.name)
     return f"""---
 name: {source.name}
@@ -234,28 +174,25 @@ description: {source.description.format(platform_name=platform_name)}
 
 {source.summary}
 
-## Usage
+## Core Commands
 
 {usage}
 
 ```bash
 {examples}
-
-reql-mcp --read-only                                    # optional MCP server for clients that support tools
 ```
 
-## {workflow_heading}
+## Core Coding Workflow
 
 {workflow}
-## Reference Routing
+## Special-Case References
 
 {reference_routing}
 
 ## Ground Rules
 
-- Treat REQL as a bounded context index, not as a replacement for exact source edits or tests.
-- Cite files, node ids, source fragments, or REQL rows when using graph-derived facts.
-- If the graph lacks evidence for a claim, say that and inspect targeted files instead of inventing relationships.
+- Follow repository instructions and run its documented tests.
+- Treat graph locations as evidence; inspect exact source before editing and do not invent missing relationships.
 - Keep the deterministic core path usable without LLM calls.
 
 Installed for: {platform_name} ({scope}).
@@ -500,6 +437,15 @@ If no `{command_name} project compile . --watch` process is already maintaining 
 This refreshes only changed/deleted artifacts through the incremental cache and keeps the graph aligned with completed edits. If a watcher is already running, do not start another compile loop; query the maintained graph instead.
 
 Before the final response for any task that changed files, confirm the graph update path: either the watcher already captured the edits, or run the one-shot compile above and report the result briefly.
+
+## Final change classification
+
+Keep repository changes and machine-local setup separate in the handoff:
+
+- Under `Versioned functional changes`, list only source, tests, documentation, examples, and versioned configuration templates that changed in the repository.
+- If the implementation adds a required configuration field, verify whether the user's personal `config.json` must supply it. If so, add a separate `Local configuration required` item naming the field path, the expected value or how to obtain it, and the relevant personal config location when known.
+- Never include the personal `config.json` in the versioned changed-file list. Do not edit it unless the user explicitly requested that local change.
+- If defaults, migration, or backward-compatible loading make a personal update unnecessary, state `Local configuration required: none` rather than implying manual action.
 
 ## Watch mode
 
