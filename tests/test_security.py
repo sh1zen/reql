@@ -131,6 +131,8 @@ class SecurityBoundaryTests(unittest.TestCase):
         if result["kind"] == "code":
             self.assertIn("working_set", result)
             self.assertIn("contracts", result)
+            self.assertIn("read_plan", result)
+            self.assertIn("change_chain", result)
             self.assertIn("targeted_reads", result)
 
     def test_mcp_query_explore_is_read_only_and_structured(self) -> None:

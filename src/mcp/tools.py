@@ -155,7 +155,7 @@ def query_explore(
     config_path: str | None = None,
     config_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Return dependency-oriented query slices for coding agents."""
+    """Return dependency and structural-refactor query slices for coding agents."""
     config = _load_tool_config(config_path, config_overrides)
     query = _required_text(query, "query")
     views = _optional_string_list(views, "views")
@@ -511,7 +511,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "query_explore",
-        "description": "Read-only: retrieve dependency-oriented REQL slices for coding agents: owners, callers, public surface, serialization paths, docs mentions, and code.",
+        "description": "Read-only: retrieve dependency-oriented REQL slices plus structural template duplicates for coding agents.",
         "inputSchema": {
             "type": "object",
             "required": ["storage_path", "query"],
@@ -521,7 +521,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                 "views": {
                     "type": ["array", "null"],
                     "default": None,
-                    "items": {"type": "string", "enum": ["all", "owners", "callers", "public_surface", "serialization_paths", "docs_mentions", "code"]},
+                    "items": {"type": "string", "enum": ["all", "owners", "callers", "public_surface", "serialization_paths", "docs_mentions", "structural_duplicates", "code"]},
                 },
                 "top_k": {"type": "integer", "default": 12, "maximum": MAX_TOP_K},
                 "max_depth": {"type": "integer", "default": 3, "maximum": MAX_DEPTH},
@@ -658,7 +658,13 @@ def call_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[str, A
 
 
 def _parsing_options(config: REQLConfig) -> dict[str, object]:
-    return {"compile": config.compile.to_dict()}
+    return {
+        "compile": config.compile.to_dict(),
+        "scan": {
+            "use_gitignore": config.scan.use_gitignore,
+            "ignore_defaults": config.scan.ignore_defaults,
+        },
+    }
 
 
 def _load_tool_config(

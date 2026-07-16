@@ -29,6 +29,34 @@ class _InterruptingInput(io.StringIO):
 
 
 class CLITests(unittest.TestCase):
+    def test_storage_lock_error_is_reported_without_traceback(self) -> None:
+        from memory import cli as cli_mod
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        storage_path = r"C:\Program Files (x86)\project\.reql\memory.reql"
+        message = (
+            f"REQL block store is locked for write: {storage_path}; "
+            "pid=20324; process_alive=true; stale=false"
+        )
+
+        with (
+            patch.object(cli_mod.sys, "stdout", stdout),
+            patch.object(cli_mod.sys, "stderr", stderr),
+            patch.object(cli_mod, "_open", side_effect=cli_mod.StorageError(message)),
+        ):
+            rc = cli_mod.main(["project", "compile", "."])
+
+        self.assertEqual(rc, 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(
+            stderr.getvalue(),
+            "reql is locked for write: to fix any possible stale: "
+            f'reql --storage "{storage_path}" storage locks --recover-stale\n',
+        )
+        self.assertNotIn("Traceback", stderr.getvalue())
+        self.assertNotIn("pid=20324", stderr.getvalue())
+
     def test_query_accepts_split_retrieve_statement_words(self) -> None:
         tmp_root = Path.cwd() / ".tmp"
         tmp_root.mkdir(exist_ok=True)
@@ -204,7 +232,8 @@ class CLITests(unittest.TestCase):
             self.assertTrue(any(item["surface"]["id"] == "function:target-api" for item in payload["sections"]["public_surface"]))
             self.assertTrue(any(item["node"]["id"] == "variable:payload" for item in payload["sections"]["serialization_paths"]))
             self.assertTrue(any(item["mention"]["id"] == "fragment:docs-target-api" for item in payload["sections"]["docs_mentions"]))
-            self.assertTrue(any("targeted_reads" in item["instruction"] for item in payload["sections"]["code"]["usage_guidance"]))
+            self.assertNotIn("usage_guidance", payload["sections"]["code"])
+            self.assertTrue(any(item["node_id"] == "function:target-api" for item in payload["sections"]["code"]["read_plan"]))
             self.assertTrue(any(item["node_id"] == "function:target-api" for item in payload["sections"]["code"]["targeted_reads"]))
 
             owners_only = subprocess.run(
@@ -228,6 +257,46 @@ class CLITests(unittest.TestCase):
             self.assertEqual(owners_payload["views"], ["owners"])
             self.assertEqual(set(owners_payload["sections"]), {"owners"})
 
+    def test_query_explore_reports_structural_template_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "memory.reql"
+            graph = MemoryGraph.open(db)
+            try:
+                nodes = (
+                    MemoryNode(id="file:profile", type="File", label="profile.php", text="profile card template", properties={"relative_path": "app/Views/profile.php", "context_scope": "code"}),
+                    MemoryNode(id="fragment:profile", type="SourceFragment", label="profile card", text='<section class="profile"><header><h2>Profile</h2></header><div><p>Name</p><input name="name"></div></section>', properties={"relative_path": "app/Views/profile.php", "line_start": 1, "line_end": 1, "context_scope": "code"}),
+                    MemoryNode(id="file:account", type="File", label="account.php", text="account template", properties={"relative_path": "app/Views/account.php", "context_scope": "code"}),
+                    MemoryNode(id="fragment:account", type="SourceFragment", label="account card", text='<section class="account"><header><h2>Account</h2></header><div><p>Email</p><input name="email"></div></section>', properties={"relative_path": "app/Views/account.php", "line_start": 1, "line_end": 1, "context_scope": "code"}),
+                    MemoryNode(id="file:nav", type="File", label="nav.php", text="navigation template", properties={"relative_path": "app/Views/nav.php", "context_scope": "code"}),
+                    MemoryNode(id="fragment:nav", type="SourceFragment", label="navigation", text='<nav><ul><li><a href="/">Home</a></li></ul></nav>', properties={"relative_path": "app/Views/nav.php", "line_start": 1, "line_end": 1, "context_scope": "code"}),
+                )
+                for node in nodes:
+                    graph.add_node(node)
+                graph.add_edge(MemoryEdge(id="edge:profile-fragment", from_id="file:profile", to_id="fragment:profile", type="CONTAINS_FRAGMENT"))
+                graph.add_edge(MemoryEdge(id="edge:account-fragment", from_id="file:account", to_id="fragment:account", type="CONTAINS_FRAGMENT"))
+                graph.add_edge(MemoryEdge(id="edge:nav-fragment", from_id="file:nav", to_id="fragment:nav", type="CONTAINS_FRAGMENT"))
+            finally:
+                graph.close()
+
+            result = subprocess.run(
+                [sys.executable, "-m", "memory.cli", "--storage", str(db), "query_explore", "--query", "profile card", "--structural-duplicates-only", "--json"],
+                check=True,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "PYTHONPATH": "src"},
+            )
+
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["views"], ["structural_duplicates"])
+            rows = payload["sections"]["structural_duplicates"]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(
+                {rows[0]["source"]["location"], rows[0]["duplicate"]["location"]},
+                {"app/Views/profile.php", "app/Views/account.php"},
+            )
+            self.assertGreater(rows[0]["similarity"], 0.8)
+            self.assertTrue(any(pattern.startswith("sequence:") for pattern in rows[0]["shared_patterns"]))
+
     def test_query_opens_read_only_for_concurrent_reads(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db = Path(td) / "memory.reql"
@@ -246,6 +315,220 @@ class CLITests(unittest.TestCase):
             finally:
                 graph.close()
 
+            held_reader = MemoryGraph.open(db, read_only=True)
+            try:
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "memory.cli",
+                        "--storage",
+                        str(db),
+                        "--config",
+                        str(config_path),
+                        "query",
+                        "FIND nodes WHERE type = 'Function' LIMIT 5",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                context_result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "memory.cli",
+                        "--storage",
+                        str(db),
+                        "query_context",
+                        "--query",
+                        "read_query",
+                        "--json",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            finally:
+                held_reader.close()
+
+            self.assertIn("Function", result.stdout)
+            self.assertEqual(json.loads(context_result.stdout)["query"], "read_query")
+            lines = log.read_text(encoding="utf-8").splitlines()
+            self.assertFalse(any('"name":"storage.open.read_only_fallback"' in line for line in lines))
+            self.assertTrue(any('"read_only":true' in line and '"name":"storage.open"' in line for line in lines))
+
+    def test_project_status_opens_read_only_with_an_existing_reader(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "project"
+            root.mkdir()
+            (root / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
+            db = Path(td) / "memory.reql"
+            graph = MemoryGraph.open(db)
+            try:
+                graph.compile_project(root)
+            finally:
+                graph.close()
+
+            held_reader = MemoryGraph.open(db, read_only=True)
+            try:
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "memory.cli",
+                        "--storage",
+                        str(db),
+                        "project",
+                        "status",
+                        str(root),
+                        "--json",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            finally:
+                held_reader.close()
+
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["project"]["properties"]["root_path"], root.resolve().as_posix())
+            self.assertGreaterEqual(payload["artifacts"], 1)
+
+    def test_project_history_and_diff_expose_latest_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "project"
+            root.mkdir()
+            source = root / "module.py"
+            source.write_text("VALUE = 1\n", encoding="utf-8")
+            db = Path(td) / "memory.reql"
+            graph = MemoryGraph.open(db)
+            try:
+                first = graph.compile_project(root)
+                source.write_text("VALUE = 2\n", encoding="utf-8")
+                second = graph.compile_project(root)
+            finally:
+                graph.close()
+
+            history_result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "memory.cli",
+                    "--storage",
+                    str(db),
+                    "project",
+                    "history",
+                    str(root),
+                    "--json",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+            diff_result = subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "memory.cli",
+                    "--storage",
+                    str(db),
+                    "project",
+                    "diff",
+                    str(root),
+                    "--revision",
+                    second.revision.id,
+                    "--json",
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=5,
+            )
+
+            history = json.loads(history_result.stdout)
+            diff = json.loads(diff_result.stdout)
+            self.assertEqual([item["id"] for item in history], [second.revision.id, first.revision.id])
+            self.assertEqual(diff["parent_id"], first.revision.id)
+            self.assertEqual(diff["changes"][0]["path"], "module.py")
+            self.assertEqual(diff["changes"][0]["status"], "modified")
+
+    def test_storage_locks_and_snapshot_query_work_while_writer_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            db = Path(td) / "memory.reql"
+            graph = MemoryGraph.open(db)
+            graph.add_node(MemoryNode(id="snapshot-topic", type="Topic", label="Snapshot topic"))
+            graph.close()
+
+            writer = MemoryGraph.open(db)
+            try:
+                locks_result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "memory.cli",
+                        "--storage",
+                        str(db),
+                        "storage",
+                        "locks",
+                        "--json",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                snapshot_result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "memory.cli",
+                        "--storage",
+                        str(db),
+                        "--snapshot",
+                        "stats",
+                        "--json",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            finally:
+                writer.close()
+
+            locks = json.loads(locks_result.stdout)
+            self.assertTrue(locks["locked"])
+            self.assertTrue(locks["writer"]["process_alive"])
+            self.assertTrue(locks["writer"]["command"])
+            self.assertTrue(locks["snapshot_available"])
+            stats = json.loads(snapshot_result.stdout)
+            self.assertGreaterEqual(stats["nodes"], 1)
+
+    def test_locate_resolves_extensionless_case_insensitive_document_path(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "project"
+            plugin = root / "extensions" / "wp-optimizer"
+            plugin.mkdir(parents=True)
+            (plugin / "README.txt").write_text("=== WP Optimizer ===\n\n== Description ==\nExact path marker.\n", encoding="utf-8")
+            hidden_docs = root / ".github"
+            hidden_docs.mkdir()
+            (hidden_docs / "README.md").write_text("# Hidden docs\n", encoding="utf-8")
+            db = Path(td) / "memory.reql"
+            graph = MemoryGraph.open(db)
+            try:
+                graph.compile_project(root)
+                with patch.object(graph.retrieval, "retrieve", side_effect=AssertionError("locate must not use semantic retrieval")):
+                    hidden_payload = graph.locate("./.github\\readme")
+                with self.assertRaisesRegex(ValueError, "must not traverse"):
+                    graph.locate("../readme")
+            finally:
+                graph.close()
+
             result = subprocess.run(
                 [
                     sys.executable,
@@ -253,20 +536,23 @@ class CLITests(unittest.TestCase):
                     "memory.cli",
                     "--storage",
                     str(db),
-                    "--config",
-                    str(config_path),
-                    "query",
-                    "FIND nodes WHERE type = 'Function' LIMIT 5",
+                    "locate",
+                    "extensions/wp-optimizer/readme",
+                    "--json",
                 ],
                 check=True,
                 capture_output=True,
                 text=True,
+                timeout=5,
             )
 
-            self.assertIn("Function", result.stdout)
-            lines = log.read_text(encoding="utf-8").splitlines()
-            self.assertFalse(any('"name":"storage.open.read_only_fallback"' in line for line in lines))
-            self.assertTrue(any('"read_only":true' in line and '"name":"storage.open"' in line for line in lines))
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["normalized_path"], "extensions/wp-optimizer/readme")
+            self.assertEqual(len(payload["matches"]), 1)
+            self.assertEqual(payload["matches"][0]["relative_path"], "extensions/wp-optimizer/README.txt")
+            self.assertEqual(payload["matches"][0]["context_scope"], "docs")
+            self.assertEqual(hidden_payload["normalized_path"], ".github/readme")
+            self.assertEqual(hidden_payload["matches"][0]["relative_path"], ".github/README.md")
 
     def test_query_context_cleanup_include_risky_flag_expands_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -355,13 +641,15 @@ class CLITests(unittest.TestCase):
             )
 
             first_payload = json.loads(first.stdout)
-            config_path = root / "conf.yaml"
+            config_path = root / "reql.conf"
             self.assertTrue(first_payload["created"])
             self.assertEqual(first_payload["path"], str(config_path))
-            self.assertEqual(first_payload["added"], ["build/", "secrets/*.json"])
+            self.assertEqual(first_payload["added"], ["secrets/*.json"])
+            self.assertEqual(first_payload["skipped"], ["build/"])
             first_exclude = load_config(config_path).scan.exclude
-            self.assertIn(".tmp/", first_exclude)
-            self.assertEqual(first_exclude[-2:], ["build/", "secrets/*.json"])
+            self.assertIn(".git/", first_exclude)
+            self.assertIn("build/", first_exclude)
+            self.assertIn("secrets/*.json", first_exclude)
 
             second = subprocess.run(
                 [
@@ -385,7 +673,10 @@ class CLITests(unittest.TestCase):
             self.assertFalse(second_payload["created"])
             self.assertEqual(second_payload["added"], ["tmp/"])
             self.assertEqual(second_payload["skipped"], ["build/"])
-            self.assertEqual(load_config(config_path).scan.exclude[-3:], ["build/", "secrets/*.json", "tmp/"])
+            effective_excludes = load_config(config_path).scan.exclude
+            self.assertIn("build/", effective_excludes)
+            self.assertIn("secrets/*.json", effective_excludes)
+            self.assertIn("tmp/", effective_excludes)
 
             unsafe_root = Path(td) / "unsafe-project"
             unsafe_root.mkdir()
@@ -407,7 +698,7 @@ class CLITests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 2)
             self.assertIn("refusing dangerous scan.exclude pattern", result.stderr)
-            self.assertFalse((unsafe_root / "conf.yaml").exists())
+            self.assertFalse((unsafe_root / "reql.conf").exists())
 
     def test_project_compile_without_storage_writes_under_build_path(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -424,6 +715,26 @@ class CLITests(unittest.TestCase):
 
             self.assertIn("Delta:", result.stdout)
             self.assertTrue((root / ".reql" / "memory.reql").exists())
+
+    def test_clean_project_compile_still_records_a_validated_run_and_delta(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "project"
+            root.mkdir()
+            (root / "app.py").write_text("def build():\n    return 'ok'\n", encoding="utf-8")
+            command = [sys.executable, "-m", "memory.cli", "project", "compile", str(root)]
+
+            subprocess.run(command, check=True, capture_output=True, text=True)
+            second = subprocess.run(command, check=True, capture_output=True, text=True)
+
+            self.assertIn("Changed: 0", second.stdout)
+            self.assertIn("Run:", second.stdout)
+            self.assertIn("Delta:", second.stdout)
+
+            (root / "app.py").write_text("def build():\n    return 'changed'\n", encoding="utf-8")
+            changed = subprocess.run(command, check=True, capture_output=True, text=True)
+
+            self.assertIn("Changed: 1", changed.stdout)
+            self.assertIn("Delta:", changed.stdout)
 
     def test_cache_status_defaults_to_current_path(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -449,12 +760,18 @@ class CLITests(unittest.TestCase):
             self.assertIn("Project:", result.stdout)
             self.assertIn("Total artifacts:", result.stdout)
 
-    def test_project_compile_loads_project_local_conf_yaml(self) -> None:
+    def test_project_compile_loads_project_local_reql_conf(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "project"
             root.mkdir()
-            (root / "conf.yaml").write_text("cache:\n  enabled: false\n", encoding="utf-8")
+            (root / "reql.conf").write_text(
+                "cache:\n  enabled: false\nscan:\n  use_gitignore: true\n  exclude:\n    - local-excluded.py\n",
+                encoding="utf-8",
+            )
+            (root / ".gitignore").write_text("git-excluded.py\n", encoding="utf-8")
             (root / "app.py").write_text("def local_config_compile():\n    return 'ok'\n", encoding="utf-8")
+            (root / "git-excluded.py").write_text("def excluded_by_git():\n    return 'no'\n", encoding="utf-8")
+            (root / "local-excluded.py").write_text("def excluded_by_reql():\n    return 'no'\n", encoding="utf-8")
 
             subprocess.run(
                 [sys.executable, "-m", "memory.cli", "project", "compile", str(root)],
@@ -471,6 +788,8 @@ class CLITests(unittest.TestCase):
                 graph.close()
 
             self.assertTrue(any(node.properties.get("name") == "local_config_compile" for node in functions))
+            self.assertFalse(any(node.properties.get("name") == "excluded_by_git" for node in functions))
+            self.assertFalse(any(node.properties.get("name") == "excluded_by_reql" for node in functions))
 
     def test_install_project_agents_creates_codex_and_claude_files_idempotently(self) -> None:
         tmp_root = Path.cwd() / ".tmp"
@@ -525,57 +844,49 @@ class CLITests(unittest.TestCase):
             codex_project_skill = (project / ".codex" / "skills" / "reql-agent" / "SKILL.md").read_text(encoding="utf-8")
             claude_project_skill = (project / ".claude" / "skills" / "reql-agent" / "SKILL.md").read_text(encoding="utf-8")
             self.assertIn("REQL Project", codex_project_skill)
-            self.assertIn("Agent Workspace mode", codex_project_skill)
             self.assertIn("Installed for: codex (project-local).", codex_project_skill)
             self.assertIn(str(command_path), codex_project_skill)
             self.assertIn("Use this skill for REQL project mode and Agent Workspace mode", codex_project_skill)
-            self.assertIn("agent init", codex_project_skill)
-            self.assertIn("agent sync", codex_project_skill)
-            self.assertIn("agent batch --task", codex_project_skill)
-            self.assertIn("agent map", codex_project_skill)
-            self.assertIn("agent export --json", codex_project_skill)
-            self.assertIn("After `reql project compile .` adds new files, run `reql agent sync` before linking", codex_project_skill)
+            self.assertIn("optional planning layer for multi-step, cross-file", codex_project_skill)
+            self.assertLess(len(codex_project_skill), 14000)
+            workflow_lines = [line for line in codex_project_skill.splitlines() if line.partition(".")[0].isdigit()]
+            self.assertGreaterEqual(len(workflow_lines), 10)
+            self.assertLessEqual(len(workflow_lines), 15)
             self.assertIn("project status .", codex_project_skill)
             self.assertIn("Project not found", codex_project_skill)
-            self.assertIn("immediately run", codex_project_skill)
             self.assertIn("project compile . --watch", codex_project_skill)
-            self.assertIn("Do not ask before the required one-shot", codex_project_skill)
-            self.assertNotIn("ask for approval and start one", codex_project_skill)
-            self.assertIn("Never exclude framework/source roots", codex_project_skill)
-            self.assertIn("Do not run multiple `project exclude` commands in parallel", codex_project_skill)
-            self.assertIn('query "HUBS LIMIT 20"', codex_project_skill)
-            self.assertNotIn("reql \"HUBS LIMIT 20\"", codex_project_skill)
+            self.assertIn("one-shot compile", codex_project_skill)
             self.assertIn("Use REQL as the repository context index", codex_project_skill)
             self.assertIn("Do not run broad `rg`", codex_project_skill)
             self.assertIn("`find`, `grep -R`", codex_project_skill)
             self.assertIn("file-scoped `rg`/symbol searches", codex_project_skill)
-            self.assertIn("Document processing runs locally", codex_project_skill)
+            self.assertIn("lightweight path", codex_project_skill)
+            self.assertIn("Do not initialize Agent Workspace", codex_project_skill)
+            self.assertIn("Document processing is local", codex_project_skill)
             self.assertIn("file spans", codex_project_skill)
             self.assertIn("targeted reads", codex_project_skill)
+            self.assertIn("read_plan", codex_project_skill)
+            self.assertIn("change_chain", codex_project_skill)
+            self.assertIn("contracts", codex_project_skill)
+            self.assertIn("impact", codex_project_skill)
             self.assertIn("--code", codex_project_skill)
             self.assertIn("--docs", codex_project_skill)
             self.assertIn("--test", codex_project_skill)
-            self.assertNotIn('query_context --query "<terms from user request>" --edit --json', codex_project_skill)
             self.assertIn('query_context --query "<terms from user request>" --cleanup', codex_project_skill)
             self.assertIn('query_context --query "<exact term>"', codex_project_skill)
             self.assertIn("RETURN id,type,text,score,relative_path,line_start,line_end", codex_project_skill)
             self.assertIn("source/code text with exact locations", codex_project_skill)
-            self.assertIn("Choose the query_context mode explicitly", codex_project_skill)
-            self.assertIn("`informative`", codex_project_skill)
             self.assertNotIn("`--edit`", codex_project_skill)
             self.assertIn("`--cleanup`", codex_project_skill)
-            self.assertIn("For unused-code or dead-code requests", codex_project_skill)
-            self.assertIn("After modifying project files", codex_project_skill)
-            self.assertIn("project compile .` once before finishing", codex_project_skill)
-            self.assertIn("Before the final response for any task that changed files", codex_project_skill)
+            self.assertIn("unused-code or dead-code requests", codex_project_skill)
             self.assertIn("Reference Routing", codex_project_skill)
             self.assertIn("references/bootstrap.md", codex_project_skill)
             self.assertIn("references/agent-workspace.md", codex_project_skill)
             self.assertIn('query_context --query "<terms from user request>"', codex_project_skill)
             self.assertIn('query_explore --query "<terms from user request>"', codex_project_skill)
-            self.assertIn('query_memories --query "<terms from user request>"', codex_project_skill)
-            self.assertIn('query_graph --query "<terms from user request>"', codex_project_skill)
             self.assertNotIn('retrieve --query "<terms from user request>"', codex_project_skill)
+            self.assertNotIn("## Watch Mode", codex_project_skill)
+            self.assertEqual(codex_project_skill.count("Use REQL as the repository context index"), 1)
             bootstrap_reference = (project / ".codex" / "skills" / "reql-agent" / "references" / "bootstrap.md").read_text(encoding="utf-8")
             query_reference = (project / ".codex" / "skills" / "reql-agent" / "references" / "query.md").read_text(encoding="utf-8")
             update_watch_reference = (project / ".codex" / "skills" / "reql-agent" / "references" / "update-watch.md").read_text(encoding="utf-8")
@@ -600,6 +911,11 @@ class CLITests(unittest.TestCase):
             self.assertIn("use `--code`, `--docs`, and `--test`", query_reference)
             self.assertIn('query_context --query "graphify"', query_reference)
             self.assertIn("read only the missing spans", query_reference)
+            self.assertIn("read_plan", query_reference)
+            self.assertIn("change_chain", query_reference)
+            self.assertIn("test_targets", query_reference)
+            self.assertIn("clear one-file or exact-symbol edit", query_reference)
+            self.assertIn("skip Agent Workspace", query_reference)
             self.assertIn("Do not read entire files unless the line ranges are missing", query_reference)
             self.assertIn("--view owners --view code", query_reference)
             self.assertIn("Start without `--json`", query_reference)
@@ -783,11 +1099,11 @@ class CLITests(unittest.TestCase):
                 self.assertIn("project status .", content)
                 self.assertIn("project compile .", content)
                 self.assertIn("broad `rg`", content)
-                self.assertIn("project compile .` once before finishing", content)
-                self.assertIn("Before the final response for any task that changed files", content)
-                self.assertIn("project status .", content)
+                self.assertIn("confirm the update before the final response", content)
+                self.assertIn("one-shot bootstrap compile", content)
                 self.assertIn("Project not found", content)
                 self.assertIn("document processing runs in the local compiler", content)
+                self.assertEqual(content.count("Start with `reql project status .`"), 1)
 
     def test_install_user_scope_writes_profile_instructions_for_supported_agents(self) -> None:
         tmp_root = Path.cwd() / ".tmp"
@@ -854,10 +1170,9 @@ class CLITests(unittest.TestCase):
                 content = path.read_text(encoding="utf-8")
                 self.assertIn("When the user types `/reql`", content)
                 self.assertIn("project status .", content)
-                self.assertIn("Dirty `.reql/`", content)
-                self.assertIn("reports/GRAPH_REPORT.md", content)
+                self.assertIn("generated `references/` files", content)
                 self.assertIn("document processing runs in the local compiler", content)
-                self.assertIn("Document processing", content)
+                self.assertIn("document processing", content)
 
             self.assertTrue((fake_home / ".cursor" / "rules" / "reql.mdc").exists())
             self.assertTrue((fake_home / ".github" / "instructions" / "reql.instructions.md").exists())
@@ -1154,42 +1469,26 @@ class CLITests(unittest.TestCase):
             self.assertIn("Detected platforms: cursor", stderr.getvalue())
             self.assertNotIn("Platform to uninstall", stderr.getvalue())
 
-    def test_interactive_install_interrupt_exits_without_traceback(self) -> None:
+    def test_interactive_install_and_uninstall_interrupt_without_traceback(self) -> None:
         from memory import cli as cli_mod
 
-        stdout = io.StringIO()
-        stderr = io.StringIO()
+        for command in ("install", "uninstall"):
+            with self.subTest(command=command):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
 
-        with (
-            patch.object(cli_mod.sys, "stdin", _InterruptingInput()),
-            patch.object(cli_mod.sys, "stdout", stdout),
-            patch.object(cli_mod.sys, "stderr", stderr),
-            patch.object(cli_mod, "_available_disk_roots", return_value=["C:\\"]),
-        ):
-            rc = cli_mod.main(["install", "--json"])
+                with (
+                    patch.object(cli_mod.sys, "stdin", _InterruptingInput()),
+                    patch.object(cli_mod.sys, "stdout", stdout),
+                    patch.object(cli_mod.sys, "stderr", stderr),
+                    patch.object(cli_mod, "_available_disk_roots", return_value=["C:\\"]),
+                ):
+                    rc = cli_mod.main([command, "--json"])
 
-        self.assertEqual(rc, 130)
-        self.assertEqual(stdout.getvalue(), "")
-        self.assertIn("Install cancelled.", stderr.getvalue())
-
-    def test_interactive_uninstall_interrupt_exits_without_traceback(self) -> None:
-        from memory import cli as cli_mod
-
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-
-        with (
-            patch.object(cli_mod.sys, "stdin", _InterruptingInput()),
-            patch.object(cli_mod.sys, "stdout", stdout),
-            patch.object(cli_mod.sys, "stderr", stderr),
-            patch.object(cli_mod, "_available_disk_roots", return_value=["C:\\"]),
-        ):
-            rc = cli_mod.main(["uninstall", "--json"])
-
-        self.assertEqual(rc, 130)
-        self.assertEqual(stdout.getvalue(), "")
-        self.assertIn("Uninstall cancelled.", stderr.getvalue())
-        self.assertNotIn("Traceback", stderr.getvalue())
+                self.assertEqual(rc, 130)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertIn(f"{command.capitalize()} cancelled.", stderr.getvalue())
+                self.assertNotIn("Traceback", stderr.getvalue())
 
     def test_copilot_auto_detect_ignores_generic_github_directory(self) -> None:
         from agents.install import detect_platforms

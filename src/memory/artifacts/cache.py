@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from ..domain.ids import stable_id
 from ..domain.models import MemoryNode
@@ -108,14 +108,12 @@ class ArtifactCache:
         return entry is not None and self.entry_matches_artifact(entry, artifact)
 
     def entry_matches_artifact(self, entry: ArtifactCacheEntry, artifact: SourceArtifact) -> bool:
-        return (
-            entry.sha256 == artifact.sha256
-            and entry.size_bytes == artifact.size_bytes
-            and float(entry.mtime) == float(artifact.mtime)
-            and entry.parser_version == self.parser_version
-            and entry.chunking_version == self.chunking_version
-            and entry.options_hash == self.options_hash
-            and entry.status == "active"
+        return artifact_cache_entry_matches(
+            entry,
+            artifact,
+            parser_version=self.parser_version,
+            chunking_version=self.chunking_version,
+            expected_options_hash=self.options_hash,
         )
 
     def dirty_set(self, scan: ScanResult, entries: dict[str, ArtifactCacheEntry] | None = None) -> DirtySet:
@@ -166,7 +164,13 @@ class ArtifactCache:
                 deleted.add(node.id)
         return deleted
 
-    def upsert_entry(self, artifact: SourceArtifact, *, compiled_at: str | None = None) -> ArtifactCacheEntry:
+    def upsert_entry(
+        self,
+        artifact: SourceArtifact,
+        *,
+        compiled_at: str | None = None,
+        persist_disk: bool = True,
+    ) -> ArtifactCacheEntry:
         now = compiled_at or utcnow_iso()
         entry = ArtifactCacheEntry(
             id=self.entry_id(artifact.project_id, artifact.id),
@@ -183,9 +187,14 @@ class ArtifactCache:
             status="active",
         )
         self.store.upsert_node(_entry_node(entry), return_clone=False)
-        if self.disk is not None:
+        if persist_disk and self.disk is not None:
             self.disk.upsert_entry(entry)
         return entry
+
+    def persist_disk_entries(self, entries: Sequence[ArtifactCacheEntry]) -> None:
+        """Persist a compilation batch with one cache read and atomic write."""
+        if self.disk is not None and entries:
+            self.disk.upsert_entries(entries)
 
     def clear_project(self, project_id: str) -> int:
         count = 0
@@ -255,11 +264,17 @@ class DiskArtifactCache:
         return entries
 
     def upsert_entry(self, entry: ArtifactCacheEntry) -> None:
+        self.upsert_entries((entry,))
+
+    def upsert_entries(self, entries: Sequence[ArtifactCacheEntry]) -> None:
+        if not entries:
+            return
         data = self._load()
-        project = self._project(data, entry.project_id)
-        entries = project.setdefault("entries", {})
-        if isinstance(entries, dict):
-            entries[entry.artifact_id] = entry.to_dict()
+        for entry in entries:
+            project = self._project(data, entry.project_id)
+            project_entries = project.setdefault("entries", {})
+            if isinstance(project_entries, dict):
+                project_entries[entry.artifact_id] = entry.to_dict()
         data["updated_at"] = utcnow_iso()
         self._write(data)
 
@@ -330,6 +345,26 @@ class DiskArtifactCache:
 
 def artifact_cache_path(project_root: str | Path) -> Path:
     return Path(project_root).expanduser().resolve(strict=False) / ".reql" / ARTIFACT_CACHE_FILENAME
+
+
+def artifact_cache_entry_matches(
+    entry: ArtifactCacheEntry,
+    artifact: SourceArtifact,
+    *,
+    parser_version: str,
+    chunking_version: str,
+    expected_options_hash: str,
+) -> bool:
+    """Return whether a disk cache entry proves an artifact is unchanged."""
+    return (
+        entry.sha256 == artifact.sha256
+        and entry.size_bytes == artifact.size_bytes
+        and float(entry.mtime) == float(artifact.mtime)
+        and entry.parser_version == parser_version
+        and entry.chunking_version == chunking_version
+        and entry.options_hash == expected_options_hash
+        and entry.status == "active"
+    )
 
 
 def _entry_node(entry: ArtifactCacheEntry) -> MemoryNode:

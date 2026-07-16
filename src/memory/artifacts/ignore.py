@@ -5,34 +5,9 @@ import fnmatch
 from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_IGNORE_PATTERNS = (
-    ".git/",
-    ".reql/",
-    ".cache/",
-    ".venv/",
-    "venv/",
-    "node_modules/",
-    "dist/",
-    "build/",
-    "__pycache__/",
-    ".mypy_cache/",
-    ".pytest_cache/",
-    ".ruff_cache/",
-    ".DS_Store",
-    "*.pyc",
-    "*.sqlite",
-    "*.sqlite-journal",
-    "*.sqlite-shm",
-    "*.sqlite-wal",
-    "*.sqlite3",
-    "*.sqlite3-journal",
-    "*.sqlite3-shm",
-    "*.sqlite3-wal",
-    "*.db",
-    "*.db-journal",
-    "*.db-shm",
-    "*.db-wal",
-)
+from ..config import default_config
+
+DEFAULT_IGNORE_PATTERNS = tuple(default_config().scan.exclude)
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,10 +68,19 @@ def build_ignore_matcher(
     root: str | Path,
     *,
     use_default_ignores: bool = True,
+    use_gitignore: bool = False,
 ) -> IgnoreMatcher:
-    """Build a matcher from built-in default rules."""
+    """Build a matcher from internal rules and an optional root ``.gitignore``."""
 
     rules: list[IgnoreRule] = []
+    if use_gitignore:
+        gitignore_path = Path(root).expanduser().resolve(strict=False) / ".gitignore"
+        if gitignore_path.is_file():
+            rules.extend(
+                rule
+                for line in gitignore_path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+                if (rule := IgnoreRule.parse(line))
+            )
     if use_default_ignores:
         rules.extend(rule for pattern in DEFAULT_IGNORE_PATTERNS if (rule := IgnoreRule.parse(pattern)))
     return IgnoreMatcher(rules)

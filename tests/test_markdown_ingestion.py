@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import tempfile
 import unittest
@@ -6,9 +6,129 @@ from pathlib import Path
 
 from api import MemoryGraph
 from memory.config import load_config
+from tests.config_helpers import open_graph_with_documents as _open_graph_with_documents
 
 
 class MarkdownIngestionTests(unittest.TestCase):
+    def test_document_formats_are_disabled_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "project"
+            root.mkdir()
+            (root / "README.md").write_text("# Disabled by default\n", encoding="utf-8")
+            graph = MemoryGraph.open(Path(td) / "memory.reql")
+            try:
+                result = graph.compile_project(root)
+                fragment_paths = {
+                    str(node.properties.get("relative_path") or "")
+                    for node in graph.store.all_nodes()
+                    if node.type == "SourceFragment"
+                }
+            finally:
+                graph.close()
+
+            self.assertFalse(result.run.errors)
+            self.assertNotIn("README.md", fragment_paths)
+
+    def test_project_config_toggles_document_formats_without_repeating_extensions(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "project"
+            root.mkdir()
+            config_path = root / "reql.conf"
+            config_path.write_text("compile:\n  documents:\n    markdown: true\n", encoding="utf-8")
+            (root / "README.md").write_text("# Enabled markdown\n", encoding="utf-8")
+            (root / "notes.txt").write_text("Disabled plain text\n", encoding="utf-8")
+            config = load_config(config_path)
+            graph = _open_graph_with_documents(Path(td) / "memory.reql")
+            try:
+                result = graph.compile_project(
+                    root,
+                    parsing_options={"compile": config.compile.to_dict()},
+                )
+                fragment_paths = {
+                    str(node.properties.get("relative_path") or "")
+                    for node in graph.store.all_nodes()
+                    if node.type == "SourceFragment"
+                }
+            finally:
+                graph.close()
+
+            self.assertFalse(result.run.errors)
+            self.assertIn("README.md", fragment_paths)
+            self.assertNotIn("notes.txt", fragment_paths)
+
+    def test_explicit_filename_policy_wins_over_detected_markdown_format(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "project"
+            root.mkdir()
+            readme = root / "readme.txt"
+            readme.write_text("=== Plugin ===\n\n== Description ==\nExplicit policy marker.\n", encoding="utf-8")
+            graph = _open_graph_with_documents(Path(td) / "memory.reql")
+            try:
+                result = graph.compile_project(
+                    root,
+                    parsing_options={
+                        "compile": {
+                            "ingest_documents": True,
+                            "documents": {"markdown": True, "plain_text": False},
+                            "document_formats": {
+                                "markdown": {"extensions": [".md", ".markdown"]},
+                                "plain_text": {"extensions": [".txt"], "filenames": ["readme.txt"]},
+                            },
+                        }
+                    },
+                )
+                artifact = next(node for node in graph.store.all_nodes() if node.type == "SourceArtifact")
+                fragments = [node for node in graph.store.all_nodes() if node.type == "SourceFragment"]
+            finally:
+                graph.close()
+
+            self.assertFalse(result.run.errors)
+            self.assertEqual(artifact.properties.get("artifact_type"), "markdown")
+            self.assertEqual(artifact.properties.get("parser_name"), "document_ingest_disabled")
+            self.assertFalse(fragments)
+
+    def test_wordpress_and_structured_extensionless_docs_use_markdown_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "project"
+            plugin = root / "extensions" / "wp-optimizer"
+            plugin.mkdir(parents=True)
+            config_path = root / "reql.conf"
+            config_path.write_text("compile:\n  documents:\n    markdown: true\n", encoding="utf-8")
+            (plugin / "readme.txt").write_text(
+                "=== WP Optimizer ===\n"
+                "Contributors: example\nTags: cache, performance\nStable tag: 1.0\n\n"
+                "== Description ==\nThe optimizer stores the unique cache beacon.\n\n"
+                "== Frequently Asked Questions ==\n= Does it clear cache? =\nYes.\n",
+                encoding="utf-8",
+            )
+            (plugin / "changelog.txt").write_text("# Changelog\n\n## 1.0\n\n- Initial release\n", encoding="utf-8")
+            (plugin / "GUIDE").write_text("Optimizer Guide\n===============\n\n- Enable cache\n- Save settings\n", encoding="utf-8")
+            config = load_config(config_path)
+            graph = _open_graph_with_documents(Path(td) / "memory.reql")
+            try:
+                result = graph.compile_project(root, parsing_options={"compile": config.compile.to_dict()})
+                artifacts = {
+                    str(node.properties.get("relative_path")): node
+                    for node in graph.store.all_nodes()
+                    if node.type == "SourceArtifact"
+                }
+                readme_fragments = [
+                    node
+                    for node in graph.store.all_nodes()
+                    if node.type == "SourceFragment" and node.properties.get("relative_path") == "extensions/wp-optimizer/readme.txt"
+                ]
+                docs_context = graph.query_context("unique cache beacon", scopes=["docs"])
+            finally:
+                graph.close()
+
+            self.assertFalse(result.run.errors)
+            for relative_path in ("extensions/wp-optimizer/readme.txt", "extensions/wp-optimizer/changelog.txt", "extensions/wp-optimizer/GUIDE"):
+                self.assertEqual(artifacts[relative_path].properties.get("artifact_type"), "markdown")
+                self.assertEqual(artifacts[relative_path].properties.get("context_scope"), "docs")
+            self.assertTrue(any(node.properties.get("fragment_type") == "heading" for node in readme_fragments))
+            self.assertTrue(all(node.properties.get("context_scope") == "docs" for node in readme_fragments))
+            self.assertIn("extensions/wp-optimizer/readme.txt", docs_context)
+
     def test_markdown_fixture_creates_structured_fragments_and_relations(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "project"
@@ -38,7 +158,7 @@ class MarkdownIngestionTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            graph = MemoryGraph.open(Path(td) / "memory.reql")
+            graph = _open_graph_with_documents(Path(td) / "memory.reql")
             try:
                 first = graph.compile_project(root)
                 second = graph.compile_project(root)
@@ -74,27 +194,35 @@ class MarkdownIngestionTests(unittest.TestCase):
             finally:
                 graph.close()
 
-    def test_compile_ingests_documents_by_default(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "project"
-            root.mkdir()
-            (root / "README.md").write_text("# README\n\nProject documentation should become source context.\n", encoding="utf-8")
-            graph = MemoryGraph.open(Path(td) / "memory.reql")
-            try:
-                result = graph.compile_project(root)
-                node_types = {node.type for node in graph.store.all_nodes()}
+    def test_compile_ingests_documents_by_default_and_ignores_noncanonical_alias(self) -> None:
+        scenarios = (
+            ("default", None),
+            ("noncanonical_alias", {"ingest_documents": False}),
+        )
+        for name, parsing_options in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as td:
+                root = Path(td) / "project"
+                root.mkdir()
+                (root / "README.md").write_text(
+                    "# README\n\nProject documentation should become source context.\n",
+                    encoding="utf-8",
+                )
+                graph = _open_graph_with_documents(Path(td) / "memory.reql")
+                try:
+                    result = graph.compile_project(root, parsing_options=parsing_options)
+                    node_types = {node.type for node in graph.store.all_nodes()}
 
-                self.assertFalse(result.run.errors)
-                self.assertIn("SourceFragment", node_types)
-            finally:
-                graph.close()
+                    self.assertFalse(result.run.errors)
+                    self.assertIn("SourceFragment", node_types)
+                finally:
+                    graph.close()
 
     def test_compile_ingest_documents_false_skips_document_fragments(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "project"
             root.mkdir()
             (root / "notes.txt").write_text("Project documentation can be skipped by config.\n", encoding="utf-8")
-            graph = MemoryGraph.open(Path(td) / "memory.reql")
+            graph = _open_graph_with_documents(Path(td) / "memory.reql")
             try:
                 result = graph.compile_project(
                     root,
@@ -112,27 +240,12 @@ class MarkdownIngestionTests(unittest.TestCase):
             finally:
                 graph.close()
 
-    def test_compile_ignores_top_level_document_option_aliases(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "project"
-            root.mkdir()
-            (root / "notes.txt").write_text("Top-level document options are not canonical.\n", encoding="utf-8")
-            graph = MemoryGraph.open(Path(td) / "memory.reql")
-            try:
-                result = graph.compile_project(root, parsing_options={"ingest_documents": False})
-                node_types = {node.type for node in graph.store.all_nodes()}
-
-                self.assertFalse(result.run.errors)
-                self.assertIn("SourceFragment", node_types)
-            finally:
-                graph.close()
-
     def test_compile_document_policy_can_skip_specific_document_type(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "project"
             root.mkdir()
             (root / "README.md").write_text("# README\n\nMarkdown can be skipped by policy.\n", encoding="utf-8")
-            graph = MemoryGraph.open(Path(td) / "memory.reql")
+            graph = _open_graph_with_documents(Path(td) / "memory.reql")
             try:
                 result = graph.compile_project(
                     root,
@@ -155,7 +268,7 @@ class MarkdownIngestionTests(unittest.TestCase):
             root = Path(td) / "project"
             root.mkdir()
             (root / "guide.pdf").write_bytes(b"%PDF-1.4\n% not a real pdf")
-            graph = MemoryGraph.open(Path(td) / "memory.reql")
+            graph = _open_graph_with_documents(Path(td) / "memory.reql")
             try:
                 result = graph.compile_project(
                     root,
@@ -181,7 +294,7 @@ class MarkdownIngestionTests(unittest.TestCase):
                 "# Payments\n\npayment service handles checkout approvals. payment service validates receipts. checkout approvals create receipt events.\n",
                 encoding="utf-8",
             )
-            graph = MemoryGraph.open(Path(td) / "memory.reql")
+            graph = _open_graph_with_documents(Path(td) / "memory.reql")
             try:
                 result = graph.compile_project(root)
                 concepts = [
@@ -225,7 +338,7 @@ class MarkdownIngestionTests(unittest.TestCase):
                 "\u6771\u4eac \u652f\u6255\u3044 \u51e6\u7406 \u306f \u76e3\u67fb \u30a4\u30d9\u30f3\u30c8 \u3092 \u8a18\u9332\u3057\u307e\u3059\u3002\n",
                 encoding="utf-8",
             )
-            graph = MemoryGraph.open(Path(td) / "memory.reql")
+            graph = _open_graph_with_documents(Path(td) / "memory.reql")
             try:
                 result = graph.compile_project(root)
                 semantic_keys = {
@@ -248,7 +361,7 @@ class MarkdownIngestionTests(unittest.TestCase):
                 "# README\n\nlocal processor documents compile_project and project compile events.\n",
                 encoding="utf-8",
             )
-            graph = MemoryGraph.open(Path(td) / "memory.reql")
+            graph = _open_graph_with_documents(Path(td) / "memory.reql")
             try:
                 result = graph.compile_project(root)
                 references = [
@@ -269,7 +382,7 @@ class MarkdownIngestionTests(unittest.TestCase):
             root.mkdir()
             readme = root / "README.md"
             readme.write_text("# README\n\nalpha ledger pipeline records alpha receipts.\n", encoding="utf-8")
-            graph = MemoryGraph.open(Path(td) / "memory.reql")
+            graph = _open_graph_with_documents(Path(td) / "memory.reql")
             try:
                 first = graph.compile_project(root)
                 readme.write_text("# README\n\ngamma ledger pipeline records gamma receipts.\n", encoding="utf-8")
@@ -303,7 +416,7 @@ class MarkdownIngestionTests(unittest.TestCase):
             root = Path(td) / "project"
             root.mkdir()
             (root / "info.md").write_text("written by the docs crew\n\n\nreader note: fresh basil improves soup\n", encoding="utf-8")
-            graph = MemoryGraph.open(Path(td) / "memory.reql")
+            graph = _open_graph_with_documents(Path(td) / "memory.reql")
             try:
                 result = graph.compile_project(root)
                 context = graph.query_context("soup", top_k=12, max_depth=2, max_items=8)
@@ -318,16 +431,16 @@ class MarkdownIngestionTests(unittest.TestCase):
             finally:
                 graph.close()
 
-    def test_config_supports_document_policy_list(self) -> None:
+    def test_config_supports_document_format_toggles(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "conf.yaml"
+            path = Path(td) / "reql.conf"
             path.write_text(
                 "\n".join(
                     [
                         "compile:",
                         "  documents:",
-                        '    - {"format": "markdown", "extensions": [".md", ".markdown"], "ingest": true}',
-                        '    - {"format": "pdf", "extensions": [".pdf"], "ingest": false}',
+                        "    markdown: true",
+                        "    pdf: false",
                     ]
                 ),
                 encoding="utf-8",
@@ -335,32 +448,34 @@ class MarkdownIngestionTests(unittest.TestCase):
 
             config = load_config(path)
 
-            self.assertEqual(
-                config.compile.documents,
-                [
-                    {"format": "markdown", "extensions": [".md", ".markdown"], "ingest": True},
-                    {"format": "pdf", "extensions": [".pdf"], "ingest": False},
-                ],
-            )
+            self.assertTrue(config.compile.documents["markdown"])
+            self.assertFalse(config.compile.documents["pdf"])
+            self.assertEqual(config.compile.document_formats["pdf"]["extensions"], [".pdf"])
 
             invalid_options = [
-                ("misspelled ingest", '"inj" + "est"', '{"format": "markdown", "extensions": [".md"], "injest": true}'),
-                ("removed agent policy", '"sub" + "agent"', '{"format": "markdown", "extensions": [".md"], "ingest": true, "subagent": true}'),
+                ("non boolean toggle", "documents", "    markdown: yes", "compile.documents.markdown must be a boolean"),
+                ("unknown format", "documents", "    unknown_format: true", "Unknown compile.documents format"),
+                (
+                    "invalid format definition",
+                    "document_formats",
+                    '    markdown: {"extensions": ["md"], "unexpected": true}',
+                    "Unknown compile.document_formats.markdown option",
+                ),
             ]
-            for label, _source_hint, document_policy in invalid_options:
+            for label, option_name, option_value, expected_error in invalid_options:
                 with self.subTest(label=label):
                     path.write_text(
                         "\n".join(
                             [
                                 "compile:",
-                                "  documents:",
-                                f"    - {document_policy}",
+                                f"  {option_name}:",
+                                option_value,
                             ]
                         ),
                         encoding="utf-8",
                     )
 
-                    with self.assertRaisesRegex(ValueError, "Unknown compile.documents\\[1\\] option"):
+                    with self.assertRaisesRegex(ValueError, expected_error):
                         load_config(path)
 
     def test_compile_links_document_fragments_to_code_symbols(self) -> None:
@@ -369,7 +484,7 @@ class MarkdownIngestionTests(unittest.TestCase):
             root.mkdir()
             (root / "app.py").write_text("def compile_project():\n    return 'ok'\n", encoding="utf-8")
             (root / "README.md").write_text("# README\n\nCall compile_project after editing docs.\n", encoding="utf-8")
-            graph = MemoryGraph.open(Path(td) / "memory.reql")
+            graph = _open_graph_with_documents(Path(td) / "memory.reql")
             try:
                 result = graph.compile_project(root)
                 references = [
@@ -412,7 +527,7 @@ class MarkdownIngestionTests(unittest.TestCase):
                     root.mkdir()
                     (root / "app.py").write_text(str(scenario["app"]), encoding="utf-8")
                     (root / "README.md").write_text(str(scenario["readme"]), encoding="utf-8")
-                    graph = MemoryGraph.open(Path(td) / "memory.reql")
+                    graph = _open_graph_with_documents(Path(td) / "memory.reql")
                     try:
                         result = graph.compile_project(root)
                         references = [
@@ -442,7 +557,7 @@ class MarkdownIngestionTests(unittest.TestCase):
             (root / "app.py").write_text("def compile_project():\n    return 'ok'\n", encoding="utf-8")
             readme = root / "README.md"
             readme.write_text("# README\n\nCall compile_project after editing docs.\n", encoding="utf-8")
-            graph = MemoryGraph.open(Path(td) / "memory.reql")
+            graph = _open_graph_with_documents(Path(td) / "memory.reql")
             try:
                 graph.compile_project(root)
                 readme.write_text("# README\n\nNo explicit code symbol here.\n", encoding="utf-8")
@@ -461,3 +576,4 @@ class MarkdownIngestionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+

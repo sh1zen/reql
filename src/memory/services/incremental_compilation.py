@@ -7,14 +7,16 @@ from pathlib import Path
 from typing import Any
 
 from ..diagnostics import PerformanceLogger
-from ..artifacts.cache import ArtifactCache, DirtySet, artifact_cache_path
+from ..artifacts.cache import ArtifactCache, ArtifactCacheEntry, DirtySet, artifact_cache_path
 from ..artifacts.compiler import ArtifactCompilationResult, ArtifactCompiler, archive_artifact_fragments, link_document_fragments_to_code
 from ..artifacts.context_scope import artifact_context_scope
 from ..artifacts.delta import CompilationRun, DeltaRepository, GraphDelta
 from ..artifacts.fingerprint import DEFAULT_CHUNKING_VERSION, DEFAULT_PARSER_VERSION, normalize_path, project_id
 from ..artifacts.models import ScanResult, SourceArtifact
 from ..artifacts.project import ProjectRegistry
+from ..artifacts.revision import ProjectRevision, RevisionRepository
 from ..artifacts.scanner import DEFAULT_MAX_FILE_SIZE_BYTES, ProjectScanner
+from ..artifacts.structural_links import refresh_project_structural_links
 from ..domain.ids import stable_id
 from ..domain.models import MemoryEdge, MemoryNode
 from ..domain.timeutils import utcnow_iso
@@ -32,6 +34,8 @@ ORPHAN_DIRECTORY_EDGE_TYPES = {
     "READS",
     "TESTS",
 }
+
+
 ORPHAN_DIRECTORY_COMMON_ROOTS = {"src", "tests", "test", "docs"}
 ORPHAN_DIRECTORY_NAME_HINTS = {"legacy", "old", "unused", "obsolete", "dead", "archive", "archived", "backup", "backups", "deprecated"}
 UNUSED_SYMBOL_FINDING_TYPES = {"possibly_unused_function", "possibly_unused_method", "possibly_unused_class"}
@@ -58,6 +62,7 @@ class CompileProjectResult:
     dirty_set: DirtySet
     run: CompilationRun
     delta: GraphDelta
+    revision: ProjectRevision | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -65,6 +70,7 @@ class CompileProjectResult:
             "dirty_set": self.dirty_set.to_dict(),
             "run": self.run.to_dict(),
             "delta": self.delta.to_dict(),
+            "revision": self.revision.to_dict(include_manifest=False) if self.revision else None,
         }
 
 
@@ -92,6 +98,7 @@ class IncrementalCompilationService:
             compile_options=compile_options,
         )
         self.deltas = DeltaRepository(store)
+        self.revisions = RevisionRepository(store)
 
     def compile_path(
         self,
@@ -129,20 +136,23 @@ class IncrementalCompilationService:
         parsing_options: dict[str, object] | None,
     ) -> CompileProjectResult:
         profile = self.profile_logger
+        root = Path(path).expanduser().resolve(strict=False)
+        compile_options = self._compile_options(parsing_options)
+        cache = self._cache_for_options(compile_options, project_root=root)
+        compiler = self._compiler_for_options(parsing_options)
+        cache_entries = cache.project_entry_map(project_id(normalize_path(root)), active_only=True) if cache_enabled else {}
         scanner = ProjectScanner(
             max_file_size_bytes=max_file_size_bytes,
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
+            use_default_ignores=not _scan_ignore_defaults(parsing_options),
+            use_gitignore=_scan_use_gitignore(parsing_options),
         )
         with (profile.span("compile.scan", path=Path(path).expanduser().resolve(strict=False)) if profile else nullcontext()):
-            scan = scanner.scan(path)
+            scan = scanner.scan(root)
         if profile:
             profile.event("compile.scan.result", category="counter", artifacts=len(scan.artifacts), skipped=len(scan.skipped_files), errors=len(scan.errors))
         with (profile.span("compile.plan", artifacts=len(scan.artifacts), cache_enabled=cache_enabled) if profile else nullcontext()):
-            compile_options = self._compile_options(parsing_options)
-            cache = self._cache_for_options(compile_options, project_root=scan.project.root_path)
-            compiler = self._compiler_for_options(parsing_options)
-            cache_entries = cache.project_entry_map(scan.project.id, active_only=True) if cache_enabled else {}
             if cache_enabled:
                 dirty = cache.dirty_set(scan, entries=cache_entries)
             else:
@@ -174,7 +184,7 @@ class IncrementalCompilationService:
 
         with (profile.span("compile.transaction", changed=run.files_changed, deleted=run.files_deleted) if profile else nullcontext()):
             with self.store.transaction():
-                delta = self._apply_compile_transaction(scan, dirty, compiler, cache, cache_enabled, recovered_artifact_ids, artifacts_by_id, aggregate, run, profile)
+                delta, revision = self._apply_compile_transaction(scan, dirty, compiler, cache, cache_enabled, recovered_artifact_ids, artifacts_by_id, aggregate, run, profile)
         checkpoint = self._checkpoint_store_if_needed(profile)
 
         for node_id in aggregate.affected_node_ids:
@@ -191,7 +201,7 @@ class IncrementalCompilationService:
                 errors=len(run.errors),
                 checkpointed=bool(checkpoint.get("checkpointed")) if checkpoint else False,
             )
-        return CompileProjectResult(scan=scan, dirty_set=dirty, run=run, delta=delta)
+        return CompileProjectResult(scan=scan, dirty_set=dirty, run=run, delta=delta, revision=revision)
 
     def _checkpoint_store_if_needed(self, profile: PerformanceLogger | None) -> dict[str, Any]:
         checkpoint = getattr(self.store, "checkpoint_if_needed", None)
@@ -216,11 +226,12 @@ class IncrementalCompilationService:
         aggregate: "_Aggregate",
         run: CompilationRun,
         profile: PerformanceLogger | None,
-    ) -> GraphDelta:
+    ) -> tuple[GraphDelta, ProjectRevision | None]:
+        pending_disk_entries: list[ArtifactCacheEntry] = []
         for artifact_id in sorted(recovered_artifact_ids):
             artifact = artifacts_by_id[artifact_id]
             with (profile.span("compile.cache_recover", artifact_id=artifact.id, relative_path=artifact.relative_path) if profile else nullcontext()):
-                cache.upsert_entry(artifact, compiled_at=utcnow_iso())
+                pending_disk_entries.append(cache.upsert_entry(artifact, compiled_at=utcnow_iso(), persist_disk=False))
         if dirty.changed_artifact_ids:
             with (profile.span("compile.register_delta", changed=len(dirty.changed_artifact_ids)) if profile else nullcontext()):
                 scan.registration = self.project_registry.register_scan_delta(scan, dirty.changed_artifact_ids)
@@ -238,7 +249,7 @@ class IncrementalCompilationService:
                 run.errors.append(f"{artifact.relative_path}: {error}")
             if cache_enabled:
                 with (profile.span("compile.cache_upsert", artifact_id=artifact.id, relative_path=artifact.relative_path) if profile else nullcontext()):
-                    cache.upsert_entry(artifact, compiled_at=utcnow_iso())
+                    pending_disk_entries.append(cache.upsert_entry(artifact, compiled_at=utcnow_iso(), persist_disk=False))
             aggregate.add(result)
             if profile:
                 profile.event(
@@ -254,6 +265,14 @@ class IncrementalCompilationService:
                     archived_edges=len(result.archived_edges),
                     errors=len(result.errors),
                 )
+
+        if cache_enabled and pending_disk_entries:
+            with (profile.span("compile.cache_flush", entries=len(pending_disk_entries)) if profile else nullcontext()):
+                cache.persist_disk_entries(pending_disk_entries)
+
+        if dirty.changed_artifact_ids and not run.errors:
+            with (profile.span("compile.refresh_structural_links", changed=len(dirty.changed_artifact_ids)) if profile else nullcontext()):
+                aggregate.add(refresh_project_structural_links(self.store, scan.project.id))
 
         if dirty.changed_artifact_ids and self._document_ingest_enabled(compiler):
             link_artifact_ids = self._document_code_link_scope(dirty.changed_artifact_ids, artifacts_by_id, compiler)
@@ -323,7 +342,14 @@ class IncrementalCompilationService:
         with (profile.span("compile.persist_delta", run_id=run.id, delta_id=delta.id) if profile else nullcontext()):
             self.deltas.persist_run(run)
             self.deltas.persist_delta(delta)
-        return delta
+        revision = None
+        if not run.errors:
+            revision = self.revisions.record(
+                project_id=scan.project.id,
+                run_id=run.id,
+                artifacts=scan.artifacts,
+            )
+        return delta, revision
 
     def _archive_deleted_artifact_node(self, node_id: str) -> None:
         node = self.store.get_node(node_id, clone=False)
@@ -366,18 +392,30 @@ class IncrementalCompilationService:
         if not grouped:
             return self._archive_stale_orphan_directory_findings(scan.project.id, set())
 
-        project_nodes = self.store.find_nodes_by_property("project_id", scan.project.id, limit=100000, clone=False)
+        project_dependency_edges: list[MemoryEdge] = []
+        for edge_type in sorted(ORPHAN_DIRECTORY_EDGE_TYPES):
+            project_dependency_edges.extend(
+                edge
+                for edge in self.store.find_edges_by_property(
+                    "project_id",
+                    scan.project.id,
+                    type_=edge_type,
+                    limit=100000,
+                    clone=False,
+                )
+                if edge.properties.get("status") != "archived"
+            )
+        endpoint_ids = {
+            node_id
+            for edge in project_dependency_edges
+            for node_id in (edge.from_id, edge.to_id)
+        }
         path_by_node_id = {
             node.id: path
-            for node in project_nodes
+            for node in self.store.get_nodes(sorted(endpoint_ids))
             if node.status == "active"
             if (path := _node_relative_path(node))
         }
-        project_dependency_edges = [
-            edge
-            for edge in self.store.find_edges_by_property("project_id", scan.project.id, limit=100000, clone=False)
-            if edge.type in ORPHAN_DIRECTORY_EDGE_TYPES and edge.properties.get("status") != "archived"
-        ]
         current_finding_ids: set[str] = set()
         for directory, artifacts in grouped:
             if self._directory_has_external_inbound(directory, path_by_node_id, project_dependency_edges):
@@ -436,25 +474,58 @@ class IncrementalCompilationService:
 
     def _refresh_unused_symbol_findings(self, scan: ScanResult) -> ArtifactCompilationResult:
         result = ArtifactCompilationResult(artifact_id="*")
-        project_nodes = self.store.find_nodes_by_property("project_id", scan.project.id, status="active", limit=100000, clone=False)
+        findings = [
+            finding
+            for finding in self.store.find_nodes_by_property(
+                "project_id",
+                scan.project.id,
+                type_="StaticAnalysisFinding",
+                status="active",
+                limit=100000,
+                clone=False,
+            )
+            if finding.properties.get("finding_type") in UNUSED_SYMBOL_FINDING_TYPES
+        ]
+        symbol_ids = {str(finding.properties.get("symbol_id") or "") for finding in findings}
+        symbol_ids.discard("")
+        if not symbol_ids:
+            return result
+
+        symbols = [
+            node
+            for node in self.store.get_nodes(sorted(symbol_ids))
+            if node.status == "active" and node.type in UNUSED_SYMBOL_NODE_TYPES
+        ]
+        symbol_ids = {node.id for node in symbols}
+        if not symbol_ids:
+            return result
+
+        files = self.store.find_nodes_by_property(
+            "project_id", scan.project.id, type_="File", status="active", limit=100000, clone=False
+        )
         files_by_path = {
             path: node
-            for node in project_nodes
-            if node.type == "File"
+            for node in files
             if (path := _node_relative_path(node))
         }
-        symbols = [node for node in project_nodes if node.type in UNUSED_SYMBOL_NODE_TYPES]
-        symbol_ids = {node.id for node in symbols}
+        imports = self.store.find_nodes_by_property(
+            "project_id", scan.project.id, type_="Import", status="active", limit=100000, clone=False
+        )
+        call_owners: list[MemoryNode] = []
+        for node_type in ("Module", "Function", "Method"):
+            call_owners.extend(
+                self.store.find_nodes_by_property(
+                    "project_id", scan.project.id, type_=node_type, status="active", limit=100000, clone=False
+                )
+            )
         used_symbol_ids = self._used_project_symbol_ids(scan.project.id, symbol_ids)
-        used_symbol_ids.update(self._imported_project_symbol_ids(scan.project.id, files_by_path, symbols, project_nodes, result))
-        used_symbol_ids.update(self._unresolved_method_call_symbol_ids(project_nodes, symbols))
+        used_symbol_ids.update(self._imported_project_symbol_ids(scan.project.id, files_by_path, symbols, imports, result))
+        used_symbol_ids.update(self._unresolved_method_call_symbol_ids(call_owners, symbols))
 
         if not used_symbol_ids:
             return result
 
-        for finding in self.store.find_nodes_by_property("project_id", scan.project.id, type_="StaticAnalysisFinding", status="active", limit=100000, clone=False):
-            if finding.properties.get("finding_type") not in UNUSED_SYMBOL_FINDING_TYPES:
-                continue
+        for finding in findings:
             symbol_id = str(finding.properties.get("symbol_id") or "")
             if symbol_id not in used_symbol_ids:
                 continue
@@ -465,8 +536,13 @@ class IncrementalCompilationService:
         used: set[str] = set()
         if not symbol_ids:
             return used
-        for edge in self.store.find_edges_by_property("project_id", project_id_, limit=100000, clone=False):
-            if edge.type not in UNUSED_SYMBOL_USAGE_EDGE_TYPES:
+        for edge in self.store.incident_edges(
+            sorted(symbol_ids),
+            edge_types=UNUSED_SYMBOL_USAGE_EDGE_TYPES,
+            limit=100000,
+            clone=False,
+        ):
+            if edge.properties.get("project_id") != project_id_:
                 continue
             if edge.properties.get("status") == "archived":
                 continue
@@ -585,12 +661,17 @@ class IncrementalCompilationService:
         cache_enabled: bool = True,
         parsing_options: dict[str, object] | None = None,
     ) -> dict[str, object]:
+        root = Path(path).expanduser().resolve(strict=False)
+        cache = self._cache_for_options(self._compile_options(parsing_options), project_root=root)
+        cache_entries = cache.project_entry_map(project_id(normalize_path(root)), active_only=True) if cache_enabled else {}
         scanner = ProjectScanner(
             max_file_size_bytes=max_file_size_bytes,
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
+            use_default_ignores=not _scan_ignore_defaults(parsing_options),
+            use_gitignore=_scan_use_gitignore(parsing_options),
         )
-        scan = scanner.scan(path)
+        scan = scanner.scan(root)
         if not cache_enabled:
             return {
                 "cache_enabled": False,
@@ -603,7 +684,7 @@ class IncrementalCompilationService:
                 "dirty": [artifact.id for artifact in scan.artifacts],
                 "deleted": [],
             }
-        return self._cache_for_options(self._compile_options(parsing_options), project_root=scan.project.root_path).status_for_scan(scan)
+        return cache.status_for_scan(scan)
 
     def clear_cache(self, path: str | Path) -> dict[str, object]:
         root = normalize_path(path)
@@ -676,9 +757,25 @@ def _document_format_ingest_enabled(document_policies: list[dict[str, object]], 
 
 def _document_policies(compile_settings: dict[str, object]) -> list[dict[str, object]]:
     documents = compile_settings.get("documents", [])
-    if not isinstance(documents, list):
+    if isinstance(documents, list):
+        return [dict(item) for item in documents if isinstance(item, dict)]
+    document_formats = compile_settings.get("document_formats", {})
+    if not isinstance(documents, dict) or not isinstance(document_formats, dict):
         return []
-    return [dict(item) for item in documents if isinstance(item, dict)]
+    policies: list[dict[str, object]] = []
+    for format_name, raw_definition in document_formats.items():
+        if not isinstance(raw_definition, dict):
+            continue
+        policy: dict[str, object] = {
+            "format": str(format_name),
+            "extensions": list(raw_definition.get("extensions", [])),
+            "ingest": bool(documents.get(format_name, False)),
+        }
+        filenames = raw_definition.get("filenames", [])
+        if isinstance(filenames, list) and filenames:
+            policy["filenames"] = list(filenames)
+        policies.append(policy)
+    return policies
 
 
 def _document_policy_ingest_enabled(policy: dict[str, object]) -> bool:
@@ -869,6 +966,24 @@ def _candidate_import_relative_paths(source_relative_path: str | None, module: s
                 seen.add(normalized)
                 candidates.append(normalized)
     return candidates
+
+
+def _scan_use_gitignore(parsing_options: dict[str, object] | None) -> bool:
+    if not parsing_options:
+        return False
+    scan_options = parsing_options.get("scan")
+    if not isinstance(scan_options, dict):
+        return False
+    return bool(scan_options.get("use_gitignore", False))
+
+
+def _scan_ignore_defaults(parsing_options: dict[str, object] | None) -> bool:
+    if not parsing_options:
+        return False
+    scan_options = parsing_options.get("scan")
+    if not isinstance(scan_options, dict):
+        return False
+    return bool(scan_options.get("ignore_defaults", False))
 
 
 class _Aggregate:

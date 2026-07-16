@@ -9,6 +9,7 @@ from ..metadata import line_offsets, make_fragment
 from ..models import DocumentFragment, DocumentParseResult
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
+WORDPRESS_HEADING_RE = re.compile(r"^(={1,3})\s*(\S.*?)\s*\1$")
 FENCE_RE = re.compile(r"^(```+|~~~+)\s*([A-Za-z0-9_+.-]+)?\s*$")
 LIST_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+")
 LINK_RE = re.compile(r"(?<!!)\[([^\]]+)\]\(([^)]+)\)")
@@ -42,9 +43,15 @@ class MarkdownParser(BaseDocumentParser):
                 continue
 
             heading = HEADING_RE.match(line)
-            if heading:
-                level = len(heading.group(1))
-                heading_text = heading.group(2).strip().strip("#").strip()
+            wordpress_heading = WORDPRESS_HEADING_RE.match(line)
+            if heading or wordpress_heading:
+                if heading:
+                    level = len(heading.group(1))
+                    heading_text = heading.group(2).strip().strip("#").strip()
+                else:
+                    assert wordpress_heading is not None
+                    level = 4 - len(wordpress_heading.group(1))
+                    heading_text = wordpress_heading.group(2).strip()
                 if level == 1 and title == self.title_from_path(artifact):
                     title = heading_text
                 heading_stack = [item for item in heading_stack if item[0] < level]

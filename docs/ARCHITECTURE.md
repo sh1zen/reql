@@ -106,8 +106,8 @@ activation and usage signals
   -> keep project/source provenance available for context
 ```
 
-Salience is code-graph oriented. Legacy conversation-memory maintenance is not
-part of the current graph model.
+Salience ranks project and source graph records from structural, retrieval, and
+usage signals.
 
 ## Analysis
 

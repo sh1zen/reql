@@ -8,7 +8,6 @@ from pathlib import Path
 import socket
 from urllib.parse import urlparse
 
-DEFAULT_HTTP_MAX_BYTES = 10 * 1024 * 1024
 MCP_ALLOWED_ROOTS_ENV = "REQL_MCP_ALLOWED_ROOTS"
 
 _METADATA_HOSTS = {
@@ -81,11 +80,6 @@ def validate_mcp_path(path: str | Path, *, name: str, must_exist: bool = False) 
         allowed = ", ".join(str(root) for root in roots)
         raise SecurityError(f"{name} must be inside an allowed MCP root: {allowed}")
     return resolved
-
-
-def enforce_response_size(size: int, *, max_bytes: int = DEFAULT_HTTP_MAX_BYTES) -> None:
-    if size > max_bytes:
-        raise SecurityError(f"HTTP response exceeded {max_bytes} bytes")
 
 
 def _resolve_host(host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:

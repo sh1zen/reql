@@ -24,7 +24,9 @@ from memory.reporting.project_report import ProjectReportFiles, ProjectReportGen
 from memory.analysis.communities import CommunityResult
 from memory.analysis.hubs import HubReport
 from memory.artifacts.project import ProjectRegistry
+from memory.artifacts.revision import ProjectRevision, RevisionRepository
 from memory.artifacts.compiler import ArtifactCompiler
+from memory.artifacts.fingerprint import normalize_relative_lookup_path
 from memory.services.incremental_compilation import CompileProjectResult, IncrementalCompilationService
 from memory.services.project_watch import ProjectWatchEvent, ProjectWatchService
 from memory.services.retrieval import RetrievalEngine
@@ -70,6 +72,7 @@ class MemoryGraph:
         self.salience = SalienceEngine(store)
         self.project_reporter = ProjectReportGenerator(store)
         self.projects = ProjectRegistry(store)
+        self.revisions = RevisionRepository(store)
         self.incremental = IncrementalCompilationService(
             store,
             compiler=ArtifactCompiler(),
@@ -91,11 +94,18 @@ class MemoryGraph:
         config: REQLConfig | None = None,
         profile_logger: PerformanceLogger | None = None,
         read_only: bool = False,
+        snapshot: bool = False,
+        defer_lexical_index: bool = False,
     ) -> MemoryGraphT:
         storage_path = Path(path).expanduser()
         if read_only:
             _ensure_readable_storage_payload(storage_path)
-        store = BlockGraphStore(storage_path, read_only=read_only)
+        store = BlockGraphStore(
+            storage_path,
+            read_only=read_only,
+            snapshot=snapshot,
+            defer_lexical_index=defer_lexical_index,
+        )
         try:
             return cls(store, extractor=extractor, config=config, profile_logger=profile_logger)
         except Exception:
@@ -202,7 +212,7 @@ class MemoryGraph:
         max_items: int = 18,
         include_archived: bool = False,
     ) -> dict[str, Any]:
-        """Return dependency-oriented query slices for coding agents."""
+        """Return dependency and structural-refactor query slices for coding agents."""
         return self.retrieval.query_explore(
             MemoryQuery(
                 text=text,
@@ -370,6 +380,18 @@ class MemoryGraph:
     def project_status(self, path: str | Path) -> dict[str, Any] | None:
         return self.projects.project_status(path)
 
+    def project_history(self, path: str | Path, *, limit: int = 20) -> list[ProjectRevision]:
+        """Return newest-first immutable revisions for a registered project."""
+        status = self.projects.project_status(path)
+        if status is None:
+            return []
+        project_id = str(status["project"]["id"])
+        return self.revisions.list(project_id=project_id, limit=limit)
+
+    def project_revision(self, revision_id: str) -> ProjectRevision | None:
+        """Return one project revision by its content-addressed id."""
+        return self.revisions.get(revision_id)
+
     def compile_project(
         self,
         path: str | Path,
@@ -534,6 +556,44 @@ class MemoryGraph:
     def get_edges(self, **kwargs: Any) -> list[MemoryEdge]:
         return self.store.get_edges(**kwargs)
 
+    def locate(self, path: str, *, include_archived: bool = False) -> dict[str, Any]:
+        """Resolve a known project-relative path through exact property indexes."""
+        relative_path = normalize_relative_lookup_path(path)
+        if not relative_path:
+            raise ValueError("locate path must not be empty")
+        normalized = relative_path.casefold()
+        suffixes = (".md", ".markdown", ".txt", ".rst") if not Path(relative_path).suffix else ()
+        key_candidates = [normalized, *(f"{normalized}{suffix}" for suffix in suffixes)]
+        legacy_candidates = [relative_path, *(f"{relative_path}{suffix}" for suffix in suffixes)]
+        matches: dict[str, MemoryNode] = {}
+        for property_name, candidates in (("relative_path_key", key_candidates), ("relative_path", legacy_candidates)):
+            for candidate in candidates:
+                for node in self.store.find_nodes_by_property(
+                    property_name,
+                    candidate,
+                    type_="SourceArtifact",
+                    limit=100,
+                    clone=False,
+                ):
+                    if include_archived or node.status not in {"archived", "deleted"}:
+                        matches[node.id] = node
+        rows = []
+        for node in sorted(matches.values(), key=lambda item: str(item.properties.get("relative_path") or "").casefold()):
+            properties = node.properties
+            rows.append(
+                {
+                    "id": node.id,
+                    "relative_path": properties.get("relative_path"),
+                    "path": properties.get("path"),
+                    "uri": properties.get("uri") or node.text,
+                    "artifact_type": properties.get("artifact_type"),
+                    "language": properties.get("language"),
+                    "context_scope": properties.get("context_scope"),
+                    "status": node.status,
+                }
+            )
+        return {"query": path, "normalized_path": normalized, "matches": rows}
+
     def inspect_node(
         self,
         node_id: str,
@@ -665,5 +725,11 @@ class MemoryGraph:
         }
 
     def _compile_parsing_options(self) -> dict[str, object]:
-        return {"compile": self.config.compile.to_dict()}
+        return {
+            "compile": self.config.compile.to_dict(),
+            "scan": {
+                "use_gitignore": self.config.scan.use_gitignore,
+                "ignore_defaults": self.config.scan.ignore_defaults,
+            },
+        }
 

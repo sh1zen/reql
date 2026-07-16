@@ -26,6 +26,9 @@ before and during edits:
 - `project compile` scans the project, fingerprints artifacts, parses supported
   code and documents, and writes graph nodes, edges, cache records, compilation
   runs, and deltas;
+- application surface files are linked deterministically when the graph can
+  infer relationships, such as controller render calls to templates and shared
+  template/CSS/JS identifiers;
 - retrieval commands such as `query_context`, `query_explore`, `query_graph`,
   and `query_memories` find lexical seed nodes, expand a bounded graph
   neighborhood, rank the result, and return compact source-backed context;
@@ -76,7 +79,16 @@ reql project compile .
 reql query_context --query "payment service"
 reql query_memories --query "payment service" --limit 8 --json
 reql query_explore --query "payment service serialization" --view owners --view code
+reql query_explore --query "profile template" --structural-duplicates-only
 ```
+
+For coding-agent tasks, `query_context --code` returns a compact working set
+plus a bounded `read_plan` and `change_chain`: owner symbols to start from,
+exact source spans to inspect before whole files, related contracts or public
+surfaces to preserve, and tests/docs to verify after edits.
+Unscoped informative queries can also end with an `Action plan` that correlates
+matching documentation and implementation spans in the same project and flags
+related `.pot`/`.po` translation catalogs for synchronization.
 
 Agent Workspace commands store the agent's session-scoped working state while
 it implements, reviews, or documents a repository:
@@ -89,7 +101,7 @@ reql agent add "Read src/memory/cli.py and found the argparse command surface"
 reql agent task add "Implement reset for the working graph"
 reql agent decision add "Keep agent memory in .reql/agent.reql"
 reql agent link TASK_ID artifact:app --relation touches
-reql agent link-task --file test-agent/context_savings.py
+reql agent link-task --task TASK_ID --file test-agent/context_savings.py
 reql agent link-many TASK_ID artifact:app function:target --relation implements
 reql agent batch --json agent-ops.json
 reql agent batch --task task="Patch CLI" --decision decision="Use one workspace lock" --link '$task' implements '$decision'
@@ -110,6 +122,11 @@ the full saved handoff maps are needed. `agent map`, `agent search`, and
 --completed` for a completed session summary after tasks are marked done. Pass
 `--metadata` only when timestamps, storage paths, source fields, or the full
 workspace graph are needed.
+
+Sessions inside one agent memory are isolated by `REQL_AGENT_ACTIVITY_ID` or
+`CODEX_THREAD_ID` when either is present. A client can also pass
+`reql agent --activity ACTIVITY_ID ...`, preventing concurrent tasks that reuse
+an agent id from changing each other's current session during synchronization.
 
 `reql agent reset` discards agent-created working notes and re-derives the
 workspace from the current standard graph without modifying `.reql/memory.reql`.
@@ -155,11 +172,13 @@ reports, exports, and maintenance workflows.
 - Local project compilation into a property graph with explicit provenance.
 - Retrieval with lexical seed nodes, bounded graph expansion, and chain-aware ranking.
 - Compact `query_context`, `query_explore`, `query_graph`, and `query_memories`
-  outputs for coding-agent workflows.
+  outputs for coding-agent workflows, including bounded read plans and
+  graph-derived change chains for code edits.
 - Separate `reql agent` working graph for agent notes, tasks, decisions,
   findings, plans, risks, and links without contaminating the standard graph.
 - Local block-file persistence with fixed-size pages, compressed records,
-  locking, transactions, and compaction.
+  reader/writer lock diagnostics, safe stale-lock recovery, read-only snapshots,
+  transactions, and compaction.
 - Incremental compilation cache with persistent compilation runs and graph deltas.
 - Artifact document parsing for Markdown, plain text, and PDF with graceful
   fallbacks.
@@ -246,7 +265,7 @@ documentation lives under `docs/`:
   retrieval, maintenance, and deterministic analysis.
 - [CLI](docs/CLI.md): command reference for compilation, retrieval, graph
   queries, exports, configuration, install helpers, and MCP startup.
-- [Configuration](docs/CONFIGURATION.md): `conf.yaml`, overrides, scan rules,
+- [Configuration](docs/CONFIGURATION.md): `reql.conf`, defaults, overrides, scan rules,
   cache settings, document ingest, analysis toggles, and loader behavior.
 - [REQL language](docs/REQL.md): first-class graph commands plus `FIND`,
   `MATCH`, `PATH`, `SEARCH`, `RETRIEVE`, `EXPLAIN`, filters, and examples.
@@ -368,12 +387,11 @@ src/mcp/
 `-- server.py               # stdio and HTTP JSON-RPC MCP transports
 src/memory/
 |-- domain/                 # Pure models, constants, ids, time, exceptions
-|-- ports/                  # Storage and extractor protocols
-|-- infrastructure/         # Concrete adapters
-|   `-- block/              # BlockGraphStore
+|-- storage/                # Storage/extractor protocols and public exports
+|   `-- adapters/           # Concrete adapters, including BlockGraphStore
 |-- extraction/             # Deterministic query/source extraction and optional adapters
 |-- artifacts/              # Project scanning, file classification, fingerprints
-|-- engines/                # Numeric and maintenance engines
+|-- engines/                # Activation and salience scoring
 |   |-- activation.py       # Spreading activation
 |   `-- salience.py         # Salience scoring
 |-- services/               # Application orchestration
@@ -383,7 +401,7 @@ src/memory/
 |-- query/                  # REQL lexer, parser, AST, and evaluator
 |-- analysis/               # Communities, centrality, specificity, hubs, bridges
 |-- reporting/              # Markdown reports
-|-- config/                 # conf.yaml models and loader
+|-- config/                 # internal defaults, project models, and loader
 `-- cli.py                  # Command-line interface
 ```
 
@@ -403,15 +421,21 @@ Main operations:
 - `retrieve(query)`
 - `compose_context(query)`
 - `query_context(query)`
+- `query_context_payload(query)`
 - `query_explore(query)`
 - `query_graph(query)`
 - `query_memories(query)`
 - `query_memories_payload(query)`
+- `locate(path)`
+- `inspect_node(node_id)`
 - `export_json()`
 - `query(statement)`
 - `compile_project(path)`
 - `update_project(path)`
+- `watch_project(path)`
 - `project_status(path)`
+- `project_history(path)`
+- `project_revision(revision_id)`
 - `project_report(path, output_dir=...)`
 - `cache_status(path)`
 - `clear_cache(path)`
@@ -424,7 +448,7 @@ Main operations:
 
 ### New Storage Backend
 
-Implement `memory.ports.graph_store.GraphStore` and pass it to the facade:
+Implement `memory.storage.graph_store.GraphStore` and pass it to the facade:
 
 ```python
 from reql import MemoryGraph

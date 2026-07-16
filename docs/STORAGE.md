@@ -17,11 +17,11 @@ fixed-size block files directly instead of using a database engine.
   graph-neighborhood locality;
 - relationships for dense nodes are written as dedicated dense-edge records so
   a high-degree node does not make its node page expensive to load;
-- schema v2 persists operational indexes in the root index and lazily loads
-  node/edge records by location.
+- schema version 2 persists operational indexes in the root index and lazily
+  loads node/edge records by location.
 
-The superblock is the durable entry point for validation, recovery, and future
-migrations. It records the storage format, manifest version, schema version,
+The superblock is the durable entry point for validation and recovery. It
+records the storage format, manifest version, schema version,
 block size, root index offset, data block count, generation id, and a SHA-256
 checksum for the data region. Opening a manifested file validates the manifest
 checksum first, then validates the data checksum before replaying block records.
@@ -57,10 +57,19 @@ can update usage while the graph is opened read-only, and ranking loads that
 overlay on open without rewriting canonical node or edge records.
 
 Each checkpoint also stores a `root_index` record. It captures record locations,
-canonical node keys, edge patterns, incoming/outgoing adjacency, lexical
-postings, type/status buckets, selected property indexes, counters, and a
-block space map. These indexes are the durable query root for schema v2. Opening
-schema v1 files is intentionally rejected.
+canonical node keys, edge patterns, incoming/outgoing adjacency, type/status
+buckets, selected property indexes, counters, and a block space map. Lexical
+postings live in a separate `lexical_index` record referenced by root-index
+version 3. Query sessions load both records; compile/update sessions defer the
+lexical record and append changed nodes to the WAL, so a small graph delta does
+not pay the full lexical-index startup cost. The deferred session tracks an exact
+old/new lexical overlay: an in-process query applies it before searching, rollback
+restores it transactionally, and an automatic checkpoint loads and folds it into
+the persisted postings once the WAL threshold is reached. Deferral therefore
+does not create stale same-process queries or an indefinitely growing WAL.
+Storage opens require schema version 2 and root-index version 3. A version
+mismatch raises `StorageError`; rebuild the project graph with the current REQL
+version.
 
 The adapter keeps operational indexes available for deterministic graph access:
 
@@ -138,16 +147,43 @@ processes:
   lock timeout;
 - stale same-host lock files from dead processes are removed automatically.
 
+Lock sidecars record the owning command, PID, host, creation time, and whether
+the command is a `--watch` process. Inspect them without opening the graph:
+
+```bash
+reql storage locks
+reql storage locks --json
+reql storage locks --recover-stale
+```
+
+Diagnostics report lock duration and same-host process liveness. Recovery only
+removes a lock when its local PID is no longer alive; an incomplete or malformed
+local lock must also exceed a safety grace period, and a different-host lock is
+never removed automatically.
+
 The default lock timeout is bounded, so a genuinely stuck peer raises
 `StorageError` instead of blocking forever. Locks from a different host are
 treated as active because process liveness cannot be checked portably across
-machines. Read/query CLI commands and read-only MCP tools open the graph
+machines. Read/query CLI commands, including `project status`, `query_context`,
+and non-mutating `query` statements, plus read-only MCP tools open the graph
 read-only directly, so they do not take the writer lock. Query usage signals
 still append to `<store>.usage.jsonl`; that sidecar journal has its own short
 exclusive file lock so concurrent readers do not interleave usage writes.
 `MemoryGraph.open(..., read_only=True)` requires an existing block store or WAL
 payload; it raises `StorageError` instead of returning an empty graph for a
 missing or empty storage path.
+
+When a writer intentionally stays active, a read command can bypass lock
+waiting and open the latest complete on-disk generation plus complete WAL
+frames:
+
+```bash
+reql --snapshot query_context --query "payment service"
+reql --snapshot project status .
+```
+
+Snapshot mode is explicitly read-only and may lag changes still held in the
+writer's in-memory transaction.
 
 ## Transactions
 

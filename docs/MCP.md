@@ -39,7 +39,7 @@ reql-mcp --read-only
 To start MCP tools with a project config and process-level overrides:
 
 ```bash
-reql-mcp --config ./conf.yaml --set project.id=agent-a --read-only
+reql-mcp --config ./reql.conf --set project.id=agent-a --read-only
 ```
 
 To share the MCP server with clients on the same machine over HTTP, bind a
@@ -72,11 +72,12 @@ return bounded JSON payloads and never return the full graph.
   expanded graph nodes, edges, textual sources, filtered generic nodes, and a
   compact rendered context block.
 - `query_context`: retrieves compact structured working-set context with owner
-  targets, targeted reads, snippets, impact, tests, and structured next-step
+  targets, targeted reads, bounded `read_plan` entries, snippets,
+  graph-derived `change_chain` steps, impact, tests, and structured next-step
   commands for JSON clients.
 - `query_explore`: retrieves dependency-oriented slices for coding agents:
-  owners, callers, public surface, serialization paths, docs mentions, and code
-  working-set records.
+  owners, callers, public surface, serialization paths, docs mentions, explicit
+  structural template duplicates, and code working-set records.
 - `query_memories`: retrieves a compact ranked list of relevant memory/source
   texts for clients that do not need graph debugging details.
 - `inspect_node`: resolves a node id from `query_memories`, `query_graph`,
@@ -103,11 +104,11 @@ Default limits are intentionally conservative: `top_k` is capped at 50,
 output rows at 200.
 
 Every MCP tool accepts optional `config_path` and `config_overrides` arguments.
-`config_path` selects a `conf.yaml`; `config_overrides` is an object using
+`config_path` selects a project `reql.conf`; `config_overrides` is an object using
 nested sections or dotted keys. The server process also honors `REQL_CONFIG`
 and `REQL_CONFIG_OVERRIDES`. Tools that receive a project `path` search for
-`conf.yaml` from that path upward when no explicit config is supplied, then
-fall back to the canonical config at the REQL code root.
+`reql.conf` from that path upward when no explicit config is supplied, then
+join it with the protected internal configuration.
 
 ## Codex `config.toml`
 
@@ -133,7 +134,7 @@ Tool calls should pass the storage path explicitly:
 {
   "storage_path": "/absolute/path/to/project/.reql/memory.reql",
   "query": "project compile behavior",
-  "config_path": "/absolute/path/to/Reql/conf.yaml"
+  "config_path": "/absolute/path/to/Reql/reql.conf"
 }
 ```
 
@@ -201,7 +202,7 @@ monitor is responsible for updates.
     "storage_path": ".reql/memory.reql",
     "path": ".",
     "max_iterations": 1,
-    "config_path": "conf.yaml"
+    "config_path": "reql.conf"
   }
 }
 ```
@@ -217,7 +218,7 @@ monitor is responsible for updates.
     "top_k": 12,
     "max_depth": 3,
     "max_items": 12,
-    "config_path": "conf.yaml"
+    "config_path": "reql.conf"
   }
 }
 ```
@@ -234,7 +235,7 @@ relevant memory/source texts:
     "top_k": 12,
     "max_depth": 2,
     "limit": 8,
-    "config_path": "conf.yaml"
+    "config_path": "reql.conf"
   }
 }
 ```
@@ -250,7 +251,8 @@ only cleanup candidates matching the query for dead-code or unused-symbol work.
 
 Use `query_explore` when an agent needs dependency slices before reading source
 files or editing. Pass `views` to reduce output to one or more of `owners`,
-`callers`, `public_surface`, `serialization_paths`, `docs_mentions`, and `code`;
+`callers`, `public_surface`, `serialization_paths`, `docs_mentions`,
+`structural_duplicates`, and `code`;
 the `code` view includes usage guidance, snippets, and targeted reads:
 
 ```json
@@ -260,7 +262,7 @@ the `code` view includes usage guidance, snippets, and targeted reads:
     "storage_path": ".reql/memory.reql",
     "query": "remove stale storage field",
     "views": ["owners", "code"],
-    "config_path": "conf.yaml"
+    "config_path": "reql.conf"
   }
 }
 ```
@@ -273,7 +275,7 @@ the `code` view includes usage guidance, snippets, and targeted reads:
     "query": "how does incremental compilation handle deleted files?",
     "top_k": 12,
     "max_depth": 2,
-    "config_path": "conf.yaml"
+    "config_path": "reql.conf"
   }
 }
 ```

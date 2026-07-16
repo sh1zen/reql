@@ -6,11 +6,3 @@ class REQLError(Exception):
 
 class StorageError(REQLError):
     """Raised when the storage adapter cannot complete an operation."""
-
-
-class ValidationError(REQLError):
-    """Raised when a node, edge or query is invalid."""
-
-
-class NotFoundError(REQLError):
-    """Raised when a requested graph object does not exist."""

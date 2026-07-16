@@ -68,6 +68,12 @@ _VERIFY_FINDING_USAGE_EDGE_TYPES = {
     "IMPLEMENTS",
     "OVERRIDES",
 }
+FIELD_ALIASES = {
+    "line_start": ("line_start", "start_line"),
+    "start_line": ("start_line", "line_start"),
+    "line_end": ("line_end", "end_line"),
+    "end_line": ("end_line", "line_end"),
+}
 DEFAULT_LIST_COLUMNS = {
     "PROJECTS": ["id", "name", "root_path", "status", "updated_at"],
     "ARTIFACTS": ["id", "relative_path", "path", "artifact_type", "language", "status", "size_bytes", "sha256"],
@@ -111,6 +117,9 @@ class QueryEvaluator:
         return self._is_graph_layer_node(self.store.get_node(edge.from_id)) and self._is_graph_layer_node(self.store.get_node(edge.to_id))
 
     def _count_graph_nodes(self, node_types: set[str] | None = None, statuses: set[str] | None = None) -> int:
+        count_nodes = getattr(self.store, "count_nodes", None)
+        if callable(count_nodes):
+            return int(count_nodes(node_types=node_types, statuses=statuses))
         return sum(
             1
             for node in self.store.all_nodes()
@@ -120,6 +129,9 @@ class QueryEvaluator:
         )
 
     def _count_graph_edges(self, edge_types: set[str] | None = None) -> int:
+        count_edges = getattr(self.store, "count_edges", None)
+        if callable(count_edges):
+            return int(count_edges(edge_types=edge_types))
         return sum(
             1
             for edge in self.store.all_edges()
@@ -971,6 +983,7 @@ class QueryEvaluator:
 # ----------------------------------------------------------------------
 def _node_listing_row(node: MemoryNode) -> dict[str, Any]:
     row = dict(node.properties)
+    row.update(_location_payload(node.properties))
     row.update(
         {
             "node": node,
@@ -1100,17 +1113,28 @@ def _resolve_on_object(subject: Any, parts: list[str]) -> Any:
         if isinstance(value, dict):
             if part in value:
                 value = value[part]
+            elif part in FIELD_ALIASES and any(alias in value for alias in FIELD_ALIASES[part]):
+                value = next(value[alias] for alias in FIELD_ALIASES[part] if alias in value)
             elif "properties" in value and isinstance(value["properties"], dict):
-                value = value["properties"].get(part)
+                value = _resolve_property_alias(value["properties"], part)
             else:
                 value = None
         elif hasattr(value, part):
             value = getattr(value, part)
         elif hasattr(value, "properties") and isinstance(value.properties, dict):
-            value = value.properties.get(part)
+            value = _resolve_property_alias(value.properties, part)
         else:
             value = None
     return value
+
+
+def _resolve_property_alias(properties: dict[str, Any], part: str) -> Any:
+    if part in properties:
+        return properties.get(part)
+    for alias in FIELD_ALIASES.get(part, ()):
+        if alias in properties:
+            return properties.get(alias)
+    return None
 
 
 def _compare(actual: Any, operator: str, expected: Any) -> bool:

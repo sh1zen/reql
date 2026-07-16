@@ -4,23 +4,6 @@ from __future__ import annotations
 from dataclasses import dataclass, fields
 from typing import Any, Mapping, get_args, get_origin, get_type_hints
 
-DEFAULT_DOCUMENT_POLICIES: list[dict[str, Any]] = [
-    {"format": "markdown", "extensions": [".md", ".markdown"], "ingest": True},
-    {"format": "plain_text", "extensions": [".txt"], "filenames": ["LICENSE", "NOTICE"], "ingest": True},
-    {"format": "restructured_text", "extensions": [".rst"], "ingest": True},
-    {"format": "html", "extensions": [".html", ".htm"], "ingest": True},
-    {"format": "log", "extensions": [".log"], "ingest": True},
-    {"format": "pdf", "extensions": [".pdf"], "ingest": True},
-    {"format": "json", "extensions": [".json"], "ingest": True},
-    {"format": "toml", "extensions": [".toml"], "ingest": True},
-    {"format": "yaml", "extensions": [".yaml", ".yml"], "ingest": True},
-    {"format": "ini", "extensions": [".ini", ".cfg", ".conf"], "ingest": True},
-    {"format": "csv", "extensions": [".csv"], "ingest": True},
-    {"format": "tsv", "extensions": [".tsv"], "ingest": True},
-    {"format": "xml", "extensions": [".xml"], "ingest": True},
-    {"format": "ndjson", "extensions": [".ndjson"], "ingest": True},
-]
-
 
 @dataclass(frozen=True, slots=True)
 class ProjectConfig:
@@ -33,6 +16,8 @@ class ProjectConfig:
 @dataclass(frozen=True, slots=True)
 class ScanConfig:
     max_file_size_mb: float
+    use_gitignore: bool
+    ignore_defaults: bool
     include: list[str]
     exclude: list[str]
 
@@ -43,6 +28,8 @@ class ScanConfig:
     def to_dict(self) -> dict[str, Any]:
         return {
             "max_file_size_mb": self.max_file_size_mb,
+            "use_gitignore": self.use_gitignore,
+            "ignore_defaults": self.ignore_defaults,
             "include": list(self.include),
             "exclude": list(self.exclude),
         }
@@ -51,12 +38,17 @@ class ScanConfig:
 @dataclass(frozen=True, slots=True)
 class CompileConfig:
     ingest_documents: bool
-    documents: list[dict[str, Any]]
+    documents: dict[str, bool]
+    document_formats: dict[str, dict[str, list[str]]]
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "ingest_documents": self.ingest_documents,
-            "documents": [dict(item) for item in self.documents],
+            "documents": dict(self.documents),
+            "document_formats": {
+                format_name: {key: list(values) for key, values in definition.items()}
+                for format_name, definition in self.document_formats.items()
+            },
         }
 
 
@@ -120,11 +112,7 @@ class REQLConfig:
         }
 
     def with_overrides(self, overrides: Mapping[str, Any] | None = None, **kwargs: Any) -> "REQLConfig":
-        merged: dict[str, Any] = {}
-        if overrides:
-            merged.update(overrides)
-        merged.update(kwargs)
-        return merge_config(self, merged)
+        return merge_config(self, {**(overrides or {}), **kwargs})
 
 
 SECTION_TYPES = {
@@ -137,19 +125,8 @@ SECTION_TYPES = {
     "diagnostics": DiagnosticsConfig,
 }
 
-DEFAULT_CONFIG_DATA: dict[str, dict[str, Any]] = {
-    "project": {"id": "default"},
-    "scan": {"max_file_size_mb": 10.0, "include": [], "exclude": []},
-    "compile": {"ingest_documents": True, "documents": [dict(item) for item in DEFAULT_DOCUMENT_POLICIES]},
-    "cache": {"enabled": True, "fingerprint_strategy": "sha256"},
-    "analysis": {"enable_hubs": True, "enable_communities": True},
-    "reporting": {"output_dir": "reports"},
-    "diagnostics": {"enabled": False, "path": ""},
-}
-
-
 def merge_config(config: REQLConfig, overrides: Mapping[str, Any]) -> REQLConfig:
-    """Return a config copy with dotted-key or nested override values applied."""
+    """Apply scalar/list replacements except for protected scan-list joins."""
 
     nested: dict[str, dict[str, Any]] = {}
     for key, value in overrides.items():
@@ -167,11 +144,41 @@ def merge_config(config: REQLConfig, overrides: Mapping[str, Any]) -> REQLConfig
     for section, values in nested.items():
         if section not in SECTION_TYPES:
             raise ValueError(f"Unknown config section: {section}")
+        scan_ignore_defaults = False
+        if section == "scan":
+            scan_ignore_defaults = bool(values.get("ignore_defaults", current[section].get("ignore_defaults", False)))
+            if scan_ignore_defaults:
+                current[section]["include"] = []
+                current[section]["exclude"] = []
         for option, value in values.items():
             if option not in current[section]:
                 raise ValueError(f"Unknown config option: {section}.{option}")
-            current[section][option] = value
+            current_value = current[section][option]
+            if section == "compile" and option == "documents" and isinstance(value, Mapping):
+                merged_mapping = dict(current_value) if isinstance(current_value, Mapping) else {}
+                merged_mapping.update(_coerce_document_toggles(value))
+                current[section][option] = merged_mapping
+            elif section == "compile" and option == "document_formats" and isinstance(value, Mapping):
+                merged_mapping = dict(current_value) if isinstance(current_value, Mapping) else {}
+                merged_mapping.update(_coerce_document_formats(value))
+                current[section][option] = merged_mapping
+            elif isinstance(current_value, list) and isinstance(value, list):
+                current[section][option] = (
+                    list(value)
+                    if section == "scan" and option in {"include", "exclude"} and scan_ignore_defaults
+                    else _join_config_lists(current_value, value)
+                )
+            else:
+                current[section][option] = value
     return config_from_mapping(current)
+
+
+def _join_config_lists(current: list[Any], additions: list[Any]) -> list[Any]:
+    joined = list(current)
+    for item in additions:
+        if item not in joined:
+            joined.append(item)
+    return joined
 
 
 def config_from_mapping(data: Mapping[str, Any]) -> REQLConfig:
@@ -213,13 +220,11 @@ def _section(cls: type[Any], raw: object, section_name: str) -> Any:
     unknown = set(raw_values) - option_names
     if unknown:
         raise ValueError(f"Unknown config option(s) in [{section_name}]: {', '.join(sorted(unknown))}")
-    default_values = dict(DEFAULT_CONFIG_DATA.get(section_name, {}))
-    missing = option_names - set(raw_values) - set(default_values)
+    missing = option_names - set(raw_values)
     if missing:
         raise ValueError(f"Missing config option(s) in [{section_name}]: {', '.join(sorted(missing))}")
-    merged_values = {**default_values, **raw_values}
     values: dict[str, Any] = {}
-    for key, value in merged_values.items():
+    for key, value in raw_values.items():
         values[key] = _coerce_value(section_name, key, value, hints[key])
     return cls(**values)
 
@@ -245,50 +250,65 @@ def _coerce_value(section: str, key: str, value: Any, expected_type: Any) -> Any
             raise ValueError(f"Config option {section}.{key} must be a list of strings")
         return list(value)
     if section == "compile" and key == "documents":
-        return _coerce_document_policies(value)
+        return _coerce_document_toggles(value)
+    if section == "compile" and key == "document_formats":
+        return _coerce_document_formats(value)
     return value
 
 
-def _coerce_document_policies(value: Any) -> list[dict[str, Any]]:
-    if not isinstance(value, list):
-        raise ValueError("Config option compile.documents must be a list")
-    policies: list[dict[str, Any]] = []
-    seen: set[str] = set()
-    for index, item in enumerate(value, start=1):
-        if not isinstance(item, Mapping):
-            raise ValueError(f"Config option compile.documents[{index}] must be an object")
-        unknown = set(item) - {"format", "extensions", "filenames", "ingest"}
-        if unknown:
-            raise ValueError(f"Unknown compile.documents[{index}] option(s): {', '.join(sorted(unknown))}")
-        format_name = str(item.get("format") or "").strip().casefold()
+def _coerce_document_toggles(value: Any) -> dict[str, bool]:
+    if not isinstance(value, Mapping):
+        raise ValueError("Config option compile.documents must be a format-to-boolean mapping")
+    toggles: dict[str, bool] = {}
+    for raw_format, enabled in value.items():
+        format_name = str(raw_format).strip().casefold()
         if not format_name:
-            raise ValueError(f"Config option compile.documents[{index}].format must not be empty")
-        if format_name in seen:
-            raise ValueError(f"Duplicate compile.documents format: {format_name}")
+            raise ValueError("Config option compile.documents format names must not be empty")
+        if not isinstance(enabled, bool):
+            raise ValueError(f"Config option compile.documents.{format_name} must be a boolean")
+        toggles[format_name] = enabled
+    return toggles
+
+
+def _coerce_document_formats(value: Any) -> dict[str, dict[str, list[str]]]:
+    if not isinstance(value, Mapping):
+        raise ValueError("Config option compile.document_formats must be a mapping")
+    formats: dict[str, dict[str, list[str]]] = {}
+    for raw_format, item in value.items():
+        format_name = str(raw_format).strip().casefold()
+        if not format_name:
+            raise ValueError("Config option compile.document_formats format names must not be empty")
+        if not isinstance(item, Mapping):
+            raise ValueError(f"Config option compile.document_formats.{format_name} must be an object")
+        unknown = set(item) - {"extensions", "filenames"}
+        if unknown:
+            raise ValueError(
+                f"Unknown compile.document_formats.{format_name} option(s): {', '.join(sorted(unknown))}"
+            )
         extensions = item.get("extensions", [])
         filenames = item.get("filenames", [])
         if not isinstance(extensions, list) or not all(isinstance(value, str) for value in extensions):
-            raise ValueError(f"Config option compile.documents[{index}].extensions must be a list of strings")
+            raise ValueError(f"Config option compile.document_formats.{format_name}.extensions must be a list of strings")
         if not isinstance(filenames, list) or not all(isinstance(value, str) for value in filenames):
-            raise ValueError(f"Config option compile.documents[{index}].filenames must be a list of strings")
+            raise ValueError(f"Config option compile.document_formats.{format_name}.filenames must be a list of strings")
         normalized_extensions = []
         for extension in extensions:
             normalized = extension.strip().casefold()
             if not normalized.startswith("."):
-                raise ValueError(f"Config option compile.documents[{index}].extensions values must start with '.'")
+                raise ValueError(
+                    f"Config option compile.document_formats.{format_name}.extensions values must start with '.'"
+                )
             normalized_extensions.append(normalized)
         normalized_filenames = [filename.strip() for filename in filenames if filename.strip()]
         if not normalized_extensions and not normalized_filenames:
-            raise ValueError(f"Config option compile.documents[{index}] must define extensions or filenames")
-        ingest = item.get("ingest", True)
-        if not isinstance(ingest, bool):
-            raise ValueError(f"Config option compile.documents[{index}].ingest must be a boolean")
-        policy = {"format": format_name, "extensions": normalized_extensions, "ingest": ingest}
-        if normalized_filenames:
-            policy["filenames"] = normalized_filenames
-        policies.append(policy)
-        seen.add(format_name)
-    return policies
+            raise ValueError(
+                f"Config option compile.document_formats.{format_name} must define extensions or filenames"
+            )
+        formats[format_name] = {
+            "extensions": normalized_extensions,
+            "filenames": normalized_filenames,
+        }
+    return formats
 
 
 def _validate(config: REQLConfig) -> None:
@@ -298,5 +318,10 @@ def _validate(config: REQLConfig) -> None:
         raise ValueError("Config option scan.max_file_size_mb must be greater than zero")
     if config.cache.fingerprint_strategy != "sha256":
         raise ValueError("Only cache.fingerprint_strategy = \"sha256\" is currently supported")
+    unknown_document_formats = set(config.compile.documents) - set(config.compile.document_formats)
+    if unknown_document_formats:
+        raise ValueError(
+            "Unknown compile.documents format(s): " + ", ".join(sorted(unknown_document_formats))
+        )
     if config.diagnostics.enabled and not config.diagnostics.path.strip():
         raise ValueError("Config option diagnostics.path must not be empty when diagnostics.enabled is true")

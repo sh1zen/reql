@@ -1,14 +1,15 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from api import MemoryGraph
+from tests.config_helpers import open_graph_with_documents as _open_graph_with_documents
 import memory.services.incremental_compilation as incremental_compilation
-from memory.artifacts.cache import artifact_cache_path
+from memory.artifacts.cache import DiskArtifactCache, artifact_cache_path
 from memory.artifacts.compiler import ArtifactCompiler
 from memory.artifacts.models import SourceArtifact
 from memory.domain.timeutils import utcnow_iso
@@ -75,7 +76,7 @@ class IncrementalCompilationTests(unittest.TestCase):
         self.db = Path(self.tmp.name) / "memory.reql"
         (self.root / "a.py").write_text("print('a')\n", encoding="utf-8")
         (self.root / "README.md").write_text("# Title\n\nBody\n", encoding="utf-8")
-        self.graph = MemoryGraph.open(self.db)
+        self.graph = _open_graph_with_documents(self.db)
 
     def tearDown(self) -> None:
         self.graph.close()
@@ -96,6 +97,52 @@ class IncrementalCompilationTests(unittest.TestCase):
         self.assertGreaterEqual(len(self._nodes("SourceFragment")), 2)
         self.assertEqual(payload["format"], "reql-artifact-cache-v1")
         self.assertEqual(set(project_cache["entries"]), {artifact.id for artifact in result.scan.artifacts})
+
+    def test_compile_records_content_addressed_revision_chain_and_file_changes(self) -> None:
+        first = self.graph.compile_project(self.root)
+
+        self.assertIsNotNone(first.revision)
+        assert first.revision is not None
+        self.assertEqual(first.revision.sequence, 1)
+        self.assertIsNone(first.revision.parent_id)
+        self.assertEqual({change.path: change.status for change in first.revision.changes}, {"README.md": "added", "a.py": "added"})
+
+        no_op = self.graph.compile_project(self.root)
+        self.assertIsNone(no_op.revision)
+        self.assertEqual(len(self.graph.project_history(self.root)), 1)
+
+        (self.root / "a.py").write_text("print('changed')\n", encoding="utf-8")
+        (self.root / "README.md").unlink()
+        (self.root / "b.py").write_text("VALUE = 2\n", encoding="utf-8")
+        second = self.graph.compile_project(self.root)
+
+        self.assertIsNotNone(second.revision)
+        assert second.revision is not None
+        self.assertEqual(second.revision.sequence, 2)
+        self.assertEqual(second.revision.parent_id, first.revision.id)
+        self.assertEqual(
+            {change.path: change.status for change in second.revision.changes},
+            {"README.md": "deleted", "a.py": "modified", "b.py": "added"},
+        )
+        self.assertNotEqual(second.revision.tree_hash, first.revision.tree_hash)
+        self.assertEqual([item.id for item in self.graph.project_history(self.root)], [second.revision.id, first.revision.id])
+
+    def test_code_context_omits_automatic_revision_section(self) -> None:
+        self.graph.compile_project(self.root)
+
+        context = self.graph.query_context("print a", scopes=["code"])
+        payload = self.graph.query_context_payload("print a", scopes=["code"])
+
+        self.assertNotIn("## Recent changes", context)
+        self.assertNotIn("recent_changes", payload)
+
+    def test_compile_flushes_disk_cache_once_per_batch(self) -> None:
+        original_write = DiskArtifactCache._write
+        with patch.object(DiskArtifactCache, "_write", autospec=True, side_effect=original_write) as write:
+            result = self.graph.compile_project(self.root)
+
+        self.assertEqual(result.run.files_changed, 2)
+        self.assertEqual(write.call_count, 1)
 
     def test_disk_cache_is_used_when_graph_cache_nodes_are_missing(self) -> None:
         self.graph.compile_project(self.root)
@@ -174,6 +221,25 @@ class IncrementalCompilationTests(unittest.TestCase):
         self.assertEqual(result.run.files_skipped, 2)
         self.assertEqual(result.run.nodes_created, 0)
         self.assertEqual(result.run.edges_created, 0)
+
+    def test_large_project_detects_same_size_change_with_restored_mtime(self) -> None:
+        large_payload = "VALUE = 1\n" + ("x" * 16384)
+        paths = [self.root / f"large_{index}.py" for index in range(12)]
+        for path in paths:
+            path.write_text(large_payload, encoding="utf-8")
+        self.graph.compile_project(self.root)
+
+        unchanged = self.graph.compile_project(self.root)
+        self.assertEqual(unchanged.run.files_changed, 0)
+
+        original_stat = paths[5].stat()
+        changed_payload = "VALUE = 2\n" + ("x" * 16384)
+        self.assertEqual(len(changed_payload), len(large_payload))
+        paths[5].write_text(changed_payload, encoding="utf-8")
+        os.utime(paths[5], ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+        changed = self.graph.compile_project(self.root)
+
+        self.assertEqual(changed.run.files_changed, 1)
 
     def test_compile_detects_deleted_artifact_when_cache_is_missing(self) -> None:
         first = self.graph.compile_project(self.root)
@@ -344,6 +410,38 @@ class IncrementalCompilationTests(unittest.TestCase):
         self.assertIn(".reql", skipped_paths)
         self.assertIn("__pycache__", skipped_paths)
 
+    def test_compile_and_cache_status_can_apply_root_gitignore(self) -> None:
+        (self.root / ".gitignore").write_text("ignored.py\n!keep.py\n!.cache/\n", encoding="utf-8")
+        (self.root / "ignored.py").write_text("ignored = True\n", encoding="utf-8")
+        (self.root / "keep.py").write_text("kept = True\n", encoding="utf-8")
+        (self.root / ".cache").mkdir()
+        (self.root / ".cache" / "protected.py").write_text("protected = True\n", encoding="utf-8")
+        parsing_options = {"scan": {"use_gitignore": True}}
+
+        result = self.graph.compile_project(self.root, parsing_options=parsing_options)
+        relative_paths = {artifact.relative_path for artifact in result.scan.artifacts}
+        skipped_paths = {item.relative_path for item in result.scan.skipped_files}
+        status = self.graph.cache_status(self.root, parsing_options=parsing_options)
+
+        self.assertNotIn("ignored.py", relative_paths)
+        self.assertIn("ignored.py", skipped_paths)
+        self.assertIn("keep.py", relative_paths)
+        self.assertNotIn(".cache/protected.py", relative_paths)
+        self.assertIn(".cache", skipped_paths)
+        self.assertEqual(status["total_artifacts"], len(result.scan.artifacts))
+
+    def test_scan_ignore_defaults_disables_internal_ignore_matcher(self) -> None:
+        (self.root / ".cache").mkdir()
+        (self.root / ".cache" / "included.py").write_text("included = True\n", encoding="utf-8")
+
+        result = self.graph.compile_project(
+            self.root,
+            parsing_options={"scan": {"ignore_defaults": True}},
+        )
+        relative_paths = {artifact.relative_path for artifact in result.scan.artifacts}
+
+        self.assertIn(".cache/included.py", relative_paths)
+
     def test_cache_status_applies_default_ignores(self) -> None:
         (self.root / ".git" / "objects" / "ab").mkdir(parents=True)
         (self.root / ".git" / "objects" / "ab" / "packed").write_bytes(b"git object")
@@ -397,6 +495,8 @@ class IncrementalCompilationTests(unittest.TestCase):
 
         self.assertEqual(result.run.status, "failed")
         self.assertTrue(result.run.errors)
+        self.assertIsNone(result.revision)
+        self.assertEqual(len(self.graph.project_history(self.root)), 1)
         self.assertIsNotNone(new_cache)
         assert new_cache is not None
         self.assertEqual(new_cache.properties["sha256"], old_cache.properties["sha256"])

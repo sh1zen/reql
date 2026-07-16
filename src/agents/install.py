@@ -850,7 +850,7 @@ def _python_hook_command(platform_name: str) -> str:
     encoded = json.dumps(payload, separators=(",", ":"))
     return (
         "python -c \"import json,pathlib,sys;"
-        "e=pathlib.Path('.reql/memory.reql').exists() or pathlib.Path('conf.yaml').exists();"
+        "e=pathlib.Path('.reql/memory.reql').exists() or pathlib.Path('reql.conf').exists();"
         f"sys.stdout.write({encoded!r} if e else '')\""
     )
 

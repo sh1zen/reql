@@ -4,9 +4,12 @@ Incremental compilation is project `compile` mode. It builds a deterministic
 technical graph for programming agents from compile-time scanning plus AST/static
 analysis.
 
-The scanner first runs read-only. The compiler compares fingerprints and
-project-local cache entries before graph writes, then registers only
-changed/deleted artifact deltas so unchanged project metadata is not rewritten.
+The scanner first runs read-only. It hashes the full content of every candidate
+file in a bounded worker pool and verifies that size and nanosecond modification
+time remain stable across each read. Unstable files are retried and then reported
+as scan errors rather than indexed from a mixed snapshot. The compiler compares fingerprints and
+project-local cache entries before graph writes, then registers only changed or
+deleted artifact deltas so unchanged project metadata is not rewritten.
 The primary cache lives on disk at `<project>/.reql/artifact-cache.json`.
 If a project was already compiled but its disk cache or `ArtifactCacheEntry`
 nodes are missing, `project compile` recovers cache entries from active compiled
@@ -15,20 +18,27 @@ recompiling every file from zero.
 The optimization path preserves deterministic graph output: for the same input
 and options, the same relevant node types, edge types, properties, provenance,
 confidence values, cache records, and `GraphDelta` shape are emitted. Runtime
-improvements come from lower-cost storage transactions, batched upserts, cache
+improvements come from parallel content hashing, lower-cost storage transactions, batched upserts, cache
 planning maps, set-backed delta aggregation, scoped context-scope metadata
 refresh, and scoped document-code linking.
+
+Document classification recognizes `readme.txt`, changelog and FAQ files,
+WordPress Plugin Directory readme structure, and extensionless files with
+Markdown headings, underlines, lists, or fenced blocks. WordPress headings such
+as `=== Plugin ===` and `== Description ==` are compiled as document sections,
+so their fragments participate in `query_context --docs`.
 
 ## Flow
 
 ```text
 project compile PATH
 project update PATH
-  -> scan project read-only
+  -> scan project read-only and hash candidate content
+  -> open and validate the current graph storage
   -> compare artifacts with .reql/artifact-cache.json entries
   -> recover missing cache entries from already compiled SourceArtifact records
   -> register Project, Directory, File, and SourceArtifact deltas for dirty files
-  -> refresh context-scope metadata for dirty files, or one-time legacy backfill
+  -> refresh context-scope metadata for dirty files or records missing that metadata
   -> compile changed supported code artifacts into technical graph nodes
   -> compile changed text document fragments structurally
   -> link document fragments to code symbols
@@ -40,15 +50,31 @@ project update PATH
 `project update` and the public `update_project()` API use the same incremental
 compile pipeline. They do not maintain a separate update path.
 
+One-shot CLI compile/update commands always open and validate `memory.reql`, and
+always record their `CompilationRun` and `GraphDelta`, including clean runs. The
+disk cache is a compilation planner, not an integrity shortcut. The writable storage open defers
+the separate lexical-postings record and loads only the structural indexes used
+by compilation. Deferred lexical changes are retained as an in-memory overlay,
+applied before any lexical query, persisted through the WAL, and folded into a
+checkpoint when the WAL threshold is reached.
+For the lowest repeated latency during active editing, keep one watch process
+running so the structural storage also remains open between changes.
+
+With the current format, updating one or a few files is bounded by the structural delta
+instead of the total number of lexical postings in the project graph.
+No graph node, edge, property, provenance field, or supported source/document
+format is omitted to obtain this bound; the optimization changes index maintenance,
+not the expressive model compiled from the project.
+
 Watch mode wraps the same flow:
 
 ```text
 project compile PATH --watch
   -> start a recursive Python watchdog observer
-  -> run one initial cache check/compile for existing dirty artifacts
+  -> run one initial verified compile
   -> wait for filesystem events
   -> wait for debounce when file changes are detected
-  -> run project compile PATH only when graph updates are needed
+  -> run one scan-and-compile cycle (without a separate status scan)
   -> repeat until interrupted or --watch-iterations is reached
 ```
 

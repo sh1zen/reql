@@ -4,7 +4,9 @@ from __future__ import annotations
 from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
+from functools import lru_cache
 from pathlib import Path
+import re
 from typing import Any, Sequence
 
 from ..diagnostics import PerformanceLogger
@@ -83,6 +85,7 @@ CODE_CONTEXT_EDGE_TYPES = {
     "IMPORTS_FROM",
     "INHERITS",
     "INSTANTIATES",
+    "OVERRIDES",
     "METHOD",
     "RAISES",
     "READS",
@@ -90,12 +93,14 @@ CODE_CONTEXT_EDGE_TYPES = {
     "RE_EXPORTS",
     "RETURNS",
     "WRITES",
+    "WRAPS",
 }
 DEFAULT_CONTEXT_EDGE_TYPES = SEMANTIC_EDGE_TYPES | CODE_CONTEXT_EDGE_TYPES
 SOURCE_NODE_TYPES = {"SourceFragment", "DocumentFragment"}
 SOURCE_EDGE_TYPES = {"EVIDENCED_BY", "DERIVED_FROM", "SUPPORTED_BY", "CONTAINS_FRAGMENT", "HAS_SECTION", "HAS_DOCSTRING", "HAS_COMMENT"}
-QUERY_EXPLORE_VIEWS = {"owners", "callers", "public_surface", "serialization_paths", "docs_mentions", "code"}
+QUERY_EXPLORE_VIEWS = {"owners", "callers", "public_surface", "serialization_paths", "docs_mentions", "structural_duplicates", "code"}
 QUERY_EXPLORE_DEFAULT_VIEWS = ("owners", "callers", "public_surface", "serialization_paths", "docs_mentions", "code")
+QUERY_EXPLORE_ALL_VIEWS = (*QUERY_EXPLORE_DEFAULT_VIEWS[:-1], "structural_duplicates", "code")
 QUERY_EXPLORE_EDGE_TYPES = CODE_CONTEXT_EDGE_TYPES | SOURCE_EDGE_TYPES | {"DECORATED_BY", "HAS_CODE_BLOCK", "HAS_COMMENT", "HAS_DOCSTRING", "TESTS"}
 OWNER_EDGE_TYPES = {"CONTAINS", "DEFINES", "EVIDENCED_BY", "HAS_FINDING", "METHOD"}
 CALLER_EDGE_TYPES = {"CALLS", "INSTANTIATES"}
@@ -103,6 +108,51 @@ PUBLIC_SURFACE_EDGE_TYPES = {"HANDLES_ROUTE", "IMPLEMENTS", "IMPORTS", "IMPORTS_
 SERIALIZATION_EDGE_TYPES = {"READS", "WRITES", "RETURNS", "RAISES", "REFERENCES", "EVIDENCED_BY", "DEPENDS_ON", "IMPORTS_FROM"}
 QUERY_CONTEXT_MODES = {"informative", "cleanup"}
 QUERY_CONTEXT_SCOPES = {"code", "docs", "test"}
+STRUCTURED_SEARCH_FIELDS = (
+    "name",
+    "qualified_name",
+    "symbol_name",
+    "module",
+    "target",
+    "relative_path",
+    "source_file",
+    "language",
+    "kind",
+    "args",
+    "bases",
+    "returns",
+    "semantic_roles",
+    "wrapper_targets",
+    "overrides",
+    "re_exports",
+)
+CODE_CONTEXT_GENERIC_QUERY_TOKENS = {
+    "agent",
+    "base",
+    "bug",
+    "change",
+    "changes",
+    "code",
+    "context",
+    "edit",
+    "edits",
+    "fix",
+    "fixes",
+    "function",
+    "functions",
+    "implementation",
+    "implement",
+    "issue",
+    "logic",
+    "noise",
+    "problem",
+    "query",
+    "request",
+    "task",
+    "unrelated",
+    "workflow",
+}
+_CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 
 
 @dataclass(slots=True)
@@ -126,6 +176,53 @@ class _PathCandidate:
     seed_score: float
     depth_penalty: float
     edge_ids: list[str] = field(default_factory=list)
+
+
+@lru_cache(maxsize=32768)
+def _expanded_tokens(value: str) -> tuple[str, ...]:
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for candidate in (value, _identifier_expanded_text(value)):
+        for token in tokenize(candidate):
+            for variant in _token_variants(token):
+                if variant not in seen:
+                    seen.add(variant)
+                    tokens.append(variant)
+    return tuple(tokens)
+
+
+def _code_context_query_tokens(value: str) -> set[str]:
+    tokens = set(_expanded_tokens(value))
+    filtered = {token for token in tokens if token not in CODE_CONTEXT_GENERIC_QUERY_TOKENS}
+    return filtered or tokens
+
+
+def _identifier_expanded_text(value: str) -> str:
+    separated = str(value).replace("\\", " ").replace("/", " ").replace(".", " ")
+    separated = separated.replace("_", " ").replace("-", " ").replace(":", " ")
+    return _CAMEL_BOUNDARY_RE.sub(" ", separated)
+
+
+def _token_variants(token: str) -> tuple[str, ...]:
+    variants = [token]
+    singular = _singular_token(token)
+    if singular and singular != token:
+        variants.append(singular)
+    return tuple(variants)
+
+
+def _singular_token(token: str) -> str | None:
+    if len(token) <= 3:
+        return None
+    if token.endswith("ies") and len(token) > 4:
+        return f"{token[:-3]}y"
+    if token.endswith("sses"):
+        return None
+    if token.endswith("ses") and len(token) > 4:
+        return token[:-2]
+    if token.endswith("s") and not token.endswith("ss"):
+        return token[:-1]
+    return None
 
 
 class RetrievalEngine:
@@ -364,12 +461,153 @@ class RetrievalEngine:
         query_mode = self._normalize_query_context_mode(query_mode)
         scopes = self._normalize_query_context_scopes(query_scopes)
         subgraph = self._filter_query_context_subgraph(subgraph, scopes)
-        if self._should_render_code_context(subgraph, max_items=max_items):
+        explicit_code_scope = bool(scopes and scopes <= {"code", "test"})
+        if explicit_code_scope or self._should_render_code_context(subgraph, max_items=max_items):
             payload = self._code_agent_context_payload(subgraph, query_mode=query_mode, max_items=max_items, include_risky=include_risky)
         else:
             payload = self._general_agent_context_payload(subgraph, query_mode=query_mode, max_items=max_items, include_risky=include_risky)
         payload["scopes"] = sorted(scopes)
+        if query_mode == "informative" and not scopes:
+            related_files = self._related_file_payload(subgraph, max_items=max_items)
+            payload["related_files"] = related_files
+            if related_files:
+                payload["counts"]["related_files"] = len(related_files)
         return payload
+
+    def _related_file_payload(self, subgraph: MemorySubgraph, *, max_items: int) -> list[dict[str, Any]]:
+        """Correlate documentation, implementation, and translation files deterministically."""
+        profile = self._query_profile(subgraph.query.text)
+        if not profile.informative_tokens:
+            return []
+
+        candidates: dict[str, MemoryNode] = {node.id: node for node in subgraph.nodes}
+        for node, _score in self.store.lexical_search(
+            subgraph.query.text,
+            top_k=max(max_items * 8, 40),
+            include_archived=subgraph.query.include_archived,
+        ):
+            candidates[node.id] = node
+
+        project_ids = {
+            str(node.properties.get("project_id"))
+            for node in candidates.values()
+            if node.properties.get("project_id") and self._node_query_token_overlap_tokens(node, profile.informative_tokens)
+        }
+        grouped: dict[tuple[str | None, str], list[tuple[MemoryNode, set[str]]]] = {}
+        for node in candidates.values():
+            if node.type in TECHNICAL_NODE_TYPES or node.status in INACTIVE_STATUSES:
+                continue
+            node_project_id = node.properties.get("project_id")
+            if project_ids and node_project_id not in project_ids:
+                continue
+            path = self._node_relative_path(node)
+            if not path or self._related_file_role(node, path) not in {"documentation", "implementation"}:
+                continue
+            overlap = self._node_query_token_overlap_tokens(node, profile.informative_tokens)
+            if not overlap:
+                continue
+            project_id = str(node_project_id) if node_project_id is not None else None
+            grouped.setdefault((project_id, path), []).append((node, overlap))
+
+        rows: list[dict[str, Any]] = []
+        for (project_id, path), matches in grouped.items():
+            role = self._related_file_role(matches[0][0], path)
+            best_node, best_overlap = max(
+                matches,
+                key=lambda item: (
+                    len(item[1]),
+                    self._line_span(item[0])[0] is not None,
+                    item[0].type in SOURCE_NODE_TYPES,
+                    item[0].salience,
+                ),
+            )
+            line_start, line_end = self._line_span(best_node)
+            rows.append(
+                {
+                    "action": "open" if role == "documentation" else "review",
+                    "role": role,
+                    "project_id": project_id,
+                    "path": path,
+                    "line_start": line_start,
+                    "line_end": line_end,
+                    "matched_terms": sorted(best_overlap),
+                    "node_ids": sorted({node.id for node, _overlap in matches})[:4],
+                    "reason": "FAQ documentation match" if role == "documentation" else "the same query terms appear in application code",
+                }
+            )
+
+        correlated_terms: dict[str | None, set[str]] = {}
+        for project_id in {row["project_id"] for row in rows}:
+            docs_terms = set().union(
+                *(set(row["matched_terms"]) for row in rows if row["project_id"] == project_id and row["role"] == "documentation")
+            )
+            code_terms = set().union(
+                *(set(row["matched_terms"]) for row in rows if row["project_id"] == project_id and row["role"] == "implementation")
+            )
+            shared = docs_terms & code_terms
+            if shared:
+                correlated_terms[project_id] = shared
+        if not correlated_terms:
+            return []
+        rows = [
+            row
+            for row in rows
+            if row["project_id"] in correlated_terms and set(row["matched_terms"]) & correlated_terms[row["project_id"]]
+        ]
+        for row in rows:
+            if "faq" in correlated_terms[row["project_id"]]:
+                row["reason"] = "FAQ documentation match" if row["role"] == "documentation" else "the same FAQ terms appear in application code"
+
+        translation_rows: list[dict[str, Any]] = []
+        for project_id in sorted(value for value in correlated_terms if value is not None):
+            artifacts = self.store.find_nodes_by_property(
+                "project_id",
+                project_id,
+                type_="SourceArtifact",
+                limit=10000,
+                clone=False,
+            )
+            for artifact in artifacts:
+                if artifact.status in INACTIVE_STATUSES:
+                    continue
+                path = self._node_relative_path(artifact)
+                if not path or self._related_file_role(artifact, path) != "translation_catalog":
+                    continue
+                translation_rows.append(
+                    {
+                        "action": "update",
+                        "role": "translation_catalog",
+                        "project_id": project_id,
+                        "path": path,
+                        "line_start": None,
+                        "line_end": None,
+                        "matched_terms": sorted(correlated_terms[project_id]),
+                        "node_ids": [artifact.id],
+                        "reason": "translation catalog for the same project; synchronize translatable strings after code changes",
+                    }
+                )
+
+        role_order = {"documentation": 0, "implementation": 1, "translation_catalog": 2}
+        rows.extend(translation_rows)
+        rows.sort(key=lambda row: (role_order.get(str(row["role"]), 9), str(row["path"]).casefold()))
+        selected = rows[: min(max_items, 8)]
+        for row in selected:
+            row.pop("project_id", None)
+        return selected
+
+    @staticmethod
+    def _related_file_role(node: MemoryNode, path: str) -> str | None:
+        normalized = path.replace("\\", "/").casefold()
+        suffix = Path(normalized).suffix
+        if suffix in {".pot", ".po"}:
+            return "translation_catalog"
+        scope = str(node.properties.get("context_scope") or "").casefold()
+        if scope in {"code", "test"} or suffix in {".php", ".py", ".js", ".ts", ".java", ".rb", ".go", ".rs", ".cs"}:
+            return "implementation"
+        name = normalized.rsplit("/", 1)[-1]
+        if scope == "docs" or name.startswith(("readme", "changelog")) or suffix in {".md", ".rst", ".txt"}:
+            return "documentation"
+        return None
 
     def _general_agent_context_payload(
         self,
@@ -416,7 +654,7 @@ class RetrievalEngine:
         limit = min(max_items, 20)
         selected: list[RankedNode] = []
         seen: set[str] = set()
-        query_tokens = set(tokenize(subgraph.query.text))
+        query_tokens = set(_expanded_tokens(subgraph.query.text))
         deferred_sources: list[RankedNode] = []
         deferred_indirect: list[RankedNode] = []
         for item in subgraph.ranked_nodes:
@@ -428,7 +666,7 @@ class RetrievalEngine:
                 deferred_indirect.append(item)
                 continue
             searchable = " ".join(part for part in (node.label, node.text, node.canonical_key) if part)
-            has_query_token = bool(query_tokens & set(tokenize(searchable)))
+            has_query_token = bool(query_tokens & set(_expanded_tokens(searchable)))
             if query_tokens and not has_query_token and float(item.reasons.get("match_score", 0.0) or 0.0) <= 0.0:
                 deferred_indirect.append(item)
                 continue
@@ -674,10 +912,20 @@ class RetrievalEngine:
             sections["serialization_paths"] = self._query_explore_serialization_paths(query, seed_ids, nodes, incident_edges, limit=limit)
         if "docs_mentions" in requested_views:
             sections["docs_mentions"] = self._query_explore_docs_mentions(query, seed_ids, nodes, incident_edges, limit=limit)
+        if "structural_duplicates" in requested_views:
+            structural_seeds = [
+                node
+                for node_id in subgraph.seed_node_ids
+                if (node := self.store.get_node(node_id)) is not None
+            ]
+            if not any(self._is_template_path(self._node_relative_path(node) or "") for node in structural_seeds):
+                structural_seeds = list(seed_nodes.values())
+            sections["structural_duplicates"] = self._query_explore_structural_duplicates(structural_seeds, limit=limit)
         if "code" in requested_views:
             sections["code"] = {
-                "usage_guidance": code_payload.get("usage_guidance", []),
                 "working_set": code_payload.get("working_set", [])[: min(max_items, limit)],
+                "read_plan": code_payload.get("read_plan", [])[: min(max_items, limit)],
+                "change_chain": code_payload.get("change_chain", [])[: min(max_items, limit)],
                 "targeted_reads": code_payload.get("targeted_reads", [])[: min(max_items, limit)],
                 "snippets": code_payload.get("snippets", [])[: min(max_items, limit)],
                 "symbols": code_payload.get("symbols", [])[: min(max_items, limit)],
@@ -841,7 +1089,7 @@ class RetrievalEngine:
         max_text_chars: int,
     ) -> list[dict[str, Any]]:
         query = retrieval.query
-        query_tokens = set(tokenize(query.text))
+        query_tokens = set(_expanded_tokens(query.text))
         degree: dict[str, int] = {}
         for edge in retrieval.edges:
             degree[edge.from_id] = degree.get(edge.from_id, 0) + 1
@@ -965,7 +1213,7 @@ class RetrievalEngine:
         limit: int,
     ) -> OrderedDict[str, MemoryNode]:
         sources: OrderedDict[str, MemoryNode] = OrderedDict()
-        query_tokens = set(tokenize(query.text))
+        query_tokens = set(_expanded_tokens(query.text))
         for node in nodes.values():
             if node.type in SOURCE_NODE_TYPES:
                 if not self._source_is_query_relevant(node, query=query, edges=edges, seed_nodes=seed_nodes, query_tokens=query_tokens):
@@ -998,7 +1246,7 @@ class RetrievalEngine:
         seed_nodes: set[str],
         sources: set[str],
     ) -> tuple[OrderedDict[str, MemoryNode], OrderedDict[str, MemoryEdge], list[str]]:
-        query_tokens = set(tokenize(query_text))
+        query_tokens = set(_expanded_tokens(query_text))
         degree: dict[str, int] = {node_id: 0 for node_id in nodes}
         for edge in edges.values():
             if edge.from_id in degree:
@@ -1056,13 +1304,42 @@ class RetrievalEngine:
         if path and cls._is_generated_context_path(path):
             return False
         if node.type == "SourceFragment":
-            return bool(path and (path.startswith("src/") or path.startswith("tests/")))
+            return bool(path and cls._is_code_source_path(path))
         return True
 
     @staticmethod
     def _is_generated_context_path(path: str) -> bool:
         value = path.replace("\\", "/")
         return any(part in value for part in (".egg-info/", "__pycache__/", ".reql/", ".git/"))
+
+    @staticmethod
+    def _is_code_source_path(path: str) -> bool:
+        value = path.replace("\\", "/").lstrip("/").casefold()
+        if value.startswith(("src/", "tests/")):
+            return True
+        return RetrievalEngine._is_application_surface_path(value)
+
+    @staticmethod
+    def _is_application_surface_path(path: str) -> bool:
+        value = path.replace("\\", "/").lstrip("/").casefold()
+        if value.startswith(
+            (
+                "app/views/",
+                "app/templates/",
+                "public/assets/",
+                "public/css/",
+                "public/js/",
+                "resources/views/",
+                "resources/css/",
+                "resources/js/",
+                "templates/",
+                "views/",
+                "assets/",
+                "static/",
+            )
+        ):
+            return True
+        return any(part in value for part in ("/views/", "/templates/", "/public/assets/", "/static/"))
 
     @staticmethod
     def _is_test_context_path(path: str) -> bool:
@@ -1085,7 +1362,7 @@ class RetrievalEngine:
     def _is_relevant_memory_node(self, node: MemoryNode, query_text: str, *, query_tokens: set[str] | None = None) -> bool:
         if node.type in TECHNICAL_NODE_TYPES:
             return False
-        query_tokens = query_tokens if query_tokens is not None else set(tokenize(query_text))
+        query_tokens = query_tokens if query_tokens is not None else set(_expanded_tokens(query_text))
         direct = self._direct_relevance_score(node, query_text, query_tokens=query_tokens)
         if node.type in {"Topic", "Entity", "Fact"}:
             return direct >= 0.65
@@ -1102,7 +1379,7 @@ class RetrievalEngine:
     ) -> bool:
         if source.type in TECHNICAL_NODE_TYPES:
             return False
-        query_tokens = query_tokens if query_tokens is not None else set(tokenize(query.text))
+        query_tokens = query_tokens if query_tokens is not None else set(_expanded_tokens(query.text))
         if self._direct_relevance_score(source, query.text, query_tokens=query_tokens) >= 0.85:
             return True
         for edge in edges.values():
@@ -1122,7 +1399,7 @@ class RetrievalEngine:
         return False
 
     def _query_profile(self, query_text: str) -> _QueryProfile:
-        ordered_tokens = tuple(tokenize(query_text))
+        ordered_tokens = tuple(_expanded_tokens(query_text))
         tokens = set(ordered_tokens)
         informative = {
             token
@@ -1373,7 +1650,7 @@ class RetrievalEngine:
         node_key = canonicalize(node_text)
         if not node_key:
             return {"match_score": 0.0, "coverage": 0.0}
-        node_tokens = set(tokenize(node_text))
+        node_tokens = set(_expanded_tokens(node_text))
         overlap = query_profile.informative_tokens & node_tokens
         coverage = self._coverage(overlap, query_profile)
         phrase_coverage = self._phrase_coverage(node_key, query_profile)
@@ -1399,7 +1676,7 @@ class RetrievalEngine:
             phrase_bonus = 0.18 * phrase_coverage
             return {"match_score": min(0.38, (0.16 * coverage) + phrase_bonus), "coverage": coverage}
         source = str(node.properties.get("relative_path") or node.properties.get("path") or "")
-        source_tokens = set(tokenize(source.replace("\\", "/").replace("/", " ").replace(".", " ")))
+        source_tokens = set(_expanded_tokens(source))
         source_overlap = query_profile.informative_tokens & source_tokens
         source_coverage = self._coverage(source_overlap, query_profile)
         if source_coverage >= 0.50:
@@ -1419,6 +1696,23 @@ class RetrievalEngine:
         haystack = f" {node_key} "
         matched = sum(1 for phrase in query_profile.phrase_terms if f" {phrase} " in haystack)
         return min(1.0, matched / len(query_profile.phrase_terms))
+
+    def _significant_query_phrases(self, query_text: str) -> list[str]:
+        tokens = [
+            token
+            for token in _expanded_tokens(query_text)
+            if len(token) >= 4 or token_signal_score(token) >= 0.75
+        ]
+        phrases: list[str] = []
+        seen: set[str] = set()
+        for size in (4, 3, 2):
+            for index in range(0, max(0, len(tokens) - size + 1)):
+                phrase = " ".join(tokens[index : index + size])
+                key = canonicalize(phrase)
+                if key and key not in seen:
+                    seen.add(key)
+                    phrases.append(key)
+        return phrases
 
     @staticmethod
     def _retrieval_type_bonus(node: MemoryNode, match_score: float) -> float:
@@ -1470,7 +1764,20 @@ class RetrievalEngine:
 
     @staticmethod
     def _node_search_text(node: MemoryNode) -> str:
-        return " ".join(part for part in [node.text, node.label, node.canonical_key] if part)
+        parts: list[str] = []
+        for part in (node.text, node.label, node.canonical_key):
+            if part:
+                parts.append(str(part))
+        for key in STRUCTURED_SEARCH_FIELDS:
+            value = node.properties.get(key)
+            if value is None:
+                continue
+            if isinstance(value, (list, tuple, set)):
+                parts.extend(str(item) for item in value if item)
+            else:
+                parts.append(str(value))
+        expanded_parts = [_identifier_expanded_text(part) for part in parts]
+        return " ".join([*parts, *expanded_parts])
 
     @classmethod
     def _node_query_token_overlap(cls, node: MemoryNode, query_tokens: set[str]) -> int:
@@ -1480,7 +1787,7 @@ class RetrievalEngine:
     def _node_query_token_overlap_tokens(cls, node: MemoryNode, query_tokens: set[str]) -> set[str]:
         if not query_tokens:
             return set()
-        return query_tokens & set(tokenize(cls._node_search_text(node)))
+        return query_tokens & set(_expanded_tokens(cls._node_search_text(node)))
 
     @staticmethod
     def _has_strong_identifier_overlap(tokens: set[str]) -> bool:
@@ -1706,6 +2013,9 @@ class RetrievalEngine:
             "docs": "docs_mentions",
             "docs_only": "docs_mentions",
             "docs_mentions_only": "docs_mentions",
+            "duplicates": "structural_duplicates",
+            "structural": "structural_duplicates",
+            "structural_duplicates_only": "structural_duplicates",
             "code_only": "code",
         }
         for view in views:
@@ -1714,7 +2024,7 @@ class RetrievalEngine:
                 continue
             value = aliases.get(key, key)
             if value == "__all__":
-                return QUERY_EXPLORE_DEFAULT_VIEWS
+                return QUERY_EXPLORE_ALL_VIEWS
             if value not in QUERY_EXPLORE_VIEWS:
                 valid = ", ".join(sorted(QUERY_EXPLORE_VIEWS | {"all"}))
                 raise ValueError(f"unknown query_explore view '{view}'. Choose from: {valid}")
@@ -1989,19 +2299,150 @@ class RetrievalEngine:
                 break
         return rows
 
+    def _query_explore_structural_duplicates(
+        self,
+        seed_nodes: Sequence[MemoryNode],
+        *,
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        seed_paths = {
+            path
+            for node in seed_nodes
+            if (path := self._node_relative_path(node)) and self._is_template_path(path)
+        }
+        if not seed_paths:
+            return []
+
+        fragments: dict[str, list[MemoryNode]] = {}
+        representatives: dict[str, MemoryNode] = {}
+        for node in self.store.all_nodes():
+            if node.status in INACTIVE_STATUSES:
+                continue
+            path = self._node_relative_path(node)
+            if not path or not self._is_template_path(path):
+                continue
+            current = representatives.get(path)
+            if current is None or self._template_representative_rank(node) > self._template_representative_rank(current):
+                representatives[path] = node
+            if node.type == "SourceFragment" and node.text:
+                fragments.setdefault(path, []).append(node)
+
+        signatures: dict[str, tuple[tuple[str, ...], set[str]]] = {}
+        for path, items in fragments.items():
+            ordered = sorted(items, key=lambda item: int(item.properties.get("line_start") or 0))
+            signatures[path] = self._template_structure_signature("\n".join(item.text or "" for item in ordered))
+
+        rows: list[dict[str, Any]] = []
+        seen_pairs: set[tuple[str, str]] = set()
+        for source_path in sorted(seed_paths):
+            source_signature = signatures.get(source_path)
+            source_node = representatives.get(source_path)
+            if source_signature is None or source_node is None:
+                continue
+            source_sequence, source_features = source_signature
+            if len(source_sequence) < 3 or not source_features:
+                continue
+            for duplicate_path, (duplicate_sequence, duplicate_features) in signatures.items():
+                if duplicate_path == source_path or len(duplicate_sequence) < 3:
+                    continue
+                pair = tuple(sorted((source_path, duplicate_path)))
+                if pair in seen_pairs:
+                    continue
+                shared = source_features & duplicate_features
+                similarity = len(shared) / max(1, len(source_features | duplicate_features))
+                if similarity < 0.50 or len(shared) < 2:
+                    continue
+                duplicate_node = representatives.get(duplicate_path)
+                if duplicate_node is None:
+                    continue
+                seen_pairs.add(pair)
+                shared_patterns = [
+                    pattern
+                    for prefix in ("sequence:", "edge:", "node:")
+                    for pattern in sorted(item for item in shared if item.startswith(prefix))[:3]
+                ]
+                rows.append(
+                    {
+                        "source": self._query_explore_node_payload(source_node),
+                        "duplicate": self._query_explore_node_payload(duplicate_node),
+                        "similarity": round(similarity, 4),
+                        "source_tag_count": len(source_sequence),
+                        "duplicate_tag_count": len(duplicate_sequence),
+                        "shared_patterns": shared_patterns[:8],
+                        "reason": "similar markup hierarchy and tag sequence; lexical relevance is not used",
+                    }
+                )
+        rows.sort(
+            key=lambda row: (
+                -float(row["similarity"]),
+                str(row["source"].get("location") or ""),
+                str(row["duplicate"].get("location") or ""),
+            )
+        )
+        return rows[:limit]
+
+    @staticmethod
+    def _is_template_path(path: str) -> bool:
+        value = path.replace("\\", "/").lstrip("/").casefold()
+        suffix = Path(value).suffix
+        if suffix in {".html", ".htm", ".twig", ".jinja", ".jinja2", ".hbs", ".mustache", ".vue"}:
+            return True
+        return suffix in {".php", ".phtml"} and any(part in f"/{value}" for part in ("/views/", "/templates/"))
+
+    @staticmethod
+    def _template_representative_rank(node: MemoryNode) -> int:
+        return {"File": 3, "SourceArtifact": 2, "SourceFragment": 1}.get(node.type, 0)
+
+    @staticmethod
+    def _template_structure_signature(text: str) -> tuple[tuple[str, ...], set[str]]:
+        tag_pattern = re.compile(r"<\s*(/?)\s*([A-Za-z][\w:-]*)\b([^>]*)>", re.IGNORECASE)
+        attr_pattern = re.compile(r"\b([A-Za-z_:][\w:.-]*)\s*(?:=|\s|$)")
+        void_tags = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
+        stack: list[str] = []
+        sequence: list[str] = []
+        features: set[str] = set()
+        for match in tag_pattern.finditer(text):
+            closing, raw_tag, raw_attrs = match.groups()
+            tag = raw_tag.casefold()
+            if closing:
+                if tag in stack:
+                    while stack and stack[-1] != tag:
+                        stack.pop()
+                    if stack:
+                        stack.pop()
+                continue
+            attrs = sorted(
+                {
+                    attr.casefold()
+                    for attr in attr_pattern.findall(raw_attrs)
+                    if attr.casefold() not in {"php", "echo"}
+                }
+            )
+            parent = stack[-1] if stack else "root"
+            descriptor = f"{len(stack)}:{tag}[{','.join(attrs)}]"
+            sequence.append(descriptor)
+            features.add(f"edge:{parent}>{tag}")
+            features.add(f"node:{descriptor}")
+            self_closing = raw_attrs.rstrip().endswith("/") or tag in void_tags
+            if not self_closing:
+                stack.append(tag)
+        for index in range(max(0, len(sequence) - 2)):
+            features.add("sequence:" + "/".join(sequence[index : index + 3]))
+        return tuple(sequence), features
+
     def _query_explore_followups(self, query_text: str, views: Sequence[str], seed_nodes: OrderedDict[str, MemoryNode]) -> list[dict[str, str]]:
         query = self._reql_string(query_text)
         followups = [
-            {
-                "label": "Full dependency slices",
-                "command": f"reql query_explore --query {query} --json",
-                "when": "use when a single view is too narrow",
-            },
-            {
-                "label": "Structured graph",
-                "command": f"reql query_graph --query {query} --max-depth 3 --json",
-                "when": "use when edge details need broader expansion",
-            },
+                {
+                    "label": "Full dependency slices",
+                    "command": f"reql query_explore --query {query} --json",
+                    "purpose": "all dependency-oriented views",
+                },
+                {
+                    "label": "Structured graph",
+                    "command": f"reql query_graph --query {query} --max-depth 3 --json",
+                    "purpose": "expanded edge details",
+                },
         ]
         if seed_nodes:
             first = next(iter(seed_nodes))
@@ -2009,7 +2450,7 @@ class RetrievalEngine:
                 {
                     "label": "Inspect first seed",
                     "command": f"reql inspect --node-id {first} --json",
-                    "when": "use to verify exact provenance and neighbors",
+                    "purpose": "seed provenance and neighbors",
                 }
             )
         for view in views:
@@ -2017,7 +2458,7 @@ class RetrievalEngine:
                 {
                     "label": f"{view} only",
                     "command": f"reql query_explore --query {query} --view {view} --json",
-                    "when": f"use to reduce output to {view}",
+                    "purpose": f"{view} view only",
                 }
             )
             if len(followups) >= 6:
@@ -2039,6 +2480,7 @@ class RetrievalEngine:
             "public_surface": "Public Surface",
             "serialization_paths": "Serialization Paths",
             "docs_mentions": "Docs Mentions",
+            "structural_duplicates": "Structural Duplicates",
             "code": "Code",
         }
         for key, title in titles.items():
@@ -2063,6 +2505,16 @@ class RetrievalEngine:
         return "\n".join(lines).strip()
 
     def _render_query_explore_row(self, row: dict[str, Any]) -> str:
+        if isinstance(row.get("source"), dict) and isinstance(row.get("duplicate"), dict):
+            source = row["source"]
+            duplicate = row["duplicate"]
+            shared = ", ".join(row.get("shared_patterns") or [])
+            shared_suffix = f"; shared={shared}" if shared else ""
+            return (
+                f"- `{source.get('location') or source.get('id')}` <-> "
+                f"`{duplicate.get('location') or duplicate.get('id')}`; "
+                f"similarity={float(row.get('similarity', 0.0)):.2f}; {row.get('reason')}{shared_suffix}"
+            )
         node = row.get("owner") or row.get("caller") or row.get("surface") or row.get("node") or row.get("mention") or row.get("target")
         if not isinstance(node, dict):
             return f"- {row.get('reason', 'match')}"
@@ -2153,6 +2605,7 @@ class RetrievalEngine:
                 or self._node_relative_path(item.node) in owner_candidate_paths
                 or (
                     not owner_candidate_ids
+                    and working_paths
                     and (
                         self._node_relative_path(item.node) in working_paths
                         or float(item.reasons.get("match_score", 0.0) or 0.0) >= 0.04
@@ -2169,10 +2622,27 @@ class RetrievalEngine:
         if query_mode == "cleanup":
             cleanup_reads = self._code_cleanup_targeted_reads(cleanup_candidates, subgraph, working_paths, max_items=compact_items)
             targeted_reads = self._merge_targeted_reads(cleanup_reads, max_items=max(compact_items * 4, 12))
+            snippets = self._code_snippet_payload(targeted_reads, subgraph, max_items=max_items)
         else:
             targeted_reads = self._code_targeted_reads(display_ranked, subgraph, working_paths, query_text=subgraph.query.text, max_items=compact_items)
-        snippets = self._code_snippet_payload(targeted_reads, subgraph, max_items=max_items) if query_mode == "cleanup" else []
+            snippets = self._code_informative_snippet_payload(
+                targeted_reads,
+                subgraph,
+                path_rows=path_rows,
+                max_items=max_items,
+            )
         cleanup_plan = self._code_cleanup_plan_lines(cleanup_candidates, path_rows, max_items=compact_items) if query_mode == "cleanup" else []
+        contracts = self._code_contract_payload(display_ranked, subgraph, working_paths, max_items=compact_items)
+        impact = self._code_impact_payload(subgraph, owner_candidates, working_paths, max_items=compact_items)
+        test_targets = self._code_test_targets(subgraph, path_rows, query_text=subgraph.query.text, max_items=max_items)
+        read_plan = self._code_read_plan_payload(targeted_reads, snippets=snippets, max_items=max_items)
+        change_chain = self._code_change_chain_payload(
+            owner_candidates=owner_candidates,
+            read_plan=read_plan,
+            contracts=contracts,
+            impact=impact,
+            max_items=max_items,
+        )
         followups = (
             self._code_follow_up_payload(subgraph, path_rows, max_items=max_items)
             if self._code_context_needs_followups(
@@ -2193,17 +2663,18 @@ class RetrievalEngine:
                 total_candidates=self._cleanup_candidate_count(display_ranked, subgraph),
                 shown_candidates=len(cleanup_candidates),
             ) if query_mode == "cleanup" else {},
-            "usage_guidance": self._code_usage_guidance_payload(query_mode=query_mode, snippets=snippets, targeted_reads=targeted_reads),
+            "read_plan": read_plan,
+            "change_chain": change_chain,
             "owner_candidates": owner_candidates,
             "cleanup_candidates": cleanup_candidates,
             "working_set": self._code_working_set_payload(path_rows, query_mode=query_mode, max_items=compact_items),
-            "contracts": self._code_contract_payload(display_ranked, subgraph, working_paths, max_items=compact_items) if query_mode == "cleanup" else [],
-            "impact": self._code_impact_payload(subgraph, owner_candidates, working_paths, max_items=compact_items) if query_mode == "cleanup" else {},
+            "contracts": contracts,
+            "impact": impact,
             "targeted_reads": targeted_reads,
             "snippets": snippets,
             "edit_plan": [],
             "cleanup_plan": cleanup_plan,
-            "test_targets": self._code_test_targets(subgraph, path_rows, query_text=subgraph.query.text, max_items=max_items) if query_mode == "cleanup" else [],
+            "test_targets": test_targets,
             "followups": followups,
             "counts": {
                 "working_set_files": len(path_rows),
@@ -2214,51 +2685,106 @@ class RetrievalEngine:
             "trace_id": subgraph.trace_id,
         }
 
-    def _code_usage_guidance_payload(
+    def _code_read_plan_payload(
+        self,
+        targeted_reads: list[dict[str, Any]],
+        *,
+        snippets: list[dict[str, Any]],
+        max_items: int,
+    ) -> list[dict[str, Any]]:
+        snippet_spans = {
+            (item.get("path"), item.get("line_start"), item.get("line_end"))
+            for item in snippets
+        }
+        plan: list[dict[str, Any]] = []
+        for item in targeted_reads[: min(max_items, 8)]:
+            path = item.get("path")
+            line_start = item.get("line_start")
+            line_end = item.get("line_end")
+            if not path or line_start is None:
+                continue
+            try:
+                start = int(line_start)
+                end = int(line_end) if line_end is not None else start
+            except (TypeError, ValueError):
+                continue
+            line_count = max(1, end - start + 1)
+            node_id = str(item.get("node_id") or "")
+            span_key = (path, start, end)
+            plan.append(
+                {
+                    "path": path,
+                    "line_start": start,
+                    "line_end": end,
+                    "line_count": line_count,
+                    "node_id": node_id,
+                    "type": item.get("type"),
+                    "label": item.get("label"),
+                    "reason": item.get("reason") or "graph match",
+                    "source_span": self._format_path_bracket_span(path, start, end),
+                    "command": f"reql inspect --node-id {node_id} --json" if node_id else "",
+                    "snippet_embedded": span_key in snippet_spans,
+                    "sufficiency": item.get("sufficiency")
+                    or {
+                        "status": "bounded",
+                        "reason": "source span returned by graph retrieval",
+                    },
+                }
+            )
+        return plan
+
+    def _code_change_chain_payload(
         self,
         *,
-        query_mode: str,
-        snippets: list[dict[str, Any]],
-        targeted_reads: list[dict[str, Any]],
-    ) -> list[dict[str, str]]:
-        if query_mode != "cleanup":
-            return [
+        owner_candidates: list[dict[str, Any]],
+        read_plan: list[dict[str, Any]],
+        contracts: list[dict[str, Any]],
+        impact: dict[str, Any],
+        max_items: int,
+    ) -> list[dict[str, Any]]:
+        limit = min(max_items, 4)
+        chain: list[dict[str, Any]] = []
+        if owner_candidates:
+            chain.append(
                 {
-                    "priority": "context",
-                    "instruction": "Use the listed files, symbols, and targeted_reads source spans as bounded context before broad repository discovery.",
-                },
-                {
-                    "priority": "refine",
-                    "instruction": "If the result is too broad, refine the query with exact identifiers, errors, file names, APIs, or fields before scanning files.",
-                },
-            ]
-        guidance = [
-            {
-                "priority": "first",
-                "instruction": "Start from cleanup_candidates; they are the only rendered removal candidates.",
-            },
-            {
-                "priority": "read",
-                "instruction": "If a snippet covers the needed code, use it before opening source files.",
-            },
-            {
-                "priority": "bounded",
-                "instruction": "When more source is required, read only missing spans from targeted_reads; avoid whole-file or broad range reads.",
-            },
-            {
-                "priority": "verify",
-                "instruction": "If owners or snippets look wrong, run raw REQL queries or refine the query with exact identifiers/errors before repository-wide search.",
-            },
-        ]
-        if not snippets and targeted_reads:
-            guidance.insert(
-                2,
-                {
-                    "priority": "source",
-                    "instruction": "No snippet text was embedded; read the listed targeted_reads spans before any broader file read.",
-                },
+                    "phase": "start",
+                    "description": "owner symbols with direct or linked query evidence",
+                    "items": owner_candidates[:limit],
+                }
             )
-        return guidance
+        if read_plan:
+            chain.append(
+                {
+                    "phase": "read",
+                    "description": "bounded source spans associated with the owner/context nodes",
+                    "items": read_plan[:limit],
+                }
+            )
+        if contracts:
+            chain.append(
+                {
+                    "phase": "preserve",
+                    "description": "contracts, public-shaped symbols, and related graph edges near the working set",
+                    "items": contracts[:limit],
+                }
+            )
+        impact_items: list[dict[str, Any]] = []
+        for key in ("public_surface", "callers", "docs"):
+            for item in list(impact.get(key) or [])[:limit]:
+                impact_item = dict(item)
+                impact_item["impact_kind"] = key
+                impact_items.append(impact_item)
+        for note in list(impact.get("notes") or [])[:limit]:
+            impact_items.append({"impact_kind": "note", "reason": note})
+        if impact_items:
+            chain.append(
+                {
+                    "phase": "check-impact",
+                    "description": "callers, public surfaces, docs, and unknowns present in the retrieved subgraph",
+                    "items": impact_items[:limit],
+                }
+            )
+        return chain
 
     def _should_render_code_context(self, subgraph: MemorySubgraph, *, max_items: int) -> bool:
         if self._is_explicit_code_context(subgraph.query.node_types):
@@ -2274,7 +2800,7 @@ class RetrievalEngine:
         return True
 
     def _has_direct_general_evidence(self, subgraph: MemorySubgraph) -> bool:
-        query_tokens = set(tokenize(subgraph.query.text))
+        query_tokens = set(_expanded_tokens(subgraph.query.text))
         if not query_tokens:
             return False
         nodes: OrderedDict[str, MemoryNode] = OrderedDict((item.node.id, item.node) for item in subgraph.ranked_nodes)
@@ -2284,7 +2810,7 @@ class RetrievalEngine:
             if node.type in TECHNICAL_NODE_TYPES or self._is_code_context_node(node):
                 continue
             searchable = " ".join(part for part in (node.label, node.text, node.canonical_key) if part)
-            if query_tokens & set(tokenize(searchable)):
+            if query_tokens & set(_expanded_tokens(searchable)):
                 return True
         return False
 
@@ -2297,7 +2823,9 @@ class RetrievalEngine:
         max_items: int,
     ) -> list[dict[str, Any]]:
         rows: OrderedDict[str, dict[str, Any]] = OrderedDict()
-        query_tokens = set(tokenize(query_text))
+        query_tokens = _code_context_query_tokens(query_text)
+        raw_query_tokens = set(tokenize(query_text))
+        cleanup_query = bool(raw_query_tokens & {"cleanup", "dead", "delete", "remove", "removal", "unused"})
 
         def add(node: MemoryNode, score: float, *, edit_candidate: bool = False, reason: str | None = None) -> None:
             path = self._node_relative_path(node)
@@ -2340,10 +2868,16 @@ class RetrievalEngine:
             direct = float(item.reasons.get("match_score", 0.0) or 0.0)
             if direct >= 0.04 or (item.node.type == "StaticAnalysisFinding" and direct > 0.0):
                 overlap = self._owner_query_overlap(item.node, query_tokens)
+                if overlap <= 0 and not (item.node.type == "StaticAnalysisFinding" and cleanup_query):
+                    continue
+                actionable_overlap = self._is_actionable_owner_overlap(overlap, query_tokens)
                 edit_candidate = item.node.type == "StaticAnalysisFinding" or (
                     item.node.type in {"Module", "Function", "Class", "Interface", "Method", "Endpoint", "Schema", "Config", "Test"}
-                    and (direct >= 0.10 or overlap >= 2 or (direct >= 0.04 and overlap >= 1))
+                    and actionable_overlap
+                    and (direct >= 0.04 or overlap >= 2)
                 )
+                if not edit_candidate and self._is_application_surface_node(item.node) and actionable_overlap:
+                    edit_candidate = True
                 reason = "finding" if item.node.type == "StaticAnalysisFinding" else ("symbol/query overlap" if overlap else "direct match")
                 add(item.node, item.score, edit_candidate=edit_candidate, reason=reason)
         for node in nodes:
@@ -2370,7 +2904,12 @@ class RetrievalEngine:
         primary_rows = [row for row in ordered if row["edit_candidate"] and not self._is_secondary_code_path(str(row["path"]))]
         if primary_rows and not self._query_requests_secondary_code_context(query_text):
             primary_paths = {str(row["path"]) for row in primary_rows}
-            ordered = [row for row in ordered if str(row["path"]) in primary_paths]
+            ordered = [
+                row
+                for row in ordered
+                if str(row["path"]) in primary_paths
+                or (bool(row["edit_candidate"]) and self._is_application_surface_path(str(row["path"])))
+            ]
         return ordered[: max(max_items, 8)]
 
     def _code_owner_candidates(
@@ -2425,23 +2964,11 @@ class RetrievalEngine:
         candidates.sort(key=lambda item: (not self._is_secondary_code_path(str(item.get("path") or "")), float(item["score"])), reverse=True)
         return candidates[: min(max_items, 3)]
 
-    @staticmethod
-    def _owner_query_overlap(node: MemoryNode, query_tokens: set[str]) -> int:
+    @classmethod
+    def _owner_query_overlap(cls, node: MemoryNode, query_tokens: set[str]) -> int:
         if not query_tokens:
             return 0
-        fields = [
-            node.id,
-            node.label,
-            node.canonical_key,
-            node.properties.get("name"),
-            node.properties.get("qualified_name"),
-            node.properties.get("symbol_name"),
-            node.properties.get("relative_path"),
-        ]
-        node_tokens: set[str] = set()
-        for field in fields:
-            if field:
-                node_tokens.update(tokenize(str(field).replace("_", " ").replace(".", " ").replace("/", " ")))
+        node_tokens = set(_expanded_tokens(cls._node_search_text(node)))
         return len(query_tokens & node_tokens)
 
     @staticmethod
@@ -2456,6 +2983,10 @@ class RetrievalEngine:
     def _is_secondary_code_path(path: str) -> bool:
         normalized = path.replace("\\", "/").casefold()
         return normalized.startswith("tests/") or normalized.startswith("docs/") or normalized == "readme.md" or "/docs/" in normalized
+
+    def _is_application_surface_node(self, node: MemoryNode) -> bool:
+        path = self._node_relative_path(node) or ""
+        return bool(path and self._is_application_surface_path(path))
 
     @staticmethod
     def _query_requests_secondary_code_context(query_text: str) -> bool:
@@ -2710,6 +3241,8 @@ class RetrievalEngine:
         query_text: str,
         max_items: int,
     ) -> list[dict[str, Any]]:
+        if not working_paths:
+            return []
         reads: OrderedDict[tuple[str, int | None, int | None, str], dict[str, Any]] = OrderedDict()
         primary_owner_available = any(not self._is_secondary_code_path(path) for path in working_paths)
         include_secondary = self._query_requests_secondary_code_context(query_text)
@@ -2734,6 +3267,7 @@ class RetrievalEngine:
                 key,
                 {
                     "path": path,
+                    "source_path": node.properties.get("path") or node.properties.get("source_path"),
                     "line_start": line_start,
                     "line_end": line_end,
                     "node_id": node.id,
@@ -2752,7 +3286,75 @@ class RetrievalEngine:
                 add(node, "related code context")
             if len(reads) >= min(max_items, 10):
                 break
+        if working_paths and len(working_paths) <= 3 and len(reads) < min(max_items, 10):
+            for node in self._matching_source_fragments_for_query(query_text, working_paths, max_items=max_items):
+                add(node, "exact source phrase")
+                if len(reads) >= min(max_items, 10):
+                    break
         return list(reads.values())[: min(max_items, 10)]
+
+    def _matching_source_fragments_for_query(self, query_text: str, working_paths: set[str], *, max_items: int) -> list[MemoryNode]:
+        matches: list[tuple[float, MemoryNode]] = []
+        for node in self.store.all_nodes():
+            if node.type not in SOURCE_NODE_TYPES:
+                continue
+            path = self._node_relative_path(node)
+            if not path or path not in working_paths or self._is_generated_context_path(path):
+                continue
+            if not self._node_matches_query_context_scope(node, {"code"}):
+                continue
+            line_start, line_end = self._line_span(node)
+            if line_start is None:
+                continue
+            if line_end is not None and line_end - line_start > 80:
+                continue
+            if not self._source_fragment_is_strong_query_match(node, query_text):
+                continue
+            metrics = self._node_match_metrics(node, self._query_profile(query_text))
+            matches.append((metrics["match_score"], node))
+        matches.sort(key=lambda item: (item[0], item[1].salience, self._location_summary(item[1]) or ""), reverse=True)
+        return [node for _, node in matches[: min(max_items, 5)]]
+
+    def _code_informative_snippet_payload(
+        self,
+        targeted_reads: list[dict[str, Any]],
+        subgraph: MemorySubgraph,
+        *,
+        path_rows: list[dict[str, Any]],
+        max_items: int,
+    ) -> list[dict[str, Any]]:
+        if not targeted_reads or len(path_rows) > 3:
+            return []
+        nodes = {item.node.id: item.node for item in subgraph.ranked_nodes}
+        nodes.update({node.id: node for node in subgraph.nodes})
+        selected: list[dict[str, Any]] = []
+        for read in targeted_reads:
+            if read.get("type") not in SOURCE_NODE_TYPES:
+                continue
+            node_id = str(read.get("node_id") or "")
+            node = nodes.get(node_id) or self.store.get_node(node_id)
+            if node is None:
+                continue
+            if not self._source_fragment_is_strong_query_match(node, subgraph.query.text):
+                continue
+            selected.append(read)
+            if len(selected) >= min(max_items, 2):
+                break
+        return self._code_snippet_payload(selected, subgraph, max_items=min(max_items, 2)) if selected else []
+
+    def _source_fragment_is_strong_query_match(self, node: MemoryNode, query_text: str) -> bool:
+        text = str(node.text or node.label or "")
+        if not text:
+            return False
+        profile = self._query_profile(query_text)
+        metrics = self._node_match_metrics(node, profile)
+        if metrics["match_score"] >= 0.50:
+            return True
+        fragment_key = canonicalize(text)
+        if not fragment_key:
+            return False
+        query_phrases = self._significant_query_phrases(query_text)
+        return any(phrase in fragment_key for phrase in query_phrases)
 
     def _code_cleanup_targeted_reads(
         self,
@@ -3033,7 +3635,7 @@ class RetrievalEngine:
         include_risky: bool = False,
     ) -> list[dict[str, Any]]:
         ranked_by_id = {item.node.id: item for item in ranked}
-        query_tokens = set(tokenize(subgraph.query.text))
+        query_tokens = set(_expanded_tokens(subgraph.query.text))
         candidates: list[dict[str, Any]] = []
         seen: set[str] = set()
         for node in [*(item.node for item in ranked), *subgraph.nodes]:
@@ -3144,9 +3746,9 @@ class RetrievalEngine:
 
     def _code_cleanup_plan_lines(self, cleanup_candidates: list[dict[str, Any]], path_rows: list[dict[str, Any]], *, max_items: int) -> list[str]:
         lines = [
-            "- Remove `safe` high-priority unused imports and variables first after checking the listed source span.",
-            "- Validate `validate` candidates against nearby callers, docs, CLI/MCP tools, configuration, and exports before deleting.",
-            "- Treat `risky` public API, entrypoint, framework lifecycle, and dynamic-reference candidates as review items, not direct removals.",
+            "- safe: high-priority unused imports and variables with listed source spans.",
+            "- validate: candidates with nearby callers, docs, CLI/MCP tools, configuration, or exports.",
+            "- risky: public API, entrypoint, framework lifecycle, or dynamic-reference candidates.",
         ]
         for item in cleanup_candidates[: min(max_items, 4)]:
             safety = item.get("removal_safety") or "validate"
@@ -3154,12 +3756,12 @@ class RetrievalEngine:
             reason = item.get("removal_reason") or item.get("validation_reason") or "review candidate before removal"
             lines.append(f"- `{name}` safety={safety}: {reason}")
         if not cleanup_candidates:
-            lines.append("- No safe-remove cleanup candidate matched this query; rerun with `--include-risky` only when validation candidates are intentionally in scope.")
+            lines.append("- No safe-remove cleanup candidate matched this query; validate/risky candidates are outside the default result set.")
             return lines
         for row in path_rows[: min(max_items, 4)]:
             path = row.get("path")
             if path:
-                lines.append(f"- Candidate file: `{path}`; use targeted reads/snippets, not a whole-file scan, unless the span is ambiguous.")
+                lines.append(f"- Candidate file: `{path}`; source spans are listed in targeted_reads/snippets when available.")
         return lines
 
     def _code_snippet_payload(
@@ -3198,7 +3800,13 @@ class RetrievalEngine:
             if key in seen:
                 continue
             seen.add(key)
-            text = self._read_source_span(path, start, end, path_index=path_index)
+            read_path_index = path_index
+            raw_source_path = item.get("source_path")
+            if raw_source_path:
+                candidate_path = Path(str(raw_source_path))
+                if candidate_path.is_absolute():
+                    read_path_index = {**path_index, path: candidate_path}
+            text = self._read_source_span(path, start, end, path_index=read_path_index)
             source = "disk"
             if not text:
                 node = nodes.get(str(item.get("node_id") or ""))
@@ -3270,7 +3878,7 @@ class RetrievalEngine:
 
     def _code_test_targets(self, subgraph: MemorySubgraph, path_rows: list[dict[str, Any]], *, query_text: str, max_items: int) -> list[dict[str, Any]]:
         ranked_by_id = {item.node.id: item for item in subgraph.ranked_nodes}
-        query_tokens = set(tokenize(query_text))
+        query_tokens = set(_expanded_tokens(query_text))
         targets: dict[str, dict[str, Any]] = {}
         for node in [*subgraph.nodes, *(item.node for item in subgraph.ranked_nodes)]:
             path = self._node_relative_path(node)
@@ -3303,34 +3911,27 @@ class RetrievalEngine:
         selected = test_rows[: min(max_items, 4)]
         if not selected and self._query_requests_secondary_code_context(query_text):
             selected.extend(doc_rows[: min(max_items, 2)])
-        if not selected and path_rows:
-            selected.append(
-                {
-                "kind": "required_suite",
-                "command": "PYTHONPATH=src python -m unittest discover -s tests -v",
-                "reason": "project test expectation for code changes",
-                "score": 0.0,
-                }
-            )
         return selected
 
     def _code_follow_up_payload(self, subgraph: MemorySubgraph, path_rows: list[dict[str, Any]], *, max_items: int) -> list[dict[str, str]]:
         query = self._reql_string(subgraph.query.text)
+        retrieve_label = "Retrieve ranked rows" if path_rows else "Retrieve source rows"
+        graph_label = "Expand code graph" if path_rows else "Expand graph context"
         followups = [
             {
-                "label": "Retrieve ranked rows",
+                "label": retrieve_label,
                 "command": f"reql query {self._shell_string(f'RETRIEVE {query} LIMIT {min(max_items, 8)} RETURN id,type,text,score,relative_path,line_start')}",
-                "when": "use when the rendered context is too terse",
+                "purpose": "ranked source/location rows",
             },
             {
-                "label": "Expand code graph",
+                "label": graph_label,
                 "command": f"reql query_graph --query {query} --max-depth {subgraph.query.max_depth} --json",
-                "when": "use before broad source search",
+                "purpose": "expanded code graph context",
             },
             {
                 "label": "Cleanup findings",
                 "command": f"reql query {self._shell_string('FINDINGS RETURN finding_type,cleanup_priority,symbol_name,qualified_name,relative_path,line_start,reason ORDER BY cleanup_priority LIMIT 30')}",
-                "when": "use for dead-code or cleanup tasks",
+                "purpose": "cleanup finding rows",
             },
         ]
         if path_rows:
@@ -3339,14 +3940,14 @@ class RetrievalEngine:
                 {
                     "label": "Symbols in first file",
                     "command": f"reql query {self._shell_string(f'SYMBOLS WHERE relative_path = {path} RETURN type,name,qualified_name,start_line,end_line LIMIT 50')}",
-                    "when": "use to inspect owner symbols without reading the whole file",
+                    "purpose": "owner symbols in the first working-set file",
                 }
             )
             followups.append(
                 {
                     "label": "Findings in first file",
                     "command": f"reql query {self._shell_string(f'FINDINGS WHERE relative_path = {path} RETURN finding_type,cleanup_priority,symbol_name,line_start,reason ORDER BY cleanup_priority LIMIT 30')}",
-                    "when": "use to check local static-analysis risks",
+                    "purpose": "static-analysis findings in the first working-set file",
                 }
             )
         ids = [item.node.id for item in subgraph.ranked_nodes[: min(3, max_items)] if self._is_code_context_node(item.node)]
@@ -3355,7 +3956,7 @@ class RetrievalEngine:
                 {
                     "label": "Inspect top node",
                     "command": f"reql inspect --node-id {ids[0]} --json",
-                    "when": "use to verify provenance and immediate neighbors",
+                    "purpose": "top node provenance and immediate neighbors",
                 }
             )
         return followups
@@ -3371,7 +3972,7 @@ class RetrievalEngine:
         if not path_rows:
             return []
         lines: list[str] = [
-            "- Start from existing graph nodes before adding new modules, wrappers, or parallel implementations.",
+            "- Existing graph-node context is available for implementation planning.",
         ]
         candidates = [row for row in path_rows if row["edit_candidate"]] or path_rows[: min(3, len(path_rows))]
         for row in candidates[: min(max_items, 4)]:
@@ -3385,15 +3986,15 @@ class RetrievalEngine:
         ][:3]
         if owner_ids:
             joined = ", ".join(owner_ids)
-            lines.append(f"- Inspect owner/provenance before editing: {joined}")
+            lines.append(f"- Owner/provenance nodes: {joined}")
         source_edges = [
             edge
             for edge in subgraph.edges
             if edge.type in SOURCE_EDGE_TYPES and (edge.from_id in owner_ids or edge.to_id in owner_ids)
         ]
         if source_edges:
-            lines.append("- Use linked `SourceFragment` evidence to read only the relevant line ranges.")
-        lines.append("- If these candidates are wrong, run raw REQL queries before broad source search.")
+            lines.append("- Linked `SourceFragment` evidence exists for relevant line ranges.")
+        lines.append("- Candidate alignment depends on the query terms and retrieved graph evidence.")
         return lines
 
     def _code_edge_lines(self, subgraph: MemorySubgraph, *, max_items: int) -> list[str]:
@@ -3432,24 +4033,62 @@ class RetrievalEngine:
         lines = self._render_context_header(payload, title="# REQL Context")
         result_lines: list[str] = []
         emitted = False
-        for item in list(payload.get("owner_candidates") or [])[:6]:
+        working_set = list(payload.get("working_set") or [])
+        small_working_set = 0 < len(working_set) <= 2
+        owner_limit = 3 if small_working_set else 6
+        file_limit = 2 if small_working_set else 6
+        read_limit = 3 if small_working_set else 6
+        merged_read_limit = 8
+        read_plan = list(payload.get("read_plan") or [])
+        plan_by_key = {
+            (item.get("node_id"), item.get("path"), item.get("line_start"), item.get("line_end")): item
+            for item in read_plan
+        }
+        rendered_read_keys: set[tuple[object, object, object, object]] = set()
+        for item in list(payload.get("owner_candidates") or [])[:owner_limit]:
             location = self._format_path_bracket_span(item.get("path"), item.get("line_start"), item.get("line_end"))
             location_suffix = f" @ {location}" if location else ""
             result_lines.append(f"- code `{item['id']}` [{item['type']}] {item.get('name') or item.get('label')}{location_suffix}; score={float(item.get('score', 0.0)):.2f}; {item.get('reason', 'graph match')}")
             emitted = True
-        for row in list(payload.get("working_set") or [])[:6]:
+        for row in working_set[:file_limit]:
             location = self._format_path_bracket_span(row.get("path"), row.get("line_start"), row.get("line_end"))
             symbols = ", ".join(row.get("symbols", [])[:4])
             suffix = f"; symbols={symbols}" if symbols else ""
             result_lines.append(f"- file `{location}` score={float(row.get('score', 0.0)):.2f}{suffix}; {row.get('reason') or 'graph match'}")
             emitted = True
-        for item in list(payload.get("targeted_reads") or [])[:6]:
+        for item in list(payload.get("targeted_reads") or [])[:read_limit]:
             location = self._format_path_bracket_span(item.get("path"), item.get("line_start"), item.get("line_end"))
-            result_lines.append(f"- ref `{location}` from `{item['node_id']}` [{item['type']}] {item['reason']}: {item['label']}")
+            key = (item.get("node_id"), item.get("path"), item.get("line_start"), item.get("line_end"))
+            rendered_read_keys.add(key)
+            plan_item = plan_by_key.get(key) or {}
+            snippet_note = "; snippet=embedded" if plan_item.get("snippet_embedded") else ""
+            command = plan_item.get("command")
+            command_note = f"; inspect_node=`{command}`" if command else ""
+            result_lines.append(f"- ref `{location}` from `{item['node_id']}` [{item['type']}] {item['reason']}: {item['label']}{snippet_note}{command_note}")
+            emitted = True
+        for item in read_plan:
+            key = (item.get("node_id"), item.get("path"), item.get("line_start"), item.get("line_end"))
+            if key in rendered_read_keys:
+                continue
+            if len(rendered_read_keys) >= merged_read_limit:
+                break
+            location = self._format_path_bracket_span(item.get("path"), item.get("line_start"), item.get("line_end"))
+            if not location:
+                continue
+            snippet_note = "snippet=embedded" if item.get("snippet_embedded") else "snippet=not_embedded"
+            command = item.get("command")
+            command_note = f"; inspect_node=`{command}`" if command else ""
+            result_lines.append(
+                f"- read `{location}` ({item.get('line_count', '?')} lines) from `{item.get('node_id')}` "
+                f"[{item.get('type')}] reason={item.get('reason')}; {snippet_note}{command_note}"
+            )
+            rendered_read_keys.add(key)
             emitted = True
         if not emitted:
             result_lines.append("- No code results matched this query.")
         self._append_section(lines, "Code results", result_lines)
+        self._append_section(lines, "Change chain", self._render_change_chain_lines(payload.get("change_chain") or []))
+        self._append_section(lines, "Snippets", self._render_snippet_lines(payload.get("snippets") or [], limit=2 if small_working_set else 3))
         self._append_section(lines, "Research queries", self._render_research_refs(payload))
         self._append_section(lines, "Summary", self._render_compact_counts(payload))
         return "\n".join(lines).strip()
@@ -3481,7 +4120,7 @@ class RetrievalEngine:
         if cleanup_filter:
             mode = cleanup_filter.get("mode") or "safe_remove"
             excluded = cleanup_filter.get("excluded_risky_candidates", 0)
-            include_note = "use --include-risky to include validate/risky findings" if not cleanup_filter.get("include_risky") else "validate/risky findings included"
+            include_note = "validate/risky findings excluded" if not cleanup_filter.get("include_risky") else "validate/risky findings included"
             self._append_section(lines, "Cleanup filter", [f"- mode={mode}; shown={cleanup_filter.get('shown_candidates', 0)}; excluded_risky={excluded}; {include_note}"])
         cleanup = list(payload.get("cleanup_candidates") or [])
         result_lines: list[str] = []
@@ -3506,17 +4145,55 @@ class RetrievalEngine:
             status_text = f"; {status}: {sufficiency.get('reason')}" if status else ""
             read_lines.append(f"- {kind} `{location}` from `{item.get('node_id')}` [{item.get('type')}] {item.get('reason')}{status_text}")
         self._append_section(lines, "Targeted reads", read_lines)
+        self._append_section(lines, "Change chain", self._render_change_chain_lines(payload.get("change_chain") or []))
+        self._append_section(lines, "Snippets", self._render_snippet_lines(payload.get("snippets") or [], limit=3))
+        self._append_section(lines, "Research queries", self._render_research_refs(payload))
+        self._append_section(lines, "Summary", self._render_compact_counts(payload))
+        return "\n".join(lines).strip()
+
+    def _render_change_chain_lines(self, change_chain: Sequence[dict[str, Any]], *, limit: int = 5) -> list[str]:
+        lines: list[str] = []
+        for step in list(change_chain)[:limit]:
+            phase = step.get("phase") or "step"
+            description = step.get("description") or ""
+            lines.append(f"- {phase}: {description}")
+            for item in list(step.get("items") or [])[:3]:
+                lines.append(f"  - {self._render_change_chain_item(item)}")
+        return lines
+
+    def _render_change_chain_item(self, item: dict[str, Any]) -> str:
+        if item.get("source_span"):
+            return f"`{item.get('source_span')}` via `{item.get('node_id')}`; {item.get('reason') or 'graph match'}"
+        if item.get("command"):
+            return f"`{item.get('command')}`; {item.get('reason') or item.get('kind') or 'verify'}"
+        if item.get("surface"):
+            surface = item.get("surface") or {}
+            return f"{item.get('impact_kind', 'impact')} `{surface.get('id')}` {surface.get('label')} @ {surface.get('location') or surface.get('path') or 'unknown'}"
+        if item.get("caller"):
+            caller = item.get("caller") or {}
+            target = item.get("target") or {}
+            return f"{item.get('impact_kind', 'impact')} `{caller.get('id')}` -> `{target.get('id')}`; {item.get('reason') or item.get('edge_type') or 'caller'}"
+        if item.get("impact_kind") == "docs":
+            return f"docs `{item.get('location') or item.get('path')}`; {item.get('reason') or 'documentation mention'}"
+        if item.get("impact_kind") == "note":
+            return str(item.get("reason") or "")
+        if item.get("location") or item.get("path"):
+            name = item.get("name") or item.get("label") or item.get("id") or item.get("node_id")
+            location = item.get("location") or self._format_path_bracket_span(item.get("path"), item.get("line_start"), item.get("line_end"))
+            related = item.get("related") or []
+            related_text = f"; related={', '.join(str(value) for value in related[:2])}" if related else ""
+            return f"`{item.get('id') or item.get('node_id')}` {name} @ {location}{related_text}"
+        return self._compact_text(str(item), max_chars=220)
+
+    def _render_snippet_lines(self, snippets: Sequence[dict[str, Any]], *, limit: int) -> list[str]:
         snippet_lines: list[str] = []
-        for item in list(payload.get("snippets") or [])[:3]:
+        for item in list(snippets)[:limit]:
             location = self._format_path_bracket_span(item.get("path"), item.get("line_start"), item.get("line_end"))
             snippet_lines.append(f"- `{location}` ({item.get('type')}; {item.get('source')})")
             text = str(item.get("text") or "")
             if text:
                 snippet_lines.extend(f"  {line}" for line in text.splitlines()[:12])
-        self._append_section(lines, "Snippets", snippet_lines)
-        self._append_section(lines, "Research queries", self._render_research_refs(payload))
-        self._append_section(lines, "Summary", self._render_compact_counts(payload))
-        return "\n".join(lines).strip()
+        return snippet_lines
 
     @staticmethod
     def _append_section(lines: list[str], title: str, body: list[str]) -> None:
@@ -3599,7 +4276,7 @@ class RetrievalEngine:
 
     @staticmethod
     def _render_followups(followups: list[dict[str, str]]) -> list[str]:
-        return [f"- {item['label']}: `{item['command']}` ({item['when']})" for item in followups]
+        return [f"- {item['label']}: `{item['command']}` ({item.get('purpose', '')})" for item in followups]
 
     @staticmethod
     def _render_counts(payload: dict[str, Any]) -> list[str]:
@@ -3658,7 +4335,7 @@ class RetrievalEngine:
 
     def _agent_source_payloads(self, subgraph: MemorySubgraph, *, max_items: int, query_text: str | None = None) -> list[dict[str, Any]]:
         candidates: OrderedDict[str, MemoryNode] = OrderedDict()
-        query_tokens = set(tokenize(query_text or ""))
+        query_tokens = set(_expanded_tokens(query_text or ""))
         for item in subgraph.ranked_nodes:
             if item.node.type in SOURCE_NODE_TYPES:
                 candidates.setdefault(item.node.id, item.node)
@@ -3673,12 +4350,12 @@ class RetrievalEngine:
             for node in candidates.values():
                 text = self._compact_text(node.text or node.label or node.canonical_key or node.id, max_chars=260)
                 path = self._node_relative_path(node) or ""
-                if query_tokens & set(tokenize(text)) and not self._is_test_context_path(path):
+                if query_tokens & set(_expanded_tokens(text)) and not self._is_test_context_path(path):
                     has_non_test_source = True
                     break
         for node in candidates.values():
             text = self._compact_text(node.text or node.label or node.canonical_key or node.id, max_chars=260)
-            if query_tokens and not (query_tokens & set(tokenize(text))):
+            if query_tokens and not (query_tokens & set(_expanded_tokens(text))):
                 continue
             path = self._node_relative_path(node) or ""
             if has_non_test_source and self._is_test_context_path(path):
@@ -3848,7 +4525,7 @@ class RetrievalEngine:
                 {
                     "label": "Inspect top node",
                     "command": f"reql inspect --node-id {ids[0]} --json",
-                    "when": "use to verify provenance and neighbors",
+                    "purpose": "top node provenance and neighbors",
                 }
             )
         non_source_id = next((item.node.id for item in followup_items if item.node.type not in SOURCE_NODE_TYPES), None)
@@ -3857,7 +4534,7 @@ class RetrievalEngine:
                 {
                     "label": "Inspect best non-source node",
                     "command": f"reql inspect --node-id {non_source_id} --json",
-                    "when": "use when the top hit is source evidence",
+                    "purpose": "best non-source node provenance and neighbors",
                 }
             )
         retrieve_statement = f"RETRIEVE {query} LIMIT {min(max_items, 8)} RETURN id,type,text,score,source_for,relation,direction,relative_path,line_start"
@@ -3865,14 +4542,14 @@ class RetrievalEngine:
             {
                 "label": "Retrieve source rows",
                 "command": f"reql query {self._shell_string(retrieve_statement)}",
-                "when": "use for compact source/location rows",
+                "purpose": "compact source/location rows",
             }
         )
         followups.append(
             {
                 "label": "Expand graph context",
                 "command": f"reql query_graph --query {query} --max-depth {subgraph.query.max_depth} --json",
-                "when": "use before broad source exploration",
+                "purpose": "expanded graph context",
             }
         )
         if len(ids) > 1:
@@ -3882,7 +4559,7 @@ class RetrievalEngine:
                 {
                     "label": "Compare top ids",
                     "command": f"reql query {self._shell_string(compare_statement)}",
-                    "when": "use to contrast close matches",
+                    "purpose": "comparison of close matches",
                 }
             )
         return followups

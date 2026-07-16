@@ -1,6 +1,8 @@
 ﻿from __future__ import annotations
 
 import hashlib
+import json
+import os
 import struct
 import tempfile
 import threading
@@ -217,6 +219,98 @@ class BlockStorageTests(unittest.TestCase):
                 self.assertEqual(reopened.lexical_search("replacement-only-token", top_k=1)[0][0].id, "n1")
             finally:
                 reopened.close()
+
+    def test_deferred_lexical_index_is_query_coherent_and_checkpointable(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "memory.reql"
+            store = BlockGraphStore(path)
+            try:
+                store.upsert_node(
+                    MemoryNode(
+                        id="n1",
+                        type="Topic",
+                        label="original marker",
+                        text="original-only-token",
+                        canonical_key="topic:n1",
+                    )
+                )
+                store.compact_storage()
+            finally:
+                store.close()
+
+            deferred = BlockGraphStore(path, defer_lexical_index=True)
+            try:
+                self.assertEqual(deferred._root_index["version"], 3)
+                self.assertNotIn("node_terms", deferred._root_index["indexes"])
+                self.assertFalse(deferred._lexical_index_loaded)
+                deferred.update_node_fields("n1", label="replacement marker", text="replacement-only-token")
+                self.assertFalse(deferred.lexical_search("original-only-token", top_k=1))
+                self.assertEqual(deferred.lexical_search("replacement-only-token", top_k=1)[0][0].id, "n1")
+                checkpoint = deferred.checkpoint_if_needed(wal_bytes_threshold=0)
+                self.assertTrue(checkpoint["checkpointed"])
+                self.assertTrue(deferred._lexical_index_loaded)
+            finally:
+                deferred.close()
+
+            reopened = BlockGraphStore(path)
+            try:
+                self.assertFalse(reopened.lexical_search("original-only-token", top_k=1))
+                self.assertEqual(reopened.lexical_search("replacement-only-token", top_k=1)[0][0].id, "n1")
+            finally:
+                reopened.close()
+
+    def test_deferred_lexical_overlay_is_restored_on_transaction_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "memory.reql"
+            initial = BlockGraphStore(path)
+            try:
+                initial.upsert_node(
+                    MemoryNode(id="n1", type="Topic", label="stable", text="stable-only-token", canonical_key="topic:n1")
+                )
+                initial.compact_storage()
+            finally:
+                initial.close()
+
+            deferred = BlockGraphStore(path, defer_lexical_index=True)
+            try:
+                with self.assertRaises(RuntimeError):
+                    with deferred.transaction():
+                        deferred.update_node_fields("n1", text="rolled-back-only-token")
+                        raise RuntimeError("rollback")
+
+                self.assertFalse(deferred._lexical_index_loaded)
+                self.assertEqual(deferred._deferred_lexical_changes, {})
+                self.assertEqual(deferred.lexical_search("stable-only-token", top_k=1)[0][0].id, "n1")
+                self.assertFalse(deferred.lexical_search("rolled-back-only-token", top_k=1))
+            finally:
+                deferred.close()
+
+    def test_legacy_root_index_version_is_rejected_without_migration(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "memory.reql"
+            store = BlockGraphStore(path)
+            try:
+                legacy_root = {**store._root_index, "version": 2}
+                with self.assertRaises(StorageError) as ctx:
+                    store._apply_root_index(legacy_root)
+            finally:
+                store.close()
+
+            self.assertIn("Unsupported REQL root index version 2", str(ctx.exception))
+            self.assertIn("Rebuild the storage", str(ctx.exception))
+
+    def test_current_root_index_requires_split_lexical_record(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "memory.reql"
+            store = BlockGraphStore(path)
+            try:
+                invalid_root = {**store._root_index, "lexical_index_location": {}}
+                with self.assertRaises(StorageError) as ctx:
+                    store._apply_root_index(invalid_root)
+            finally:
+                store.close()
+
+            self.assertIn("missing the required split lexical index", str(ctx.exception))
 
     def test_append_only_wal_reopens_without_manual_compaction(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -440,8 +534,14 @@ class BlockStorageTests(unittest.TestCase):
             try:
                 lock_path = path.with_name(f"{path.name}.lock")
                 self.assertTrue(lock_path.exists())
-                with self.assertRaises(StorageError):
+                with self.assertRaises(StorageError) as locked:
                     BlockGraphStore(path, lock_timeout_seconds=0.0)
+                message = str(locked.exception)
+                self.assertIn("command=", message)
+                self.assertIn("duration=", message)
+                self.assertIn("process_alive=true", message)
+                self.assertIn("watcher=false", message)
+                self.assertIn("--snapshot", message)
                 with self.assertRaises(StorageError):
                     BlockGraphStore(path, read_only=True, lock_timeout_seconds=0.0)
             finally:
@@ -453,6 +553,70 @@ class BlockStorageTests(unittest.TestCase):
                 self.assertEqual(second.schema_version(), 2)
             finally:
                 second.close()
+
+    def test_lock_diagnostics_report_watcher_owner_and_allow_snapshot_reads(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "memory.reql"
+            initial = BlockGraphStore(path)
+            initial.upsert_node(MemoryNode(id="snapshot-node", type="Topic", canonical_key="snapshot-node"))
+            initial.close()
+
+            with patch.object(block_store_module.sys, "argv", ["reql", "project", "compile", ".", "--watch"]):
+                writer = BlockGraphStore(path)
+            try:
+                diagnostics = block_store_module.inspect_store_locks(path)
+                self.assertTrue(diagnostics["locked"])
+                self.assertTrue(diagnostics["snapshot_available"])
+                self.assertIsNotNone(diagnostics["writer"])
+                assert diagnostics["writer"] is not None
+                self.assertIn("project compile", diagnostics["writer"]["command"])
+                self.assertTrue(diagnostics["writer"]["process_alive"])
+                self.assertTrue(diagnostics["writer"]["watcher"])
+                self.assertGreaterEqual(diagnostics["writer"]["duration_seconds"], 0.0)
+
+                snapshot = BlockGraphStore(path, read_only=True, snapshot=True, lock_timeout_seconds=0.0)
+                try:
+                    self.assertIsNotNone(snapshot.get_node("snapshot-node"))
+                finally:
+                    snapshot.close()
+            finally:
+                writer.close()
+
+    def test_stale_lock_recovery_is_safe_for_dead_and_incomplete_owners(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "memory.reql"
+            lock_path = path.with_name(f"{path.name}.lock")
+            lock_path.write_text(
+                json.dumps(
+                    {
+                        "format": "reql-store-lock-v2",
+                        "path": str(path),
+                        "pid": 2147483647,
+                        "host": block_store_module.socket.gethostname(),
+                        "token": "dead-owner",
+                        "created_at": block_store_module.utcnow_iso(),
+                        "command": "reql project compile .",
+                        "watcher": False,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            recovered = block_store_module.inspect_store_locks(path, recover_stale=True)
+            self.assertFalse(lock_path.exists())
+            self.assertEqual(len(recovered["recovered"]), 1)
+            self.assertFalse(recovered["recovered"][0]["process_alive"])
+
+            lock_path.write_text("", encoding="utf-8")
+            recent = block_store_module.inspect_store_locks(path, recover_stale=True)
+            self.assertTrue(lock_path.exists())
+            self.assertFalse(recent["writer"]["stale"])
+
+            old = time.time() - block_store_module.DEFAULT_INCOMPLETE_LOCK_STALE_SECONDS - 1
+            os.utime(lock_path, (old, old))
+            expired = block_store_module.inspect_store_locks(path, recover_stale=True)
+            self.assertFalse(lock_path.exists())
+            self.assertEqual(len(expired["recovered"]), 1)
 
     def test_readers_share_lock_and_writer_waits_for_readers(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -532,6 +696,29 @@ class BlockStorageTests(unittest.TestCase):
                 self.assertEqual(reopened.usage_for_node("n1")["usage_count"], 1)
             finally:
                 reopened.close()
+
+    def test_read_only_open_does_not_lock_usage_journal_for_loading(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "memory.reql"
+            store = BlockGraphStore(path)
+            try:
+                store.upsert_node(MemoryNode(id="n1", type="Topic", canonical_key="topic:one"))
+                store.compact_storage()
+            finally:
+                store.close()
+
+            reader = BlockGraphStore(path, read_only=True)
+            try:
+                reader.record_usage_event("topic one", [{"id": "n1", "score": 0.8, "activation": 0.3}])
+            finally:
+                reader.close()
+
+            with patch.object(block_store_module._StoreLock, "acquire", side_effect=AssertionError("usage journal read must not take a write lock")):
+                reopened = BlockGraphStore(path, read_only=True)
+                try:
+                    self.assertEqual(reopened.usage_for_node("n1")["usage_count"], 1)
+                finally:
+                    reopened.close()
 
     def test_wal_replays_updates_without_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -720,6 +907,29 @@ class BlockStorageTests(unittest.TestCase):
                 self.assertEqual([created for _, created in first], [True, True])
                 self.assertEqual([created for _, created in second], [False, False])
                 self.assertEqual(store.count_nodes(node_types={"Topic"}), 2)
+            finally:
+                store.close()
+
+    def test_indexed_counts_and_bounded_ordering(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = BlockGraphStore(Path(td) / "memory.reql")
+            try:
+                store.batch_upsert_nodes(
+                    [
+                        MemoryNode(id="active-low", type="Topic", status="active", salience=0.1),
+                        MemoryNode(id="active-high", type="Topic", status="active", salience=0.9),
+                        MemoryNode(id="archived", type="Topic", status="archived", salience=1.0),
+                        MemoryNode(id="other", type="Entity", status="active", salience=0.8),
+                    ]
+                )
+                store.batch_upsert_edges(
+                    [MemoryEdge(id="related", from_id="active-low", to_id="active-high", type="RELATED_TO")]
+                )
+
+                self.assertEqual(store.count_nodes(node_types={"Topic"}, statuses={"active"}), 2)
+                self.assertEqual(store.count_edges(edge_types={"RELATED_TO"}), 1)
+                top = store.find_nodes(type_="Topic", status="active", limit=1, order_by="salience")
+                self.assertEqual([node.id for node in top], ["active-high"])
             finally:
                 store.close()
 

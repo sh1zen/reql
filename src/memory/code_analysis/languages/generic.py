@@ -366,6 +366,7 @@ class GenericProfileTreeSitterExtractor(TreeSitterExtractorBase):
         self.references.append(_reference(self.artifact, caller or _parent(self.module, scope), target, _line(target_node), _column(target_node), "read"))
         for argument in _call_argument_nodes(node, self.profile):
             self._generic_expression_references(argument, scope, access="read")
+        argument_values = _quoted_texts_in_nodes(self.source, _call_argument_nodes(node, self.profile))
         self.calls.append(
             CodeCall(
                 id=stable_id("call", self.artifact.id, caller or "", target, _line(node), _column(node)),
@@ -374,7 +375,7 @@ class GenericProfileTreeSitterExtractor(TreeSitterExtractorBase):
                 target=target,
                 line=_line(node),
                 column=_column(node),
-                metadata={"language": self.language_key, "profile": self.profile.name},
+                metadata={"language": self.language_key, "profile": self.profile.name, "arguments": argument_values},
             )
         )
 
@@ -676,6 +677,27 @@ def _quoted_text_in_node(source: bytes, node: Any | None) -> str | None:
         if value:
             return value
     return None
+
+
+def _quoted_texts_in_nodes(source: bytes, nodes: list[Any]) -> list[str]:
+    values: list[str] = []
+    seen: set[str] = set()
+
+    def visit(node: Any | None) -> None:
+        if node is None:
+            return
+        child_type = str(getattr(node, "type", ""))
+        if "string" in child_type:
+            value = _clean_import_text(_node_text(source, node))
+            if value and value not in seen:
+                seen.add(value)
+                values.append(value)
+        for child in _named_children(node):
+            visit(child)
+
+    for node in nodes:
+        visit(node)
+    return values
 
 
 def _arguments_node(node: Any | None) -> Any | None:

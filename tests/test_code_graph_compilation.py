@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from api import MemoryGraph
 from memory.artifacts.models import SourceArtifact
@@ -15,6 +16,7 @@ from memory.code_analysis.languages.python import PythonTreeSitterExtractor
 from memory.code_analysis.languages.solidity import SolidityTreeSitterExtractor
 from memory.code_analysis.languages.tsx import TsxTreeSitterExtractor
 from memory.code_analysis.languages.typescript import TypeScriptTreeSitterExtractor
+from tests.config_helpers import open_graph_with_documents as _open_graph_with_documents
 from memory.code_analysis.factory import EXTRACTOR_BY_LANGUAGE, extractor_for
 from memory.code_analysis.catalog import CODE_LANGUAGE_CATALOG
 from memory.artifacts.fingerprint import artifact_id, normalize_path, project_id
@@ -92,17 +94,6 @@ class CodeGraphCompilationTests(unittest.TestCase):
         self.assertEqual(TypeScriptTreeSitterExtractor.tree_sitter_function, "language_typescript")
         self.assertEqual(TsxTreeSitterExtractor.tree_sitter_function, "language_tsx")
         self.assertEqual(PhpTreeSitterExtractor.tree_sitter_function, "language_php")
-
-    def test_compile_project_runs_without_external_extraction_pipeline(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "project"
-            root.mkdir()
-            (root / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
-            graph = MemoryGraph.open(Path(td) / "memory.reql")
-            try:
-                graph.compile_project(root)
-            finally:
-                graph.close()
 
     def test_tree_sitter_syntax_recovery_does_not_fail_project_compile(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -240,6 +231,330 @@ class CodeGraphCompilationTests(unittest.TestCase):
                     )
                 )
                 self.assertIn("EVIDENCED_BY incoming", query_graph["context"])
+            finally:
+                graph.close()
+
+    def test_project_structural_links_make_overrides_reexports_and_wrappers_queryable(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "project"
+            package = root / "pkg"
+            package.mkdir(parents=True)
+            (package / "__init__.py").write_text(
+                "from .base import Base\nfrom .derived import *\n",
+                encoding="utf-8",
+            )
+            (package / "base.py").write_text(
+                "\n".join(
+                    [
+                        "class Base:",
+                        "    def execute(self, value):",
+                        "        return value",
+                        "",
+                        "    def close(self):",
+                        "        return None",
+                        "",
+                        "def target(value):",
+                        "    return value",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (package / "derived.py").write_text(
+                "\n".join(
+                    [
+                        "from .base import Base, target",
+                        "",
+                        "class Derived(Base):",
+                        "    def execute(self, value):",
+                        "        return super().execute(value)",
+                        "",
+                        "    def close(self):",
+                        "        return super().close()",
+                        "",
+                        "def proxy(value):",
+                        "    return target(value)",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            graph = MemoryGraph.open(Path(td) / "memory.reql")
+            try:
+                result = graph.compile_project(root)
+                self.assertFalse(result.run.errors)
+                nodes = {node.id: node for node in graph.store.all_nodes()}
+
+                override_edges = [
+                    edge
+                    for edge in graph.store.get_edges(type_="OVERRIDES", limit=20)
+                    if edge.properties.get("status") == "active"
+                ]
+                override_pairs = {
+                    (
+                        nodes[edge.from_id].properties.get("qualified_name"),
+                        nodes[edge.to_id].properties.get("qualified_name"),
+                    )
+                    for edge in override_edges
+                }
+                self.assertEqual(
+                    override_pairs,
+                    {
+                        ("pkg.derived.Derived.execute", "pkg.base.Base.execute"),
+                        ("pkg.derived.Derived.close", "pkg.base.Base.close"),
+                    },
+                )
+                self.assertTrue(
+                    all("override" in nodes[edge.from_id].properties.get("semantic_roles", []) for edge in override_edges)
+                )
+
+                proxy = next(node for node in nodes.values() if node.properties.get("qualified_name") == "pkg.derived.proxy")
+                target = next(node for node in nodes.values() if node.properties.get("qualified_name") == "pkg.base.target")
+                self.assertIn("wrapper", proxy.properties.get("semantic_roles", []))
+                self.assertTrue(
+                    any(
+                        edge.from_id == proxy.id and edge.to_id == target.id and edge.properties.get("status") == "active"
+                        for edge in graph.store.get_edges(type_="WRAPS", limit=20)
+                    )
+                )
+
+                initializer_nodes = [
+                    node
+                    for node in nodes.values()
+                    if node.type in {"File", "Module"} and node.properties.get("relative_path") == "pkg/__init__.py"
+                ]
+                self.assertTrue(initializer_nodes)
+                self.assertTrue(
+                    all(
+                        {"package-initializer", "re-export"}.issubset(node.properties.get("semantic_roles", []))
+                        for node in initializer_nodes
+                    )
+                )
+                init_module = next(node for node in initializer_nodes if node.type == "Module")
+                re_exported_names = {
+                    nodes[edge.to_id].properties.get("name")
+                    for edge in graph.store.get_edges(from_id=init_module.id, type_="RE_EXPORTS", limit=30)
+                    if edge.properties.get("status") == "active" and edge.to_id in nodes
+                }
+                self.assertTrue({"Base", "Derived", "proxy"}.issubset(re_exported_names))
+
+                override_rows = graph.query("RETRIEVE 'override' LIMIT 10 RETURN type,text,relative_path")
+                self.assertTrue(any(row["type"] == "Method" and row["relative_path"] == "pkg/derived.py" for row in override_rows.rows))
+                wrapper_rows = graph.query("RETRIEVE 'wrapper' LIMIT 10 RETURN type,text,relative_path")
+                self.assertTrue(any(row["text"] == "pkg.derived.proxy" for row in wrapper_rows.rows))
+                initializer_rows = graph.query("RETRIEVE 're-export package initializer' LIMIT 10 RETURN type,text,relative_path")
+                self.assertTrue(any(row["relative_path"] == "pkg/__init__.py" for row in initializer_rows.rows))
+                initializer_context = graph.query_context_payload(
+                    "re-export initializer",
+                    scopes=["code"],
+                    top_k=10,
+                )
+                self.assertIn("pkg/__init__.py", {row["path"] for row in initializer_context["working_set"]})
+
+                (package / "__init__.py").write_text("# no public exports\n", encoding="utf-8")
+                (package / "derived.py").write_text(
+                    "\n".join(
+                        [
+                            "from .base import Base, target",
+                            "",
+                            "class Derived(Base):",
+                            "    def execute(self, value):",
+                            "        return super().execute(value)",
+                            "",
+                            "def proxy(value):",
+                            "    return target(value)",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                refreshed = graph.compile_project(root)
+                self.assertFalse(refreshed.run.errors)
+                active_override_edges = [
+                    edge
+                    for edge in graph.store.get_edges(type_="OVERRIDES", limit=20)
+                    if edge.properties.get("status") == "active" and edge.weight > 0
+                ]
+                self.assertEqual(len(active_override_edges), 1)
+                refreshed_initializers = [
+                    node
+                    for node in graph.store.all_nodes()
+                    if node.type in {"File", "Module"} and node.properties.get("relative_path") == "pkg/__init__.py"
+                ]
+                self.assertTrue(all("re-export" not in node.properties.get("semantic_roles", []) for node in refreshed_initializers))
+            finally:
+                graph.close()
+
+    def test_compile_links_php_rendered_views_and_surface_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "project"
+            controller = root / "app" / "Controllers" / "AuthController.php"
+            view = root / "app" / "Views" / "home" / "index.php"
+            partial = root / "app" / "Views" / "partials" / "banner.php"
+            css = root / "public" / "assets" / "css" / "app.css"
+            js = root / "public" / "assets" / "js" / "app.js"
+            controller.parent.mkdir(parents=True)
+            view.parent.mkdir(parents=True)
+            partial.parent.mkdir(parents=True)
+            css.parent.mkdir(parents=True)
+            js.parent.mkdir(parents=True)
+            controller.write_text(
+                "\n".join(
+                    [
+                        "<?php",
+                        "class AuthController {",
+                        "    public function login() {",
+                        "        $badges = [];",
+                        "        $unused = [];",
+                        "        return view('home/index', array_merge(['user' => $user, 'role' => $role], compact('badges')));",
+                        "    }",
+                        "}",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            view.write_text(
+                "\n".join(
+                    [
+                        "<form>",
+                        "  <input class=\"password-field\" name=\"password\" type=\"password\">",
+                        "  <?php require __DIR__ . '/../partials/banner.php'; ?>",
+                        "  <?php // require __DIR__ . '/../partials/ghost.php'; ?>",
+                        "</form>",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            partial.write_text("<aside class=\"banner\"><?= $user ?></aside>\n", encoding="utf-8")
+            css.write_text(
+                "\n".join(
+                    [
+                        ".password-field { border-color: #555; }",
+                        ".js-only { display: none; }",
+                        ".unused-css { opacity: .5; }",
+                        ".duplicate { color: red; color: blue; }",
+                        "input[type=\"password\"] { letter-spacing: 0; }",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            js.write_text(
+                "document.querySelector('.password-field')?.focus();\n"
+                "document.querySelectorAll('.js-only').forEach((item) => item.remove());\n",
+                encoding="utf-8",
+            )
+
+            graph = MemoryGraph.open(Path(td) / "memory.reql")
+            try:
+                result = graph.compile_project(root)
+                self.assertFalse(result.run.errors)
+
+                files = {
+                    node.properties.get("relative_path"): node
+                    for node in graph.store.all_nodes()
+                    if node.type == "File"
+                }
+                self.assertEqual(files["public/assets/css/app.css"].properties.get("context_scope"), "code")
+                self.assertEqual(files["public/assets/css/app.css"].properties.get("language"), "CSS")
+
+                template_edges = [
+                    edge
+                    for edge in graph.store.all_edges()
+                    if edge.type == "REFERENCES"
+                    and edge.properties.get("relation") == "template_render"
+                    and edge.to_id == files["app/Views/home/index.php"].id
+                ]
+                self.assertTrue(template_edges)
+                self.assertEqual(template_edges[0].properties.get("target_name"), "home/index")
+                self.assertEqual(template_edges[0].properties.get("view_variables"), ["badges", "role", "user"])
+
+                unused_variables = {
+                    node.properties.get("symbol_name")
+                    for node in graph.store.all_nodes()
+                    if node.type == "StaticAnalysisFinding"
+                    and node.properties.get("finding_type") == "unused_variable"
+                    and node.properties.get("relative_path") == "app/Controllers/AuthController.php"
+                }
+                self.assertNotIn("badges", unused_variables)
+                self.assertIn("unused", unused_variables)
+
+                include_edges = [
+                    edge
+                    for edge in graph.store.all_edges()
+                    if edge.type == "REFERENCES"
+                    and edge.properties.get("relation") == "template_include"
+                    and edge.to_id == files["app/Views/partials/banner.php"].id
+                ]
+                self.assertTrue(include_edges)
+                self.assertTrue(include_edges[0].properties.get("inherits_scope"))
+                self.assertFalse(
+                    any(
+                        "ghost.php" in str(node.properties.get("module") or "")
+                        for node in graph.store.all_nodes()
+                        if node.type == "Import"
+                    )
+                )
+
+                node_by_id = {node.id: node for node in graph.store.all_nodes()}
+                surface_edges = [
+                    edge
+                    for edge in graph.store.all_edges()
+                    if edge.type == "REFERENCES" and edge.properties.get("relation") == "shared_surface_identifier"
+                ]
+                linked_paths = {
+                    (
+                        node_by_id[edge.from_id].properties.get("relative_path") if edge.from_id in node_by_id else None,
+                        node_by_id[edge.to_id].properties.get("relative_path") if edge.to_id in node_by_id else None,
+                    )
+                    for edge in surface_edges
+                }
+                self.assertTrue(
+                    ("public/assets/css/app.css", "app/Views/home/index.php") in linked_paths
+                    or ("app/Views/home/index.php", "public/assets/css/app.css") in linked_paths
+                )
+                self.assertTrue(
+                    ("public/assets/js/app.js", "app/Views/home/index.php") in linked_paths
+                    or ("app/Views/home/index.php", "public/assets/js/app.js") in linked_paths
+                )
+                self.assertTrue(
+                    ("public/assets/css/app.css", "public/assets/js/app.js") in linked_paths
+                    or ("public/assets/js/app.js", "public/assets/css/app.css") in linked_paths
+                )
+
+                css_findings = [
+                    node
+                    for node in graph.store.all_nodes()
+                    if node.type == "StaticAnalysisFinding"
+                    and node.properties.get("relative_path") == "public/assets/css/app.css"
+                    and node.status == "active"
+                ]
+                finding_names = {(node.properties.get("finding_type"), node.properties.get("symbol_name")) for node in css_findings}
+                self.assertIn(("unused_css_class", ".unused-css"), finding_names)
+                self.assertNotIn(("unused_css_class", ".password-field"), finding_names)
+                self.assertNotIn(("unused_css_class", ".js-only"), finding_names)
+                self.assertIn(("always_overridden_css_declaration", ".duplicate color"), finding_names)
+
+                payload = graph.query_context_payload("AuthController password field", top_k=12, scopes=["code"])
+                working_paths = {row["path"] for row in payload["working_set"]}
+                self.assertIn("app/Controllers/AuthController.php", working_paths)
+                self.assertIn("app/Views/home/index.php", working_paths)
+                self.assertIn("public/assets/css/app.css", working_paths)
+                php_symbols = [
+                    node
+                    for node in graph.store.all_nodes()
+                    if node.type in {"Class", "Method"}
+                    and node.properties.get("relative_path") == "app/Controllers/AuthController.php"
+                ]
+                if php_symbols:
+                    self.assertTrue(all(node.properties.get("line_start") for node in php_symbols))
+                    self.assertTrue(all(node.properties.get("line_end") for node in php_symbols))
+                    self.assertTrue(all(node.properties.get("source_path") for node in php_symbols))
+                    symbol_rows = graph.query(
+                        "SYMBOLS WHERE relative_path = 'app/Controllers/AuthController.php' "
+                        "RETURN type,name,start_line,end_line,line_start,line_end LIMIT 10"
+                    )
+                    owner_rows = [row for row in symbol_rows.rows if row["type"] in {"Class", "Method"}]
+                    self.assertTrue(owner_rows)
+                    self.assertTrue(all(row["line_start"] for row in owner_rows))
+                    self.assertTrue(all(row["line_end"] for row in owner_rows))
             finally:
                 graph.close()
 
@@ -448,7 +763,7 @@ class CodeGraphCompilationTests(unittest.TestCase):
                 "# Soup Guide\n\nshared_scope_marker soup docs evidence.\n",
                 encoding="utf-8",
             )
-            graph = MemoryGraph.open(Path(td) / "memory.reql")
+            graph = _open_graph_with_documents(Path(td) / "memory.reql")
             try:
                 result = graph.compile_project(root)
                 self.assertFalse(result.run.errors)
@@ -598,6 +913,27 @@ class CodeGraphCompilationTests(unittest.TestCase):
                 self.assertTrue(expected_imports.issubset({item.module for item in result.imports}))
                 self.assertTrue(expected_calls.issubset({call.target for call in result.calls}))
                 self.assertTrue(all(call.caller for call in result.calls if call.target in expected_calls))
+
+    def test_tree_sitter_parser_unavailable_is_non_fatal(self) -> None:
+        artifact = SourceArtifact(
+            id="artifact:sql",
+            project_id="project:generic",
+            uri="file:///schema.sql",
+            path="schema.sql",
+            relative_path="schema.sql",
+            artifact_type="code",
+            language="sql",
+            size_bytes=20,
+            sha256="",
+            mtime=0.0,
+        )
+        parser = TreeSitterCodeParser()
+        with patch("memory.code_analysis.base._parser_for", side_effect=ValueError("Unsupported Tree-sitter language: sql")):
+            result = parser.parse_artifact(artifact, "select * from users;\n")
+
+        self.assertFalse(result.errors)
+        self.assertEqual(result.module.metadata.get("parser_status"), "skipped")
+        self.assertIn("Unsupported Tree-sitter language: sql", result.module.metadata.get("parser_warning", ""))
 
     def test_compile_project_supports_multiple_languages_in_one_project(self) -> None:
         with tempfile.TemporaryDirectory() as td:

@@ -1,6 +1,8 @@
 """REQL configuration loading."""
 from .loader import (
     CONFIG_FILENAME,
+    LOCAL_CONFIG_FILENAME,
+    PROJECT_CONFIG_FILENAME,
     CONFIG_OVERRIDES_ENV,
     CONFIG_PATH_ENV,
     ConfigError,
@@ -9,6 +11,7 @@ from .loader import (
     find_config_path,
     load_config,
     load_effective_config,
+    load_project_config_data,
     merge_overrides,
     parse_config_override_assignment,
     parse_config_override_assignments,
@@ -31,6 +34,8 @@ from .models import (
 __all__ = [
     "AnalysisConfig",
     "CONFIG_FILENAME",
+    "LOCAL_CONFIG_FILENAME",
+    "PROJECT_CONFIG_FILENAME",
     "CONFIG_OVERRIDES_ENV",
     "CONFIG_PATH_ENV",
     "CacheConfig",
@@ -47,6 +52,7 @@ __all__ = [
     "find_config_path",
     "load_config",
     "load_effective_config",
+    "load_project_config_data",
     "merge_config",
     "merge_overrides",
     "parse_config_override_assignment",

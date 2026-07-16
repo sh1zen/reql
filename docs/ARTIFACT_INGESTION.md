@@ -83,8 +83,8 @@ errors and do not stop the full project compile.
 
 ## Fallbacks
 
-PDF parsing is controlled by the `compile.documents` policy for `pdf`. When
-that policy has `ingest: true`, PDF parsing uses optional dependencies.
+PDF parsing is controlled by `compile.documents.pdf`. When that toggle is
+`true`, PDF parsing uses optional dependencies.
 Missing dependencies do not become mandatory runtime requirements. The compiler
 records metadata-only fragments and marks artifact properties such as
 `needs_parser` or `partially_readable` where appropriate. Image and video files

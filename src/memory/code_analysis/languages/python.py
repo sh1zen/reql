@@ -135,6 +135,10 @@ class PythonTreeSitterExtractor(TreeSitterExtractorBase):
             param_annotations = _param_annotations(self.source, parameters)
             if param_annotations:
                 symbol.metadata["param_annotations"] = param_annotations
+            wrapper_target = _python_wrapper_target(self.source, node)
+            if wrapper_target:
+                symbol.metadata["semantic_roles"] = ["wrapper"]
+                symbol.metadata["wrapper_targets"] = [wrapper_target]
             return symbol
         return None
 
@@ -327,6 +331,34 @@ def _python_bases(source: bytes, node: Any) -> list[str]:
     if superclasses is None:
         return []
     return [_node_text(source, child).strip() for child in _named_children(superclasses) if _node_text(source, child).strip()]
+
+
+def _python_wrapper_target(source: bytes, node: Any) -> str | None:
+    """Return the delegated call for a conservative one-statement wrapper."""
+    body = _field(node, "body")
+    statements = [
+        child
+        for child in _named_children(body)
+        if str(getattr(child, "type", "")) != "comment" and not _is_docstring_statement(child)
+    ]
+    if len(statements) != 1:
+        return None
+    statement = statements[0]
+    if str(getattr(statement, "type", "")) not in {"expression_statement", "return_statement"}:
+        return None
+    calls = _descendants_of_type(statement, "call")
+    if len(calls) != 1:
+        return None
+    return _call_target(source, _field(calls[0], "function")) or None
+
+
+def _descendants_of_type(node: Any | None, node_type: str) -> list[Any]:
+    if node is None:
+        return []
+    matches = [node] if str(getattr(node, "type", "")) == node_type else []
+    for child in _named_children(node):
+        matches.extend(_descendants_of_type(child, node_type))
+    return matches
 
 
 def _assignment_names(source: bytes, node: Any | None) -> list[tuple[str, Any]]:

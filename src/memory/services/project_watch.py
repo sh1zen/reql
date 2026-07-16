@@ -164,34 +164,23 @@ class ProjectWatchService:
         debounce_seconds: float,
         sleeper: SleepFn,
     ) -> ProjectWatchEvent:
-        status = self.incremental.cache_status(
+        if debounce_seconds > 0:
+            sleeper(debounce_seconds)
+        # A watch cycle must observe one coherent filesystem snapshot. The old
+        # status-then-compile flow scanned twice and could both waste time and
+        # compile a different state than the one it reported.
+        result = self.incremental.compile_path(
             path,
-
             max_file_size_bytes=max_file_size_bytes,
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
             cache_enabled=cache_enabled,
             parsing_options=parsing_options,
         )
-        dirty = _status_int(status, "dirty_artifacts")
-        deleted = _status_int(status, "deleted_artifacts")
-        total = _status_int(status, "total_artifacts")
-        result: CompileProjectResult | None = None
-        errors: tuple[str, ...] = ()
-
-        if dirty or deleted:
-            if debounce_seconds > 0:
-                sleeper(debounce_seconds)
-            result = self.incremental.compile_path(
-                path,
-
-                max_file_size_bytes=max_file_size_bytes,
-                include_patterns=include_patterns,
-                exclude_patterns=exclude_patterns,
-                cache_enabled=cache_enabled,
-                parsing_options=parsing_options,
-            )
-            errors = tuple(result.run.errors)
+        dirty = len(result.dirty_set.changed_artifact_ids)
+        deleted = len(result.dirty_set.deleted_artifact_ids)
+        total = len(result.scan.artifacts)
+        errors = tuple(result.run.errors)
 
         return ProjectWatchEvent(
             iteration=iteration,
@@ -200,20 +189,10 @@ class ProjectWatchService:
             total_artifacts=total,
             dirty_artifacts=dirty,
             deleted_artifacts=deleted,
-            compiled=result is not None,
+            compiled=bool(dirty or deleted),
             result=result,
             errors=errors,
         )
-
-
-def _status_int(status: dict[str, object], key: str) -> int:
-    value = status.get(key, 0)
-    if isinstance(value, bool):
-        return int(value)
-    try:
-        return int(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return 0
 
 
 class _WatchdogChangeHandler(FileSystemEventHandler):

@@ -9,13 +9,34 @@ from typing import Any
 from ..domain.ids import stable_id
 from .models import ArtifactFingerprint
 
-DEFAULT_PARSER_VERSION = "project-scan-v9"
+DEFAULT_PARSER_VERSION = "project-scan-v10"
 DEFAULT_CHUNKING_VERSION = "uncompiled-v1"
 
 
 def normalize_path(path: str | Path) -> str:
     """Return an absolute normalized path string with POSIX separators."""
     return Path(path).expanduser().resolve(strict=False).as_posix()
+
+
+def normalize_relative_lookup_path(path: str | Path) -> str:
+    """Normalize a project-relative lookup path without altering dotfile names."""
+    value = str(path).strip().replace("\\", "/")
+    while value.startswith("./"):
+        value = value[2:]
+    if value.startswith("/") or (len(value) >= 2 and value[1] == ":"):
+        raise ValueError("path must be project-relative")
+    parts = []
+    for part in value.rstrip("/").split("/"):
+        if part in {"", "."}:
+            continue
+        if part == "..":
+            raise ValueError("path must not traverse outside the project")
+        parts.append(part)
+    return "/".join(parts)
+
+
+def relative_path_lookup_key(path: str | Path) -> str:
+    return normalize_relative_lookup_path(path).casefold()
 
 
 def relative_path(root: str | Path, path: str | Path) -> str:

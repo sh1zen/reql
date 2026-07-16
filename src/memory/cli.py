@@ -9,10 +9,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .config import CONFIG_FILENAME, ConfigError, REQLConfig, load_config, load_effective_config, parse_config_override_assignments, write_sample_config
+from .config import PROJECT_CONFIG_FILENAME, ConfigError, REQLConfig, load_effective_config, load_project_config_data, parse_config_override_assignments, write_sample_config
 from .diagnostics import PerformanceLogger
 from .domain.exceptions import StorageError
-from .storage import BlockGraphStore
+from .storage import BlockGraphStore, inspect_store_locks
 from .reporting.html_graph import write_graph_html
 from api.memory_graph import MemoryGraph
 
@@ -20,6 +20,7 @@ from api.memory_graph import MemoryGraph
 DEFAULT_STORAGE_DIR = ".reql"
 DEFAULT_STORAGE_FILE = "memory.reql"
 DANGEROUS_EXCLUDE_PATTERNS = {"*", "**", "**/*", "/**", "/*", "/", ".", "./"}
+LOCKED_FOR_WRITE_PREFIX = "REQL block store is locked for write: "
 
 
 class _PromptInterrupted(Exception):
@@ -48,6 +49,17 @@ def _print_json(payload: object) -> None:
         sys.stdout.buffer.write(b"\n")
 
 
+def _format_storage_error(error: StorageError) -> str:
+    message = str(error)
+    if message.startswith(LOCKED_FOR_WRITE_PREFIX):
+        storage_path = message[len(LOCKED_FOR_WRITE_PREFIX) :].partition(";")[0].strip()
+        return (
+            "reql is locked for write: to fix any possible stale: "
+            f'reql --storage "{storage_path}" storage locks --recover-stale'
+        )
+    return f"reql: {message}"
+
+
 def _print_compile_result(result: Any) -> None:
     run = result.run
     print(f"Project: {result.scan.project.name}")
@@ -60,6 +72,8 @@ def _print_compile_result(result: Any) -> None:
     print(f"Nodes: created={run.nodes_created}, updated={run.nodes_updated}")
     print(f"Edges: created={run.edges_created}, updated={run.edges_updated}")
     print(f"Delta: {result.delta.id}")
+    if result.revision is not None:
+        print(f"Revision: {result.revision.id} ({len(result.revision.changes)} file changes)")
     if run.errors:
         print("Errors:")
         for error in run.errors:
@@ -253,6 +267,27 @@ def _print_storage_inspection(payload: dict[str, Any]) -> None:
         print(f"  {key}: {value}")
 
 
+def _print_storage_locks(payload: dict[str, Any]) -> None:
+    print(f"Path: {payload['path']}")
+    print(f"Locked: {payload['locked']}")
+    locks = [payload["writer"]] if payload.get("writer") else []
+    locks.extend(payload.get("readers") or [])
+    for item in locks:
+        alive = item.get("process_alive")
+        alive_text = "unknown" if alive is None else str(bool(alive)).lower()
+        print(
+            f"  {item['mode']}: command={item.get('command') or 'unknown'}; "
+            f"pid={item.get('pid')}; duration={float(item.get('duration_seconds', 0.0)):.3f}s; "
+            f"alive={alive_text}; watcher={str(bool(item.get('watcher'))).lower()}; "
+            f"stale={str(bool(item.get('stale'))).lower()}"
+        )
+    for item in payload.get("recovered") or []:
+        print(f"Recovered stale {item['mode']} lock: {item['lock_path']}")
+    print(f"Snapshot available: {payload.get('snapshot_available', False)}")
+    if payload.get("snapshot_hint"):
+        print(f"Snapshot command: {payload['snapshot_hint']}")
+
+
 def _print_storage_compaction(payload: dict[str, Any]) -> None:
     print(f"Compacted: {payload['path']}")
     print(f"Generation: {payload['generation_id_before']} -> {payload['generation_id_after']}")
@@ -275,7 +310,12 @@ def _print_agent_status(payload: dict[str, Any]) -> None:
     print(f"Derived nodes: {payload['derived_nodes']}")
     print(f"Agent nodes: {payload['agent_nodes']}")
     if payload.get("current_session_id"):
-        print(f"Current session: {payload['current_session_id']} ({payload.get('current_session_title') or ''})")
+        open_tasks = int(payload.get("current_session_open_tasks") or 0)
+        title = payload.get("current_session_title") or ""
+        if payload.get("current_session_is_idle"):
+            print(f"Last session: {payload['current_session_id']} ({title}; idle, open_tasks=0)")
+        else:
+            print(f"Current session: {payload['current_session_id']} ({title}; open_tasks={open_tasks})")
 
 
 def _print_agent_node(payload: dict[str, Any]) -> None:
@@ -438,7 +478,7 @@ def _agent_batch_operations_from_args(args: argparse.Namespace) -> list[dict[str
     return operations
 
 
-_READ_ONLY_COMMANDS = {"query_context", "query_explore", "query_graph", "query_memories", "query", "stats", "inspect"}
+_READ_ONLY_COMMANDS = {"locate", "query_context", "query_explore", "query_graph", "query_memories", "query", "stats", "inspect"}
 _MUTATING_REQL_COMMANDS = {"COMMUNITIES", "HUBS"}
 
 
@@ -450,14 +490,26 @@ def _query_requires_write(args: argparse.Namespace) -> bool:
     return first in _MUTATING_REQL_COMMANDS
 
 
+def _is_read_only_command(args: argparse.Namespace) -> bool:
+    command = str(getattr(args, "command", ""))
+    if command == "project":
+        return str(getattr(args, "project_command", "")) in {"status", "history", "diff"}
+    return command in _READ_ONLY_COMMANDS and not _query_requires_write(args)
+
+
 def _open(args: argparse.Namespace, config: REQLConfig, profile_logger: PerformanceLogger | None = None) -> MemoryGraph:
-    read_only_command = str(getattr(args, "command", "")) in _READ_ONLY_COMMANDS and not _query_requires_write(args)
+    read_only_command = _is_read_only_command(args)
+    snapshot = bool(getattr(args, "snapshot", False))
+    defer_lexical_index = (
+        str(getattr(args, "command", "")) == "project"
+        and str(getattr(args, "project_command", "")) in {"compile", "update"}
+    )
     if read_only_command:
         if profile_logger:
             profile_logger.event("storage.open.start", category="lifecycle", path=str(args.storage), read_only=True)
             try:
                 with profile_logger.span("storage.open", path=str(args.storage), read_only=True):
-                    return MemoryGraph.open(Path(args.storage), config=config, profile_logger=profile_logger, read_only=True)
+                    return MemoryGraph.open(Path(args.storage), config=config, profile_logger=profile_logger, read_only=True, snapshot=snapshot)
             except StorageError as exc:
                 if "missing REQL storage" not in str(exc):
                     raise
@@ -467,7 +519,7 @@ def _open(args: argparse.Namespace, config: REQLConfig, profile_logger: Performa
                 _checkpoint_opened_store_if_needed(graph, profile_logger)
                 return graph
         try:
-            return MemoryGraph.open(Path(args.storage), config=config, read_only=True)
+            return MemoryGraph.open(Path(args.storage), config=config, read_only=True, snapshot=snapshot)
         except StorageError as exc:
             if "missing REQL storage" not in str(exc):
                 raise
@@ -477,10 +529,15 @@ def _open(args: argparse.Namespace, config: REQLConfig, profile_logger: Performa
     if profile_logger:
         profile_logger.event("storage.open.start", category="lifecycle", path=str(args.storage), read_only=False)
         with profile_logger.span("storage.open", path=str(args.storage), read_only=False):
-            graph = MemoryGraph.open(Path(args.storage), config=config, profile_logger=profile_logger)
+            graph = MemoryGraph.open(
+                Path(args.storage),
+                config=config,
+                profile_logger=profile_logger,
+                defer_lexical_index=defer_lexical_index,
+            )
         _checkpoint_opened_store_if_needed(graph, profile_logger)
         return graph
-    graph = MemoryGraph.open(Path(args.storage), config=config)
+    graph = MemoryGraph.open(Path(args.storage), config=config, defer_lexical_index=defer_lexical_index)
     _checkpoint_opened_store_if_needed(graph, None)
     return graph
 
@@ -581,7 +638,7 @@ def _add_query_explore_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--view",
         action="append",
-        choices=["all", "owners", "callers", "public_surface", "serialization_paths", "docs_mentions", "code"],
+        choices=["all", "owners", "callers", "public_surface", "serialization_paths", "docs_mentions", "structural_duplicates", "code"],
         help="Explore view to include; may be repeated. Defaults to all views.",
     )
     parser.add_argument("--owners-only", action="store_true", help="Shortcut for --view owners")
@@ -589,6 +646,7 @@ def _add_query_explore_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--public-surface-only", action="store_true", help="Shortcut for --view public_surface")
     parser.add_argument("--serialization-paths-only", action="store_true", help="Shortcut for --view serialization_paths")
     parser.add_argument("--docs-mentions-only", action="store_true", help="Shortcut for --view docs_mentions")
+    parser.add_argument("--structural-duplicates-only", action="store_true", help="Shortcut for --view structural_duplicates")
     parser.add_argument("--code-only", action="store_true", help="Shortcut for --view code")
     parser.add_argument("--include-archived", action="store_true", help="Include archived graph records")
     parser.add_argument("--json", action="store_true", help="Print structured JSON result")
@@ -601,6 +659,7 @@ def _query_explore_views_from_args(args: argparse.Namespace) -> list[str] | None
         ("public_surface_only", "public_surface"),
         ("serialization_paths_only", "serialization_paths"),
         ("docs_mentions_only", "docs_mentions"),
+        ("structural_duplicates_only", "structural_duplicates"),
         ("code_only", "code"),
     ]
     selected = [view for attr, view in shortcuts if bool(getattr(args, attr, False))]
@@ -695,14 +754,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="REQL block storage path. Defaults to <build path>/.reql/memory.reql for project/cache commands, otherwise ./.reql/memory.reql",
     )
-    parser.add_argument("--config", default=None, help="Path to conf.yaml")
+    parser.add_argument("--config", default=None, help="Path to a project reql.conf")
     parser.add_argument(
         "--set",
         dest="config_overrides",
         action="append",
         default=[],
         metavar="SECTION.OPTION=VALUE",
-        help="Override a config value after loading conf.yaml; may be repeated",
+        help="Override a config value after loading the internal defaults and reql.conf; list values are joined",
     )
 
     sub = parser.add_subparsers(dest="command", required=True)
@@ -738,6 +797,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     agent = sub.add_parser("agent", help="Agent Workspace commands for coding-agent working memory")
     agent.add_argument("--agent", dest="agent_id", default=None, help="Use an agent id; defaults to REQL_AGENT_ID or the bus current agent")
+    agent.add_argument(
+        "--activity",
+        dest="activity_id",
+        default=None,
+        help="Isolate the current session for one activity; defaults to REQL_AGENT_ACTIVITY_ID or CODEX_THREAD_ID",
+    )
+    parser.add_argument(
+        "--snapshot",
+        action="store_true",
+        help="Open read-only commands from the latest complete storage snapshot even while a writer lock is active",
+    )
     agent_sub = agent.add_subparsers(dest="agent_command", required=True)
     agent_init = agent_sub.add_parser("init", help="Initialize a private agent working graph from the standard graph")
     agent_init.add_argument("--json", action="store_true", help="Print structured JSON result")
@@ -779,7 +849,7 @@ def build_parser() -> argparse.ArgumentParser:
     agent_link.add_argument("--relation", required=True, help="Relation type")
     agent_link.add_argument("--json", action="store_true", help="Print structured JSON result")
     agent_link_task = agent_sub.add_parser("link-task", help="Link an open task to a target resolved from a readable path")
-    agent_link_task.add_argument("--task", dest="task_id", default=None, help="Task id; defaults to the latest open task in the current session")
+    agent_link_task.add_argument("--task", dest="task_id", required=True, help="Explicit task id to link")
     agent_link_task.add_argument("--file", dest="file_path", required=True, help="File path to resolve in the agent graph")
     agent_link_task.add_argument("--relation", default="touches", help="Relation type; defaults to touches")
     agent_link_task.add_argument("--json", action="store_true", help="Print structured JSON result")
@@ -838,10 +908,10 @@ def build_parser() -> argparse.ArgumentParser:
     config = sub.add_parser("config", help="Configuration commands: show, init")
     config_sub = config.add_subparsers(dest="config_command", required=True)
     config_sub.add_parser("show", help="Print the effective configuration")
-    config_init = config_sub.add_parser("init", help="Create a sample conf.yaml if absent")
-    config_init.add_argument("--path", default="conf.yaml", help="Target config file path")
+    config_init = config_sub.add_parser("init", help="Create a sample reql.conf if absent")
+    config_init.add_argument("--path", default=PROJECT_CONFIG_FILENAME, help="Target project config file path")
 
-    project = sub.add_parser("project", help="Project commands: compile, exclude, update, status, report")
+    project = sub.add_parser("project", help="Project commands: compile, update, status, history, diff, report, exclude")
     project_sub = project.add_subparsers(dest="project_command", required=True)
 
     project_compile = project_sub.add_parser("compile", help="Scan and incrementally compile dirty artifacts")
@@ -859,6 +929,16 @@ def build_parser() -> argparse.ArgumentParser:
     project_status = project_sub.add_parser("status", help="Show registered project artifact status")
     project_status.add_argument("path")
     project_status.add_argument("--json", action="store_true", help="Print structured JSON result")
+
+    project_history = project_sub.add_parser("history", help="Show newest-first content-addressed project revisions")
+    project_history.add_argument("path", nargs="?", default=".", help="Registered project path; defaults to the current working directory")
+    project_history.add_argument("--limit", type=int, default=20, help="Maximum revisions to show")
+    project_history.add_argument("--json", action="store_true", help="Print structured JSON result")
+
+    project_diff = project_sub.add_parser("diff", help="Show file changes in a revision; defaults to the latest revision")
+    project_diff.add_argument("path", nargs="?", default=".", help="Registered project path; defaults to the current working directory")
+    project_diff.add_argument("--revision", default=None, help="Revision id; defaults to the latest project revision")
+    project_diff.add_argument("--json", action="store_true", help="Print structured JSON result")
 
     project_report = project_sub.add_parser("report", help="Write project Markdown reports")
     project_report.add_argument("path")
@@ -894,15 +974,23 @@ def build_parser() -> argparse.ArgumentParser:
     query = sub.add_parser("query", help="Execute a REQL statement")
     _add_reql_statement_arguments(query)
 
+    locate = sub.add_parser("locate", help="Resolve a known project-relative path without semantic ranking")
+    locate.add_argument("path", help="Exact relative path; known document extensions may be omitted")
+    locate.add_argument("--include-archived", action="store_true", help="Include archived or deleted artifacts")
+    locate.add_argument("--json", action="store_true", help="Print structured JSON result")
+
     stats = sub.add_parser("stats", help="Print graph statistics")
     stats.add_argument("--json", action="store_true")
 
-    storage = sub.add_parser("storage", help="Storage commands: inspect, compact")
+    storage = sub.add_parser("storage", help="Storage commands: inspect, locks, compact")
     storage_sub = storage.add_subparsers(dest="storage_command", required=True)
     storage_compact = storage_sub.add_parser("compact", help="Rewrite the block store into a compact generation")
     storage_compact.add_argument("--json", action="store_true", help="Print structured JSON result")
     storage_inspect = storage_sub.add_parser("inspect", help="Inspect block layout, compression, dense nodes, and indexes")
     storage_inspect.add_argument("--json", action="store_true", help="Print structured JSON result")
+    storage_locks = storage_sub.add_parser("locks", help="Inspect lock owners, liveness, duration, watcher state, and snapshot availability")
+    storage_locks.add_argument("--recover-stale", action="store_true", help="Remove only locks proven stale; incomplete local locks require a safety grace period")
+    storage_locks.add_argument("--json", action="store_true", help="Print structured JSON result")
 
     export = sub.add_parser("export", help="Export nodes and edges as JSON or standalone HTML")
     export.add_argument("--out", default=None, help="Optional output file or directory")
@@ -936,7 +1024,13 @@ def _max_file_size_bytes(args: argparse.Namespace, config: REQLConfig) -> int:
 
 
 def _parsing_options(config: REQLConfig) -> dict[str, object]:
-    return {"compile": config.compile.to_dict()}
+    return {
+        "compile": config.compile.to_dict(),
+        "scan": {
+            "use_gitignore": config.scan.use_gitignore,
+            "ignore_defaults": config.scan.ignore_defaults,
+        },
+    }
 
 
 def _document_format_ingest_enabled(document_policies: list[dict[str, object]], format_name: str) -> bool:
@@ -965,19 +1059,21 @@ def _append_config_exclude_patterns(project_path: str | Path, patterns: list[str
         if pattern not in normalized:
             normalized.append(pattern)
 
-    config_path = root / CONFIG_FILENAME
+    config_path = root / PROJECT_CONFIG_FILENAME
     created = False
     if not config_path.exists():
         write_sample_config(config_path)
         created = True
-    config = load_config(str(config_path))
-    existing_rules = set(config.scan.exclude)
+    project_data = load_project_config_data(config_path)
+    scan_data = project_data.get("scan", {})
+    project_excludes = list(scan_data.get("exclude", [])) if isinstance(scan_data, dict) else []
+    existing_rules = set(project_excludes)
     added = [pattern for pattern in normalized if pattern not in existing_rules]
     skipped = [pattern for pattern in normalized if pattern in existing_rules]
 
     if added:
         current_text = config_path.read_text(encoding="utf-8")
-        exclude_patterns = [*config.scan.exclude, *added]
+        exclude_patterns = [*project_excludes, *added]
         _write_text_atomic(config_path, _replace_scan_exclude(current_text, exclude_patterns))
 
     return {
@@ -1074,7 +1170,7 @@ def _graph_json_path(raw_path: str | None) -> Path:
     return path
 
 
-def main(argv: list[str] | None = None) -> int:
+def _main(argv: list[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
     try:
@@ -1082,6 +1178,13 @@ def main(argv: list[str] | None = None) -> int:
     except SystemExit:
         raise
     profile_logger: PerformanceLogger | None = None
+
+    snapshot_allowed = _is_read_only_command(args) or (
+        args.command == "storage" and args.storage_command in {"inspect", "locks"}
+    )
+    if args.snapshot and not snapshot_allowed:
+        print("--snapshot is only valid for read-only commands and storage inspection", file=sys.stderr)
+        return 2
 
     if args.command == "config" and args.config_command == "init":
         try:
@@ -1197,7 +1300,7 @@ def main(argv: list[str] | None = None) -> int:
         agent_id = args.agent_id or os.environ.get("REQL_AGENT_ID")
         if args.agent_command == "init" and not agent_id:
             agent_id = AgentWorkspace.new_agent_id()
-        workspace = AgentWorkspace(args.storage, agent_id=agent_id, config=config)
+        workspace = AgentWorkspace(args.storage, agent_id=agent_id, activity_id=args.activity_id, config=config)
         try:
             if args.agent_command == "init":
                 result = workspace.init()
@@ -1388,10 +1491,17 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     if args.command == "storage":
+        if args.storage_command == "locks":
+            payload = inspect_store_locks(Path(args.storage), recover_stale=args.recover_stale)
+            if args.json:
+                _print_json(payload)
+            else:
+                _print_storage_locks(payload)
+            return 0
         read_only = args.storage_command == "inspect"
         if profile_logger:
             profile_logger.event("storage.open.start", category="lifecycle", path=str(args.storage), read_only=read_only)
-        store = BlockGraphStore(Path(args.storage), read_only=read_only)
+        store = BlockGraphStore(Path(args.storage), read_only=read_only, snapshot=bool(args.snapshot and read_only))
         try:
             if args.storage_command == "inspect":
                 if profile_logger:
@@ -1484,6 +1594,47 @@ def main(argv: list[str] | None = None) -> int:
                         print("Statuses:")
                         for item_status, count in sorted(status["status_counts"].items()):
                             print(f"  {item_status}: {count}")
+                return 0
+            if args.project_command == "history":
+                if graph.project_status(args.path) is None:
+                    print("Project not found", file=sys.stderr)
+                    return 1
+                revisions = graph.project_history(args.path, limit=max(0, args.limit))
+                if args.json:
+                    _print_json([revision.to_dict(include_manifest=False) for revision in revisions])
+                elif not revisions:
+                    print("No project revisions")
+                else:
+                    for revision in revisions:
+                        print(
+                            f"{revision.id}\t{revision.created_at}\t"
+                            f"files={len(revision.changes)}\tparent={revision.parent_id or '-'}"
+                        )
+                return 0
+            if args.project_command == "diff":
+                status = graph.project_status(args.path)
+                if status is None:
+                    print("Project not found", file=sys.stderr)
+                    return 1
+                if args.revision:
+                    revision = graph.project_revision(args.revision)
+                else:
+                    history = graph.project_history(args.path, limit=1)
+                    revision = history[0] if history else None
+                project_id = str(status["project"]["id"])
+                if revision is None or revision.project_id != project_id:
+                    print("Revision not found", file=sys.stderr)
+                    return 1
+                if args.json:
+                    _print_json(revision.to_dict(include_manifest=False))
+                else:
+                    print(f"Revision: {revision.id}")
+                    print(f"Parent: {revision.parent_id or '-'}")
+                    print(f"Tree: {revision.tree_hash}")
+                    for change in revision.changes:
+                        before = (change.old_sha256 or "-")[:12]
+                        after = (change.new_sha256 or "-")[:12]
+                        print(f"{change.status[0].upper()}\t{change.path}\t{before} -> {after}")
                 return 0
             if args.project_command == "report":
                 files = graph.project_report(args.path, output_dir=args.output or config.reporting.output_dir)
@@ -1628,6 +1779,19 @@ def main(argv: list[str] | None = None) -> int:
                 print(result.to_table())
             return 0
 
+        if args.command == "locate":
+            payload = graph.locate(args.path, include_archived=args.include_archived)
+            if args.json:
+                _print_json(payload)
+            else:
+                for match in payload["matches"]:
+                    print(f"{match['relative_path']}\t{match['artifact_type']}\t{match['id']}")
+            if not payload["matches"]:
+                if not args.json:
+                    print(f"Path not found: {args.path}", file=sys.stderr)
+                return 1
+            return 0
+
         if args.command == "stats":
             by_type = graph.store.node_type_counts()
             payload = {
@@ -1679,6 +1843,15 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     finally:
         graph.close()
+
+
+def main(argv: list[str] | None = None) -> int:
+    """Run the CLI and render expected storage failures without a traceback."""
+    try:
+        return _main(argv)
+    except StorageError as exc:
+        print(_format_storage_error(exc), file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

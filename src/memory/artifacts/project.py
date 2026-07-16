@@ -9,7 +9,7 @@ from ..domain.models import MemoryEdge, MemoryNode
 from ..domain.timeutils import utcnow_iso
 from ..storage.graph_store import GraphStore
 from .context_scope import artifact_context_scope
-from .fingerprint import normalize_path
+from .fingerprint import normalize_path, relative_path_lookup_key
 from .models import GraphRegistrationSummary, Project, ScanResult, SourceArtifact
 from .scanner import DEFAULT_MAX_FILE_SIZE_BYTES, ProjectScanner
 
@@ -299,7 +299,12 @@ def _project_node(project: Project) -> MemoryNode:
 
 def _artifact_node(artifact: SourceArtifact) -> MemoryNode:
     properties = artifact.to_dict()
-    properties.update({"context_scope": artifact_context_scope(artifact)})
+    properties.update(
+        {
+            "context_scope": artifact_context_scope(artifact),
+            "relative_path_key": relative_path_lookup_key(artifact.relative_path),
+        }
+    )
     return MemoryNode(
         id=artifact.id,
 

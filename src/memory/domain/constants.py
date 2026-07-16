@@ -92,6 +92,8 @@ EDGE_TYPES = {
     "DEPENDS_ON",
     "USES",
     "IMPORTS",
+    "IMPORTS_FROM",
+    "RE_EXPORTS",
     "REFERENCES",
     "INHERITS",
     "IMPLEMENTS",
@@ -111,6 +113,8 @@ EDGE_TYPES = {
     "DEFINES",
     "CONTAINS_ENTITY",
     "CALLS",
+    "METHOD",
+    "WRAPS",
 }
 
 ACTIVE_STATUSES = {"candidate", "latent", "active", "reinforced", "mature", "promoted", "confirmed"}

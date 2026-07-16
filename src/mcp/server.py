@@ -49,7 +49,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default=None, help=f"HTTP bind address, for example 127.0.0.1 or 0.0.0.0. Default: {DEFAULT_HTTP_HOST}.")
     parser.add_argument("--port", type=int, default=None, help=f"HTTP bind port. Default: {DEFAULT_HTTP_PORT}.")
     parser.add_argument("--api-key", default=None, help="HTTP API key. Required for HTTP transport unless provided through --api-key-env.")
-    parser.add_argument("--config", default=None, help="Path to conf.yaml used by MCP tools")
+    parser.add_argument("--config", default=None, help="Path to a project reql.conf used by MCP tools")
     parser.add_argument(
         "--set",
         dest="config_overrides",

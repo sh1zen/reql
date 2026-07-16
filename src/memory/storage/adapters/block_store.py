@@ -10,15 +10,19 @@ from __future__ import annotations
 from collections import OrderedDict, defaultdict
 from contextlib import contextmanager
 from dataclasses import replace
+from datetime import datetime, timezone
 import hashlib
+import heapq
 import mmap
 import os
 from pathlib import Path
 import json
 import math
+import shlex
 import signal
 import socket
 import struct
+import sys
 import threading
 import time
 import uuid
@@ -36,6 +40,7 @@ DEFAULT_BLOCK_SIZE = 64 * 1024
 DEFAULT_PAGE_CACHE_BLOCKS = 128
 DEFAULT_DENSE_NODE_THRESHOLD = 1024
 DEFAULT_LOCK_TIMEOUT_SECONDS = 30.0
+DEFAULT_INCOMPLETE_LOCK_STALE_SECONDS = 30.0
 DEFAULT_AUTO_CHECKPOINT_WAL_BYTES = 8 * 1024 * 1024
 DEFAULT_LEXICAL_TEXT_BUDGET = 4096
 
@@ -63,6 +68,7 @@ _BINARY_KIND_TO_ID = {
     "operation": 5,
     "root_index": 6,
     "tombstone": 7,
+    "lexical_index": 8,
 }
 _BINARY_ID_TO_KIND = {value: key for key, value in _BINARY_KIND_TO_ID.items()}
 _NULL_STRING_LENGTH = 0xFFFFFFFF
@@ -71,6 +77,7 @@ _WAL_FRAME_HEADER = struct.Struct("<I32s")
 _EncodedRecord = tuple[dict[str, Any], bytes]
 _Location = dict[str, int]
 _ScalarIndexValue = str | int | float | bool | None
+CURRENT_ROOT_INDEX_VERSION = 3
 _VOLATILE_RECORD_FIELDS = {"updated_at"}
 _VOLATILE_PROPERTY_FIELDS = {"created_at", "updated_at"}
 
@@ -88,11 +95,16 @@ INDEXED_NODE_PROPERTIES = {
     "project_id",
     "qualified_name",
     "relative_path",
+    "relative_path_key",
+    "re_exports",
     "root_path",
+    "semantic_roles",
     "sha256",
     "severity",
     "symbol_name",
     "symbol_type",
+    "wrapper_targets",
+    "overrides",
 }
 INDEXED_EDGE_PROPERTIES = {"artifact_id", "community_id", "finding_type", "project_id", "run_id"}
 
@@ -238,6 +250,146 @@ class _TransactionJournal:
         self.root_index = dict(store._root_index)
         self.space_map = dict(store._space_map)
         self.pending_wal_len = len(store._pending_wal_records)
+        self.lexical_index_loaded = store._lexical_index_loaded
+        self.lexical_index_location = dict(store._lexical_index_location) if store._lexical_index_location else None
+        self.deferred_lexical_changes = {
+            node_id: (
+                store._clone_node(old) if old is not None else None,
+                store._clone_node(new) if new is not None else None,
+            )
+            for node_id, (old, new) in store._deferred_lexical_changes.items()
+        }
+
+
+def _current_lock_command() -> str:
+    argv = [str(value) for value in sys.argv if str(value)]
+    if not argv:
+        return ""
+    return " ".join(shlex.quote(value) for value in argv)[:1000]
+
+
+def _lock_age_seconds(payload: dict[str, Any], lock_path: Path) -> float:
+    created_at = str(payload.get("created_at") or "")
+    if created_at:
+        try:
+            created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            return max(0.0, (datetime.now(timezone.utc) - created.astimezone(timezone.utc)).total_seconds())
+        except ValueError:
+            pass
+    try:
+        return max(0.0, time.time() - lock_path.stat().st_mtime)
+    except OSError:
+        return 0.0
+
+
+def _read_lock_payload(lock_path: Path) -> dict[str, Any]:
+    try:
+        raw = lock_path.read_text(encoding="utf-8")
+    except OSError:
+        return {}
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _lock_process_alive(payload: dict[str, Any]) -> bool | None:
+    host = str(payload.get("host") or "")
+    if host and host != socket.gethostname():
+        return None
+    try:
+        pid = int(payload.get("pid"))
+    except (TypeError, ValueError):
+        return None
+    return _process_is_alive(pid) if pid > 0 else False
+
+
+def _lock_is_stale(payload: dict[str, Any], lock_path: Path) -> bool:
+    alive = _lock_process_alive(payload)
+    if alive is not None:
+        return not alive
+    host = str(payload.get("host") or "")
+    if host and host != socket.gethostname():
+        return False
+    return _lock_age_seconds(payload, lock_path) >= DEFAULT_INCOMPLETE_LOCK_STALE_SECONDS
+
+
+def _lock_diagnostic(payload: dict[str, Any], lock_path: Path, *, mode: str) -> dict[str, Any]:
+    command = str(payload.get("command") or "")
+    return {
+        "mode": mode,
+        "lock_path": str(lock_path),
+        "pid": payload.get("pid"),
+        "host": payload.get("host"),
+        "command": command,
+        "duration_seconds": round(_lock_age_seconds(payload, lock_path), 3),
+        "process_alive": _lock_process_alive(payload),
+        "watcher": bool(payload.get("watcher")) or "--watch" in command.split(),
+        "stale": _lock_is_stale(payload, lock_path),
+        "created_at": payload.get("created_at"),
+    }
+
+
+def _format_locked_message(target_path: Path, diagnostic: dict[str, Any]) -> str:
+    alive = diagnostic.get("process_alive")
+    alive_text = "unknown" if alive is None else str(bool(alive)).lower()
+    command = str(diagnostic.get("command") or "unknown")
+    return (
+        f"REQL block store is locked for {diagnostic.get('mode', 'unknown')}: {target_path}; "
+        f"command={command}; pid={diagnostic.get('pid')}; host={diagnostic.get('host')}; "
+        f"duration={float(diagnostic.get('duration_seconds', 0.0)):.3f}s; "
+        f"process_alive={alive_text}; watcher={str(bool(diagnostic.get('watcher'))).lower()}; "
+        f"stale={str(bool(diagnostic.get('stale'))).lower()}. "
+        f"Read commands may use --snapshot; inspect or recover locks with "
+        f"`reql --storage \"{target_path}\" storage locks --recover-stale`."
+    )
+
+
+def inspect_store_locks(target_path: str | Path, *, recover_stale: bool = False) -> dict[str, Any]:
+    """Inspect lock ownership without opening or locking the block store."""
+    target = Path(target_path)
+    lock_path = target.with_name(f"{target.name}.lock")
+    readers_path = target.with_name(f"{target.name}.readers")
+    recovered: list[dict[str, Any]] = []
+
+    def inspect_path(path: Path, mode: str) -> dict[str, Any] | None:
+        if not path.exists():
+            return None
+        payload = _read_lock_payload(path)
+        diagnostic = _lock_diagnostic(payload, path, mode=mode)
+        if recover_stale and diagnostic["stale"]:
+            try:
+                path.unlink()
+                diagnostic["recovered"] = True
+                recovered.append(diagnostic)
+                return None
+            except FileNotFoundError:
+                diagnostic["recovered"] = True
+                recovered.append(diagnostic)
+                return None
+            except OSError as exc:
+                diagnostic["recovery_error"] = str(exc)
+        return diagnostic
+
+    writer = inspect_path(lock_path, "write")
+    readers = [item for path in sorted(readers_path.glob("*.lock")) if (item := inspect_path(path, "read")) is not None]
+    try:
+        readers_path.rmdir()
+    except OSError:
+        pass
+    snapshot_available = target.exists() and target.is_file() and target.stat().st_size > 0
+    return {
+        "path": str(target),
+        "locked": writer is not None or bool(readers),
+        "writer": writer,
+        "readers": readers,
+        "recovered": recovered,
+        "snapshot_available": snapshot_available,
+        "snapshot_hint": f'reql --storage "{target}" --snapshot <read-command>' if snapshot_available else None,
+    }
 
 
 class _StoreLock:
@@ -283,13 +435,16 @@ class _StoreLock:
             self.acquired = False
 
     def _payload(self) -> dict[str, Any]:
+        command = _current_lock_command()
         return {
-            "format": "reql-store-lock-v1",
+            "format": "reql-store-lock-v2",
             "path": str(self.target_path),
             "pid": os.getpid(),
             "host": socket.gethostname(),
             "token": self.token,
             "created_at": utcnow_iso(),
+            "command": command,
+            "watcher": "--watch" in command.split(),
         }
 
     def _read_payload(self) -> dict[str, Any]:
@@ -307,15 +462,7 @@ class _StoreLock:
 
     def _remove_stale_lock(self) -> bool:
         payload = self._read_payload()
-        host = str(payload.get("host") or "")
-        pid = payload.get("pid")
-        if host and host != socket.gethostname():
-            return False
-        try:
-            pid_int = int(pid)
-        except (TypeError, ValueError):
-            pid_int = -1
-        if pid_int > 0 and _process_is_alive(pid_int):
+        if not _lock_is_stale(payload, self.lock_path):
             return False
         try:
             self.lock_path.unlink()
@@ -326,11 +473,8 @@ class _StoreLock:
             return False
 
     def _locked_message(self) -> str:
-        payload = self._read_payload()
-        owner = ""
-        if payload:
-            owner = f" by pid {payload.get('pid')} on {payload.get('host')}"
-        return f"REQL block store is locked for writing{owner}: {self.target_path}"
+        diagnostic = _lock_diagnostic(self._read_payload(), self.lock_path, mode="write")
+        return _format_locked_message(self.target_path, diagnostic)
 
 
 class _ReaderLock:
@@ -382,13 +526,16 @@ class _ReaderLock:
             os.close(fd)
 
     def _payload(self) -> dict[str, Any]:
+        command = _current_lock_command()
         return {
-            "format": "reql-store-reader-lock-v1",
+            "format": "reql-store-reader-lock-v2",
             "path": str(self.target_path),
             "pid": os.getpid(),
             "host": socket.gethostname(),
             "token": self.token,
             "created_at": utcnow_iso(),
+            "command": command,
+            "watcher": "--watch" in command.split(),
         }
 
     def _read_payload(self) -> dict[str, Any]:
@@ -446,8 +593,9 @@ class _StoreReadWriteLock:
             if not active:
                 return
             if time.monotonic() >= deadline:
-                owner = f" by pid {active[0].get('pid')} on {active[0].get('host')}" if active else ""
-                raise StorageError(f"REQL block store is locked for reading{owner}: {self.target_path}")
+                diagnostic_path = Path(str(active[0].get("_lock_path") or self.reader.readers_path))
+                diagnostic = _lock_diagnostic(active[0], diagnostic_path, mode="read")
+                raise StorageError(_format_locked_message(self.target_path, diagnostic))
             time.sleep(0.05)
 
     def _active_reader_payloads(self) -> list[dict[str, Any]]:
@@ -456,7 +604,8 @@ class _StoreReadWriteLock:
         active: list[dict[str, Any]] = []
         for path in sorted(self.reader.readers_path.glob("*.lock")):
             payload = self._read_payload(path)
-            if self._reader_is_stale(payload):
+            payload["_lock_path"] = str(path)
+            if self._reader_is_stale(payload, path):
                 try:
                     path.unlink()
                 except FileNotFoundError:
@@ -482,16 +631,8 @@ class _StoreReadWriteLock:
             return {}
         return payload if isinstance(payload, dict) else {}
 
-    def _reader_is_stale(self, payload: dict[str, Any]) -> bool:
-        host = str(payload.get("host") or "")
-        pid = payload.get("pid")
-        if host and host != socket.gethostname():
-            return False
-        try:
-            pid_int = int(pid)
-        except (TypeError, ValueError):
-            return True
-        return pid_int <= 0 or not _process_is_alive(pid_int)
+    def _reader_is_stale(self, payload: dict[str, Any], path: Path) -> bool:
+        return _lock_is_stale(payload, path)
 
 
 def _process_is_alive(pid: int) -> bool:
@@ -791,6 +932,8 @@ class BlockGraphStore:
         dense_node_threshold: int = DEFAULT_DENSE_NODE_THRESHOLD,
         page_cache_blocks: int = DEFAULT_PAGE_CACHE_BLOCKS,
         read_only: bool = False,
+        snapshot: bool = False,
+        defer_lexical_index: bool = False,
         lock_timeout_seconds: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
     ) -> None:
         if block_size < 4096:
@@ -801,6 +944,10 @@ class BlockGraphStore:
         self.block_size = block_size
         self.dense_node_threshold = dense_node_threshold
         self.read_only = read_only
+        self.snapshot = bool(snapshot)
+        self.defer_lexical_index = bool(defer_lexical_index)
+        if self.snapshot and not self.read_only:
+            raise ValueError("snapshot mode requires read_only=True")
         self._page_cache = _PageCache(page_cache_blocks)
         self._transaction_depth = 0
         self._transaction_journals: list[_TransactionJournal] = []
@@ -830,6 +977,9 @@ class BlockGraphStore:
         self._node_terms: dict[str, dict[str, float]] = defaultdict(dict)
         self._node_term_index: dict[str, set[str]] = {}
         self._node_lexical_fingerprints: dict[str, tuple[str, ...]] = {}
+        self._lexical_index_loaded = True
+        self._lexical_index_location: _Location | None = None
+        self._deferred_lexical_changes: dict[str, tuple[MemoryNode | None, MemoryNode | None]] = {}
         self._node_type_index: dict[tuple[str], set[str]] = defaultdict(set)
         self._node_status_index: dict[tuple[str], set[str]] = defaultdict(set)
         self._edge_type_index: dict[tuple[str], set[str]] = defaultdict(set)
@@ -847,7 +997,9 @@ class BlockGraphStore:
         if create and not self.read_only:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = _StoreReadWriteLock(self.path, timeout_seconds=lock_timeout_seconds)
-        if self.read_only:
+        if self.snapshot:
+            pass
+        elif self.read_only:
             self._lock.acquire_read()
         else:
             self._lock.acquire_write()
@@ -1071,6 +1223,15 @@ class BlockGraphStore:
             "node_terms": {term: dict(postings) for term, postings in self._node_terms.items()},
             "node_term_index": {node_id: set(terms) for node_id, terms in self._node_term_index.items()},
             "node_lexical_fingerprints": dict(self._node_lexical_fingerprints),
+            "lexical_index_loaded": self._lexical_index_loaded,
+            "lexical_index_location": dict(self._lexical_index_location) if self._lexical_index_location else None,
+            "deferred_lexical_changes": {
+                node_id: (
+                    self._clone_node(old) if old is not None else None,
+                    self._clone_node(new) if new is not None else None,
+                )
+                for node_id, (old, new) in self._deferred_lexical_changes.items()
+            },
             "node_type_index": {key: set(values) for key, values in self._node_type_index.items()},
             "node_status_index": {key: set(values) for key, values in self._node_status_index.items()},
             "edge_type_index": {key: set(values) for key, values in self._edge_type_index.items()},
@@ -1102,6 +1263,16 @@ class BlockGraphStore:
         self._node_terms = defaultdict(dict, {term: dict(postings) for term, postings in snapshot["node_terms"].items()})
         self._node_term_index = {node_id: set(terms) for node_id, terms in snapshot["node_term_index"].items()}
         self._node_lexical_fingerprints = dict(snapshot.get("node_lexical_fingerprints", {}))
+        self._lexical_index_loaded = bool(snapshot.get("lexical_index_loaded", True))
+        lexical_location = snapshot.get("lexical_index_location")
+        self._lexical_index_location = dict(lexical_location) if isinstance(lexical_location, dict) else None
+        self._deferred_lexical_changes = {
+            node_id: (
+                self._clone_node(old) if old is not None else None,
+                self._clone_node(new) if new is not None else None,
+            )
+            for node_id, (old, new) in snapshot.get("deferred_lexical_changes", {}).items()
+        }
         self._node_type_index = defaultdict(set, snapshot["node_type_index"])
         self._node_status_index = defaultdict(set, snapshot["node_status_index"])
         self._edge_type_index = defaultdict(set, snapshot["edge_type_index"])
@@ -1155,6 +1326,19 @@ class BlockGraphStore:
         self._space_map = dict(journal.space_map)
         del self._pending_wal_records[journal.pending_wal_len :]
         self._rebuild_indexes()
+        self._lexical_index_location = dict(journal.lexical_index_location) if journal.lexical_index_location else None
+        self._deferred_lexical_changes = {
+            node_id: (
+                self._clone_node(old) if old is not None else None,
+                self._clone_node(new) if new is not None else None,
+            )
+            for node_id, (old, new) in journal.deferred_lexical_changes.items()
+        }
+        if not journal.lexical_index_loaded:
+            self._node_terms = defaultdict(dict)
+            self._node_term_index = {}
+            self._node_lexical_fingerprints = {}
+            self._lexical_index_loaded = False
 
     def _journal_node_before_change(self, node_id: str) -> None:
         if not self._transaction_journals:
@@ -1478,8 +1662,6 @@ class BlockGraphStore:
     def _load_usage_journal(self) -> None:
         if not self._usage_journal_path.exists():
             return
-        usage_lock = _StoreLock(self._usage_journal_path, timeout_seconds=self._lock_timeout_seconds)
-        usage_lock.acquire()
         try:
             with self._usage_journal_path.open("r", encoding="utf-8") as fh:
                 for line in fh:
@@ -1495,8 +1677,8 @@ class BlockGraphStore:
                     payload = item.get("payload")
                     if isinstance(payload, dict):
                         self._apply_usage_event(payload, created_at=str(item.get("created_at") or ""))
-        finally:
-            usage_lock.release()
+        except FileNotFoundError:
+            return
 
     def _inspect_physical_storage(self) -> dict[str, Any]:
         if not self.path.exists():
@@ -1794,6 +1976,8 @@ class BlockGraphStore:
         if not force and not self._dirty:
             return
         self._materialize_all_records()
+        if not self._lexical_index_loaded:
+            self._ensure_lexical_index_loaded()
         self._meta.update(
             {
                 "schema_version": SCHEMA_VERSION,
@@ -1804,6 +1988,17 @@ class BlockGraphStore:
             }
         )
         base_encoded = self._encode_records(self._ordered_records())
+        lexical_record = {
+            "kind": "lexical_index",
+            "value": {
+                "id": "lexical_index",
+                "node_terms": {
+                    term: {node_id: weight for node_id, weight in sorted(postings.items())}
+                    for term, postings in sorted(self._node_terms.items())
+                },
+            },
+        }
+        base_encoded.append((lexical_record, _encode_record(lexical_record)))
         generation_id = self._generation_id + 1
         blocks, locations, space_map = self._pack_blocks(base_encoded)
         root_index = self._build_root_index(locations=locations, space_map=space_map, generation_id=generation_id)
@@ -1823,6 +2018,8 @@ class BlockGraphStore:
             root_index_offset = self.block_size + (int(root_location["block_id"]) * self.block_size) + int(root_location["frame_offset"])
         self._root_index = root_index
         self._space_map = space_map
+        lexical_location = root_index.get("lexical_index_location")
+        self._lexical_index_location = dict(lexical_location) if isinstance(lexical_location, dict) and lexical_location else None
         self._data_offset = self.block_size
         data_pages = list(self._iter_data_pages(blocks))
         data_checksum = self._checksum_data_pages(data_pages)
@@ -2035,7 +2232,7 @@ class BlockGraphStore:
         edge_patterns = len(self._edges)
         adjacency_nodes = len(self._nodes)
         return {
-            "version": 2,
+            "version": CURRENT_ROOT_INDEX_VERSION,
             "generation_id": generation_id,
             "codec": "binary-v2",
             "nodes": len(node_locations),
@@ -2048,15 +2245,12 @@ class BlockGraphStore:
                 "nodes": node_locations,
                 "edges": edge_locations,
             },
+            "lexical_index_location": dict(locations.get("lexical_index", {}).get("lexical_index", {})),
             "indexes": {
                 "node_keys": _tuple_map_to_rows(self._node_key_index),
                 "edge_patterns": _tuple_map_to_rows(self._edge_pattern_index),
                 "out_edges": _dict_set_to_json(self._out_edges),
                 "in_edges": _dict_set_to_json(self._in_edges),
-                "node_terms": {
-                    term: {node_id: weight for node_id, weight in sorted(postings.items())}
-                    for term, postings in sorted(self._node_terms.items())
-                },
                 "node_type": _set_map_to_rows(self._node_type_index),
                 "node_status": _set_map_to_rows(self._node_status_index),
                 "edge_type": _set_map_to_rows(self._edge_type_index),
@@ -2066,6 +2260,15 @@ class BlockGraphStore:
         }
 
     def _apply_root_index(self, value: dict[str, Any]) -> None:
+        version = int(value.get("version", 0) or 0)
+        if version != CURRENT_ROOT_INDEX_VERSION:
+            raise StorageError(
+                f"Unsupported REQL root index version {version} for {self.path}; "
+                f"expected {CURRENT_ROOT_INDEX_VERSION}. Rebuild the storage with the current REQL version."
+            )
+        lexical_location = value.get("lexical_index_location")
+        if not isinstance(lexical_location, dict) or not lexical_location:
+            raise StorageError(f"REQL root index is missing the required split lexical index for {self.path}")
         self._root_index = value
         self._space_map = dict(value.get("space_map", {}))
         locations = dict(value.get("record_locations", {}))
@@ -2087,15 +2290,50 @@ class BlockGraphStore:
         self._edge_type_index = defaultdict(set, _rows_to_set_map(indexes.get("edge_type"), 1))
         self._node_property_index = defaultdict(set, _rows_to_set_map(indexes.get("node_properties"), 2))
         self._edge_property_index = defaultdict(set, _rows_to_set_map(indexes.get("edge_properties"), 2))
+        self._lexical_index_location = {str(key): int(item) for key, item in lexical_location.items()}
+        self._node_terms = defaultdict(dict)
+        self._node_term_index = {}
+        self._deferred_lexical_changes = {}
+        self._lexical_index_loaded = False
+        if not self.defer_lexical_index:
+            self._ensure_lexical_index_loaded()
+        self._node_lexical_fingerprints = {}
+
+    def _ensure_lexical_index_loaded(self) -> None:
+        if self._lexical_index_loaded:
+            return
+        raw_terms: Any = {}
+        if self._lexical_index_location is not None:
+            record = self._read_record_at(
+                int(self._lexical_index_location["block_id"]),
+                int(self._lexical_index_location["frame_offset"]),
+            )
+            if record.get("kind") != "lexical_index":
+                raise StorageError(f"REQL lexical index record was not found for {self.path}")
+            raw_terms = dict(record.get("value", {})).get("node_terms", {})
         node_terms: dict[str, dict[str, float]] = defaultdict(dict)
-        raw_terms = indexes.get("node_terms", {})
         if isinstance(raw_terms, dict):
             for term, postings in raw_terms.items():
                 if isinstance(postings, dict):
                     node_terms[str(term)] = {str(node_id): float(weight) for node_id, weight in postings.items()}
         self._node_terms = defaultdict(dict, node_terms)
         self._node_term_index = self._build_node_term_index()
+        self._lexical_index_loaded = True
+        for old, new in self._deferred_lexical_changes.values():
+            if old is not None:
+                self._remove_terms(old)
+            if new is not None:
+                self._reindex_node_terms(new)
+        self._deferred_lexical_changes = {}
+
+    def _rebuild_lexical_index(self) -> None:
+        self._node_terms = defaultdict(dict)
+        self._node_term_index = {}
         self._node_lexical_fingerprints = {}
+        self._deferred_lexical_changes = {}
+        self._lexical_index_loaded = True
+        for node in self._nodes.values():
+            self._reindex_node_terms(node)
 
     def _rebuild_indexes(self) -> None:
         self._node_key_index = {}
@@ -2125,17 +2363,22 @@ class BlockGraphStore:
     def _replace_node(self, node: MemoryNode) -> None:
         self._journal_node_before_change(node.id)
         old = self._nodes.get(node.id)
+        lexical_changed = True
         if old:
+            self._remove_node_structural_indexes(old)
+        if old and self._lexical_index_loaded:
             old_fingerprint = self._node_lexical_fingerprints.get(old.id)
             if old_fingerprint is None:
                 old_fingerprint = self._node_lexical_fingerprint(old)
             new_fingerprint = self._node_lexical_fingerprint(node)
             lexical_changed = old_fingerprint != new_fingerprint
-            self._remove_node_structural_indexes(old)
             if lexical_changed:
                 self._remove_terms(old)
         self._nodes[node.id] = node
         self._index_node_structural(node)
+        if not self._lexical_index_loaded:
+            self._record_deferred_lexical_change(old, node)
+            return
         if old and not lexical_changed:
             self._node_lexical_fingerprints[node.id] = new_fingerprint
         else:
@@ -2153,6 +2396,8 @@ class BlockGraphStore:
         self._journal_node_before_change(node_id)
         old = self._nodes.pop(node_id, None)
         if old:
+            if not self._lexical_index_loaded:
+                self._record_deferred_lexical_change(old, None)
             self._remove_node_indexes(old)
         self._node_locations.pop(node_id, None)
 
@@ -2185,7 +2430,21 @@ class BlockGraphStore:
 
     def _remove_node_indexes(self, node: MemoryNode) -> None:
         self._remove_node_structural_indexes(node)
-        self._remove_terms(node)
+        if self._lexical_index_loaded:
+            self._remove_terms(node)
+
+    def _record_deferred_lexical_change(self, old: MemoryNode | None, new: MemoryNode | None) -> None:
+        node_id = (old or new).id if old is not None or new is not None else ""
+        if not node_id:
+            return
+        original = self._deferred_lexical_changes.get(node_id, (old, None))[0]
+        if original is None and new is None:
+            self._deferred_lexical_changes.pop(node_id, None)
+            return
+        self._deferred_lexical_changes[node_id] = (
+            self._clone_node(original) if original is not None else None,
+            self._clone_node(new) if new is not None else None,
+        )
 
     def _remove_node_structural_indexes(self, node: MemoryNode) -> None:
         if node.canonical_key:
@@ -2344,6 +2603,8 @@ class BlockGraphStore:
         allowed_order = {"salience", "activation", "updated_at", "created_at", "confidence", "utility"}
         if order_by not in allowed_order:
             order_by = "salience"
+        if limit <= 0:
+            return []
         statuses = {status} if isinstance(status, str) else set(status or [])
         candidate_ids = set(self._node_type_index.get((type_,), set())) if type_ is not None else set(self._nodes) | set(self._node_locations)
         if statuses:
@@ -2351,9 +2612,14 @@ class BlockGraphStore:
             for item_status in statuses:
                 status_ids.update(self._node_status_index.get((item_status,), set()))
             candidate_ids &= status_ids
-        nodes = [node for node_id in candidate_ids if (node := self._load_node_from_location(node_id)) is not None]
-        nodes.sort(key=lambda item: getattr(item, order_by), reverse=descending)
-        return [self._clone_node(node) for node in nodes[:limit]]
+        nodes = (
+            node
+            for node_id in candidate_ids
+            if (node := self._load_node_from_location(node_id)) is not None
+        )
+        select = heapq.nlargest if descending else heapq.nsmallest
+        selected = select(limit, nodes, key=lambda item: getattr(item, order_by))
+        return [self._clone_node(node) for node in selected]
 
     def find_nodes_by_property(
         self,
@@ -2746,6 +3012,7 @@ class BlockGraphStore:
         node_types: set[str] | None = None,
         include_archived: bool = False,
     ) -> list[tuple[MemoryNode, float]]:
+        self._ensure_lexical_index_loaded()
         tokens = tokenize(text)
         if not tokens:
             return []

@@ -82,12 +82,23 @@ Find classes and methods:
 FIND nodes TYPES Class,Method RETURN name,qualified_name,start_line,end_line LIMIT 50
 ```
 
+Compiled code symbols expose both `start_line/end_line` and `line_start/line_end`
+as equivalent source-span aliases. `SYMBOLS`, `FIND`, `MATCH`, and `RETRIEVE`
+queries can use either spelling, and compiled symbols include `source_path` plus
+`relative_path` so targeted source reads can resolve exact spans.
+
 Find compile-time static analysis findings:
 
 ```text
 FINDINGS WHERE finding_type = "unused_import"
 RETURN symbol_name,relative_path,line_start,cleanup_priority,reason
 ```
+
+Application-surface compilation connects CSS selectors with matching template
+attributes and JavaScript selector/class APIs. It also emits
+`unused_css_class` and high-confidence `always_overridden_css_declaration`
+findings. PHP `include`/`require` partials resolve to view files when their path
+is static, while template-render edges expose detected `view_variables`.
 
 `FINDINGS` sorts active findings by numeric `cleanup_rank` by default, so direct
 cleanup candidates appear before low-confidence or test-local noise. Explicit
@@ -121,6 +132,11 @@ available. Use `reql query_context --code --json` or `reql query_context
 --cleanup --json` when another tool should consume the compact payload directly;
 payloads include `query_mode`, `scopes`, `cleanup_filter`, `owner_candidates`,
 `cleanup_candidates`, `working_set`, and `targeted_reads`.
+For small code working sets, informative code context can also embed exact
+`SourceFragment` snippets when a source fragment strongly matches the query
+phrase; this keeps phrase-level hits, such as UI labels inside PHP templates,
+available without opening whole files. Rendered code results stay compact for
+one- or two-file tasks while the JSON payload keeps the full targeted-read data.
 In cleanup mode, `targeted_reads` includes per-finding read kinds such as
 `import_block`, `symbol_body`, `finding_context`, `caller_ref`, `importer_ref`,
 `doc_ref`, and `test_ref`, plus a sufficiency reason explaining whether the
@@ -128,10 +144,12 @@ listed reads are enough before opening broader source files.
 
 Use `query_explore` when an agent needs the dependency chain for a concrete code
 target before editing. It returns focused owners, callers, public surface,
-serialization paths, docs mentions, and code working-set sections with usage
-guidance, snippets, and targeted reads; pass repeated
+serialization paths, docs mentions, structural template duplicates, and code
+working-set sections with usage guidance, snippets, and targeted reads; pass repeated
 `--view` flags such as `--view owners --view code`, or shortcuts such as `--owners-only` and
-`--serialization-paths-only` to keep output small.
+`--serialization-paths-only` to keep output small. Use
+`--structural-duplicates-only` for markup-signature comparisons across templates;
+this view is opt-in so normal dependency exploration does not pay its scan cost.
 
 Use raw `reql query "..."` statements when you need deterministic rows instead
 of a synthesized context block. `RETRIEVE` is the raw query form for ranked

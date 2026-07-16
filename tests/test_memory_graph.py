@@ -5,6 +5,7 @@ from dataclasses import asdict
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from api import MemoryGraph
 from memory.domain.models import MemoryEdge, MemoryNode, MemoryQuery
@@ -12,6 +13,19 @@ from memory.extraction import normalization
 
 
 class NormalizationTests(unittest.TestCase):
+    def test_expanded_retrieval_tokens_are_cached_without_changing_results(self) -> None:
+        from memory.services.retrieval import _expanded_tokens
+
+        _expanded_tokens.cache_clear()
+        first = _expanded_tokens("AgentWorkspace.link_task task_ids")
+        second = _expanded_tokens("AgentWorkspace.link_task task_ids")
+
+        self.assertIs(first, second)
+        self.assertIn("agent", first)
+        self.assertIn("workspace", first)
+        self.assertIn("task", first)
+        self.assertEqual(_expanded_tokens.cache_info().hits, 1)
+
     def test_token_signal_score_preserves_formula(self) -> None:
         cases = {
             "a": 0.0,
@@ -277,11 +291,16 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
         self.assertIn("Mode: informative", context)
         self.assertIn("Scope: code", context)
         self.assertIn("## Code results", context)
+        self.assertNotIn("## Read plan", context)
+        self.assertNotIn("## Recent changes", context)
+        self.assertNotIn("## Action plan", context)
+        self.assertIn("## Change chain", context)
         self.assertIn("## Research queries", context)
         self.assertIn("## Summary", context)
         self.assertNotIn("## Best matches", context)
         self.assertNotIn("## Source evidence", context)
         self.assertIn("src/memory/services/retrieval.py [2-4]", context)
+        self.assertIn("inspect_node=", context)
         self.assertNotIn("signals:", context)
         self.assertIn("src/memory/services/retrieval.py", context)
         self.assertIn("query_context", context)
@@ -294,10 +313,14 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
         self.assertEqual(payload["query_mode"], "informative")
         self.assertEqual(payload["scopes"], ["code"])
         self.assertNotIn("context", payload)
-        self.assertTrue(payload["usage_guidance"])
+        self.assertNotIn("usage_guidance", payload)
         self.assertTrue(any(item["id"] == "function:query-context" for item in payload["owner_candidates"]))
         self.assertNotIn("primary_targets", payload)
         self.assertNotIn("intervention_targets", payload)
+        self.assertTrue(payload["read_plan"])
+        self.assertTrue(payload["change_chain"])
+        self.assertFalse(any(step.get("phase") == "verify" for step in payload["change_chain"]))
+        self.assertFalse(any("instruction" in step for step in payload["change_chain"]))
         self.assertTrue(any(row["path"] == "src/memory/services/retrieval.py" for row in payload["working_set"]))
         retrieval_rows = [row for row in payload["working_set"] if row["path"] == "src/memory/services/retrieval.py"]
         self.assertTrue(retrieval_rows)
@@ -306,8 +329,8 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
         self.assertEqual(retrieval_rows[0]["line_end"], 4)
         self.assertFalse(any(row["path"] == "tests/test_retrieval.py" for row in payload["working_set"]))
         self.assertFalse(any(row["path"] == "docs/query_context.md" for row in payload["working_set"]))
-        self.assertFalse(payload["contracts"])
-        self.assertEqual(payload["impact"], {})
+        self.assertTrue(payload["contracts"])
+        self.assertTrue(payload["impact"])
         self.assertTrue(payload["targeted_reads"])
         self.assertFalse(payload["snippets"])
         self.assertFalse(payload["test_targets"])
@@ -320,6 +343,9 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
         self.assertEqual(informative_payload["query_mode"], "informative")
         self.assertNotIn("context", informative_payload)
         self.assertNotIn("intervention_targets", informative_payload)
+        self.assertNotIn("usage_guidance", informative_payload)
+        self.assertIn("read_plan", informative_payload)
+        self.assertIn("change_chain", informative_payload)
         self.assertFalse(informative_payload["snippets"])
         self.assertFalse(informative_payload["edit_plan"])
         self.assertTrue(all(row["role"] == "read" for row in informative_payload["working_set"]))
@@ -340,6 +366,7 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
 
         cleanup_context = self.graph.query_context("unused variable cleanup query_context noise", top_k=8, mode="cleanup")
         self.assertIn("## Cleanup candidates", cleanup_context)
+        self.assertIn("## Change chain", cleanup_context)
         self.assertIn("## Research queries", cleanup_context)
         self.assertIn("## Summary", cleanup_context)
 
@@ -347,6 +374,106 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
         self.assertEqual(default_payload["query_mode"], "informative")
         self.assertNotIn("intervention_targets", default_payload)
         self.assertFalse(default_payload["cleanup_candidates"])
+
+    def test_query_context_includes_application_views_and_css_assets(self) -> None:
+        nodes = [
+            MemoryNode(
+                id="function:auth-controller",
+                type="Method",
+                label="AuthController.login",
+                text="AuthController handles login password field validation.",
+                canonical_key="app.controllers.AuthController.login",
+                properties={
+                    "relative_path": "app/Controllers/AuthController.php",
+                    "context_scope": "code",
+                    "qualified_name": "AuthController.login",
+                    "line_start": 12,
+                    "line_end": 40,
+                },
+                salience=0.9,
+            ),
+            MemoryNode(
+                id="fragment:home-view",
+                type="SourceFragment",
+                label="app/Views/home/index.php#password",
+                text='<input class="password-field" name="password" type="password">',
+                canonical_key="fragment:home-view-password",
+                properties={
+                    "relative_path": "app/Views/home/index.php",
+                    "context_scope": "code",
+                    "line_start": 20,
+                    "line_end": 24,
+                },
+                salience=0.8,
+            ),
+            MemoryNode(
+                id="fragment:app-css",
+                type="SourceFragment",
+                label="public/assets/css/app.css#password",
+                text=".password-field { border-color: var(--form-border); }",
+                canonical_key="fragment:app-css-password",
+                properties={
+                    "relative_path": "public/assets/css/app.css",
+                    "context_scope": "code",
+                    "line_start": 100,
+                    "line_end": 106,
+                },
+                salience=0.8,
+            ),
+        ]
+        for node in nodes:
+            self.graph.add_node(node)
+
+        payload = self.graph.query_context_payload("password field", top_k=8, scopes=["code"])
+        working_paths = {row["path"] for row in payload["working_set"]}
+
+        self.assertIn("app/Controllers/AuthController.php", working_paths)
+        self.assertIn("app/Views/home/index.php", working_paths)
+        self.assertIn("public/assets/css/app.css", working_paths)
+
+    def test_query_context_filters_unrelated_javascript_generic_workflow_noise(self) -> None:
+        target = MemoryNode(
+            id="method:checkout-discount",
+            type="Method",
+            label="CheckoutController.applyDiscount",
+            text="Checkout discount calculation applies coupon totals.",
+            canonical_key="app.controllers.CheckoutController.applyDiscount",
+            properties={
+                "relative_path": "app/Controllers/CheckoutController.php",
+                "context_scope": "code",
+                "qualified_name": "CheckoutController.applyDiscount",
+                "line_start": 30,
+                "line_end": 52,
+            },
+            salience=0.4,
+        )
+        js_noise = MemoryNode(
+            id="function:unrelated-workflow-js",
+            type="Function",
+            label="initWorkflow",
+            text="Unrelated workflow helper function toggles menu animation.",
+            canonical_key="public.js.workflow.initWorkflow",
+            properties={
+                "relative_path": "public/js/workflow.js",
+                "context_scope": "code",
+                "qualified_name": "initWorkflow",
+                "line_start": 1,
+                "line_end": 16,
+            },
+            salience=0.99,
+        )
+        self.graph.add_node(target)
+        self.graph.add_node(js_noise)
+
+        payload = self.graph.query_context_payload("checkout discount fix workflow function", top_k=8, scopes=["code"])
+        working_paths = {row["path"] for row in payload["working_set"]}
+
+        self.assertEqual(payload["kind"], "code")
+        self.assertNotIn("results", payload)
+        self.assertIn("app/Controllers/CheckoutController.php", working_paths)
+        self.assertNotIn("public/js/workflow.js", working_paths)
+        self.assertTrue(any(item["id"] == "method:checkout-discount" for item in payload["owner_candidates"]))
+        self.assertFalse(any(item["id"] == "function:unrelated-workflow-js" for item in payload["owner_candidates"]))
 
     def test_cleanup_query_context_includes_stronger_targeted_read_payload(self) -> None:
         source_path = Path(self.tmp.name) / "app.py"
@@ -632,7 +759,10 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
         self.assertFalse(any(item["id"] == "function:agent-install-launcher" for item in payload["owner_candidates"]))
 
         no_match = self.graph.query_context_payload("unmatched archive restore marker", top_k=8, scopes=["code"])
-        self.assertFalse(no_match["results"])
+        self.assertEqual(no_match["kind"], "code")
+        self.assertFalse(no_match["working_set"])
+        self.assertFalse(no_match["targeted_reads"])
+        self.assertFalse(no_match["read_plan"])
         self.assertTrue(any(item["label"] == "Retrieve source rows" for item in no_match["followups"]))
         self.assertTrue(any(item["label"] == "Expand graph context" for item in no_match["followups"]))
 
@@ -678,6 +808,216 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
         self.assertTrue(reads)
         self.assertEqual(reads[0]["line_start"], 2024)
         self.assertEqual(reads[0]["line_end"], 2075)
+
+    def test_query_context_uses_structured_symbol_tokens_for_compound_queries(self) -> None:
+        class_node = MemoryNode(
+            id="class:catalog-client",
+            type="Class",
+            label="App.Clients.CatalogClient",
+            text="",
+            canonical_key="App.Clients.CatalogClient",
+            properties={
+                "relative_path": "app/Clients/CatalogClient.php",
+                "context_scope": "code",
+                "name": "CatalogClient",
+                "qualified_name": "App.Clients.CatalogClient",
+                "start_line": 4,
+                "end_line": 45,
+            },
+            salience=0.2,
+        )
+        release_method = MemoryNode(
+            id="method:catalog-release-dates",
+            type="Method",
+            label="App.Clients.CatalogClient.fetchMovieReleaseDates",
+            text="",
+            canonical_key="App.Clients.CatalogClient.fetchMovieReleaseDates",
+            properties={
+                "relative_path": "app/Clients/CatalogClient.php",
+                "context_scope": "code",
+                "name": "fetchMovieReleaseDates",
+                "qualified_name": "App.Clients.CatalogClient.fetchMovieReleaseDates",
+                "start_line": 12,
+                "end_line": 18,
+            },
+            salience=0.2,
+        )
+        upcoming_method = MemoryNode(
+            id="method:catalog-upcoming",
+            type="Method",
+            label="App.Clients.CatalogClient.discoverUpcomingMovies",
+            text="",
+            canonical_key="App.Clients.CatalogClient.discoverUpcomingMovies",
+            properties={
+                "relative_path": "app/Clients/CatalogClient.php",
+                "context_scope": "code",
+                "name": "discoverUpcomingMovies",
+                "qualified_name": "App.Clients.CatalogClient.discoverUpcomingMovies",
+                "start_line": 20,
+                "end_line": 28,
+            },
+            salience=0.2,
+        )
+        noisy_fragment = MemoryNode(
+            id="fragment:catalog-noise",
+            type="SourceFragment",
+            label="docs/catalog.md#noise",
+            text="movie release dates discover upcoming integration notes",
+            canonical_key="fragment:catalog-noise",
+            properties={"relative_path": "docs/catalog.md", "context_scope": "docs", "line_start": 1, "line_end": 4},
+            salience=0.95,
+        )
+        for node in (class_node, release_method, upcoming_method, noisy_fragment):
+            self.graph.add_node(node)
+        self.graph.add_edge(MemoryEdge(id="edge:class-release", from_id=class_node.id, to_id=release_method.id, type="METHOD"))
+        self.graph.add_edge(MemoryEdge(id="edge:class-upcoming", from_id=class_node.id, to_id=upcoming_method.id, type="METHOD"))
+
+        payload = self.graph.query_context_payload(
+            "CatalogClient movie release dates discover upcoming",
+            top_k=8,
+            max_depth=1,
+            scopes=["code"],
+        )
+
+        working_paths = {row["path"] for row in payload["working_set"]}
+        self.assertIn("app/Clients/CatalogClient.php", working_paths)
+        self.assertNotIn("docs/catalog.md", working_paths)
+        owner_ids = {item["id"] for item in payload["owner_candidates"]}
+        self.assertIn("method:catalog-release-dates", owner_ids)
+        self.assertIn("method:catalog-upcoming", owner_ids)
+        reads = {item["node_id"]: item for item in payload["targeted_reads"]}
+        self.assertEqual(reads["method:catalog-release-dates"]["line_start"], 12)
+        self.assertEqual(reads["method:catalog-upcoming"]["line_end"], 28)
+
+    def test_query_context_embeds_exact_source_fragment_snippet_for_small_code_sets(self) -> None:
+        project_root = Path(self.tmp.name) / "project"
+        source_path = project_root / "profile" / "show.php"
+        source_path.parent.mkdir(parents=True)
+        source_path.write_text(
+            "\n".join(
+                [
+                    "<?php",
+                    "<section>",
+                    "  <h1>Profilo utente</h1>",
+                    "  <h2>Statistiche di visualizzazione</h2>",
+                    "</section>",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        fragment = MemoryNode(
+            id="fragment:profile-show-stats",
+            type="SourceFragment",
+            label="profile/show.php#stats",
+            text="Statistiche di visualizzazione",
+            canonical_key="fragment:profile-show-stats",
+            properties={
+                "relative_path": "profile/show.php",
+                "source_path": str(source_path),
+                "context_scope": "code",
+                "line_start": 4,
+                "line_end": 4,
+            },
+            salience=0.9,
+        )
+        file_node = MemoryNode(
+            id="file:profile-show",
+            type="File",
+            label="profile/show.php",
+            text="profile show php source file",
+            canonical_key="file:profile-show",
+            properties={
+                "relative_path": "profile/show.php",
+                "path": str(source_path),
+                "context_scope": "code",
+            },
+            salience=0.5,
+        )
+        self.graph.add_node(file_node)
+        self.graph.add_node(fragment)
+        self.graph.add_edge(MemoryEdge(id="edge:file-profile-stats", from_id=file_node.id, to_id=fragment.id, type="CONTAINS"))
+
+        payload = self.graph.query_context_payload(
+            "profile show php Statistiche di visualizzazione",
+            top_k=6,
+            scopes=["code"],
+        )
+        rendered = self.graph.query_context(
+            "profile show php Statistiche di visualizzazione",
+            top_k=6,
+            scopes=["code"],
+        )
+
+        self.assertTrue(payload["snippets"])
+        self.assertEqual(payload["snippets"][0]["path"], "profile/show.php")
+        self.assertEqual(payload["snippets"][0]["line_start"], 4)
+        self.assertIn("Statistiche di visualizzazione", payload["snippets"][0]["text"])
+        self.assertIn("## Snippets", rendered)
+        self.assertIn("profile/show.php [4]", rendered)
+        self.assertIn("Statistiche di visualizzazione", rendered)
+
+    def test_query_context_keeps_small_working_set_rendering_compact(self) -> None:
+        for index in range(5):
+            self.graph.add_node(
+                MemoryNode(
+                    id=f"method:compact-{index}",
+                    type="Method",
+                    label=f"App.Service.CompactTarget.part{index}",
+                    text="compact result marker bounded render",
+                    canonical_key=f"App.Service.CompactTarget.part{index}",
+                    properties={
+                        "relative_path": "app/Service.php",
+                        "context_scope": "code",
+                        "name": f"part{index}",
+                        "qualified_name": f"App.Service.CompactTarget.part{index}",
+                        "line_start": 10 + index,
+                        "line_end": 10 + index,
+                    },
+                    salience=0.7,
+                )
+            )
+
+        payload = self.graph.query_context_payload("CompactTarget compact result marker", top_k=8, scopes=["code"])
+        rendered = self.graph.query_context("CompactTarget compact result marker", top_k=8, scopes=["code"])
+
+        self.assertGreaterEqual(len(payload["targeted_reads"]), 5)
+        self.assertLessEqual(rendered.count("- ref `"), 3)
+
+    def test_reql_symbol_rows_resolve_line_start_aliases(self) -> None:
+        symbol = MemoryNode(
+            id="method:catalog-release-dates",
+            type="Method",
+            label="App.Clients.CatalogClient.fetchMovieReleaseDates",
+            text="",
+            canonical_key="App.Clients.CatalogClient.fetchMovieReleaseDates",
+            properties={
+                "relative_path": "app/Clients/CatalogClient.php",
+                "context_scope": "code",
+                "name": "fetchMovieReleaseDates",
+                "qualified_name": "App.Clients.CatalogClient.fetchMovieReleaseDates",
+                "start_line": 12,
+                "end_line": 18,
+            },
+        )
+        self.graph.add_node(symbol)
+
+        result = self.graph.query(
+            "SYMBOLS WHERE name = 'fetchMovieReleaseDates' RETURN name,start_line,end_line,line_start,line_end"
+        )
+
+        self.assertEqual(result.rows[0]["start_line"], 12)
+        self.assertEqual(result.rows[0]["end_line"], 18)
+        self.assertEqual(result.rows[0]["line_start"], 12)
+        self.assertEqual(result.rows[0]["line_end"], 18)
+
+    def test_unfiltered_find_uses_indexed_count_metadata(self) -> None:
+        self.graph.add_node(MemoryNode(id="fact:indexed-count", type="Fact", label="Indexed count", salience=0.9))
+
+        with patch.object(self.graph.store, "all_nodes", side_effect=AssertionError("unexpected full node scan")):
+            result = self.graph.query("FIND nodes LIMIT 1")
+
+        self.assertEqual(len(result.rows), 1)
+        self.assertGreaterEqual(result.diagnostics["matched"], 1)
 
     def test_query_outputs_include_directional_edge_context(self) -> None:
         upstream = MemoryNode(
@@ -953,6 +1293,68 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
         self.assertTrue(any(item["label"] == "Inspect top node" for item in payload["followups"]))
         self.assertTrue(any('RETRIEVE "office plant watering"' in item["command"] for item in payload["followups"]))
         self.assertNotIn("working_set", payload)
+
+    def test_query_context_correlates_related_files_without_rendering_action_plan(self) -> None:
+        project_id = "project:wp-optimizer"
+        readme = MemoryNode(
+            id="fragment:wp-readme-faq",
+            type="SourceFragment",
+            label="readme.txt FAQ",
+            text="Frequently Asked Questions FAQ for the wp-optimizer plugin.",
+            canonical_key="wp-optimizer:readme:faq",
+            properties={
+                "project_id": project_id,
+                "relative_path": "readme.txt",
+                "context_scope": "docs",
+                "line_start": 376,
+                "line_end": 496,
+            },
+        )
+        handler = MemoryNode(
+            id="method:wp-admin-faq",
+            type="Method",
+            label="PagesHandler.renderFaq",
+            text="Render the wp-optimizer admin FAQ and its translated answers.",
+            canonical_key="wp-optimizer:PagesHandler:renderFaq",
+            properties={
+                "project_id": project_id,
+                "relative_path": "admin/PagesHandler.class.php",
+                "context_scope": "code",
+                "line_start": 621,
+                "line_end": 930,
+            },
+        )
+        catalog = MemoryNode(
+            id="artifact:wpopt-pot",
+            type="SourceArtifact",
+            label="languages/wpopt.pot",
+            text="languages/wpopt.pot",
+            canonical_key="wp-optimizer:languages/wpopt.pot",
+            properties={
+                "project_id": project_id,
+                "relative_path": "languages/wpopt.pot",
+                "context_scope": "docs",
+            },
+        )
+        for node in (readme, handler, catalog):
+            self.graph.add_node(node)
+
+        payload = self.graph.query_context_payload("readme FAQ", top_k=6, max_depth=1, max_items=8)
+        context = self.graph.query_context("readme FAQ", top_k=6, max_depth=1, max_items=8)
+
+        related = {item["path"]: item for item in payload["related_files"]}
+        self.assertEqual(related["readme.txt"]["action"], "open")
+        self.assertEqual((related["readme.txt"]["line_start"], related["readme.txt"]["line_end"]), (376, 496))
+        self.assertEqual(related["admin/PagesHandler.class.php"]["action"], "review")
+        self.assertEqual(
+            (related["admin/PagesHandler.class.php"]["line_start"], related["admin/PagesHandler.class.php"]["line_end"]),
+            (621, 930),
+        )
+        self.assertEqual(related["languages/wpopt.pot"]["action"], "update")
+        self.assertNotIn("## Action plan", context)
+        self.assertNotIn("Open `readme.txt:376-496`", context)
+        self.assertNotIn("Review `admin/PagesHandler.class.php:621-930`", context)
+        self.assertNotIn("Update `languages/wpopt.pot`", context)
 
     def test_reql_where_supports_sql_like_text_and_range_operators(self) -> None:
         self.graph.add_node(

@@ -53,6 +53,11 @@ source fragments, call targets, and read/write/return/raise references. This
 keeps each non-Python/Solidity language independently extensible while sharing
 the common Tree-sitter graph assembly code.
 
+Compiled symbol nodes carry deterministic source spans as both
+`start_line/end_line` and `line_start/line_end`, plus `relative_path` and
+`source_path`. Query and context retrieval use these fields interchangeably so
+agents can request precise symbol spans without opening whole files.
+
 The Tree-sitter extraction layer is structured directly under
 `memory.code_analysis`. `TreeSitterCodeParser` and shared AST primitives live in
 `memory.code_analysis.base`, while
@@ -107,7 +112,7 @@ Primary technical relations:
 - `File/Module -IMPORTS-> Import`
 - `File -DEPENDS_ON-> Dependency`
 - `Module -IMPORTS_FROM-> Dependency`
-- `Module -RE_EXPORTS-> Import` for imports exposed by package `__init__.py`
+- `Module -RE_EXPORTS-> Symbol/Module/File` for imports exposed by package `__init__.py`
 - `Function/Method -CALLS-> Function/Method` when locally resolvable
 - `Function/Method -INSTANTIATES-> Class/Interface` for constructor calls
 - `Function/Method -EMITS-> Event symbol` for Solidity event emission
@@ -117,6 +122,8 @@ Primary technical relations:
 - `Function/Method -RETURNS-> Symbol`
 - `Function/Method -RAISES-> Symbol`
 - `Class/Interface -INHERITS-> Class/CodeSymbol`
+- `Method -OVERRIDES-> Method` when a same-name method is found on a resolved ancestor
+- `Function/Method -WRAPS-> Function/Method/Class` for conservative one-statement delegation wrappers
 - `Class -IMPLEMENTS-> Interface`
 - `Function/Method -HANDLES_ROUTE-> Endpoint`
 - `Module/Function/Class/Interface/Method -EVIDENCED_BY-> SourceFragment`
@@ -172,9 +179,17 @@ findings. Add `--include-risky` to include API, entrypoint, framework lifecycle,
 test-local, low-confidence, and dynamic-reference candidates marked for
 validation instead of direct removal.
 
-Package `__init__.py` imports are also marked on `Import` nodes with
-`is_re_export=true` and linked from the module with `RE_EXPORTS`, so public API
-surfaces are queryable without treating them as direct removal candidates.
+Package `__init__.py` imports are marked on `Import` nodes with
+`is_re_export=true`. A project-wide post-parse pass resolves them to real public
+symbols (including public names from wildcard imports) and links those targets
+from the initializer module with `RE_EXPORTS`. Initializer modules and files carry
+the searchable roles `package-initializer` and, when applicable, `re-export`.
+The same pass resolves ancestors across files, emits `OVERRIDES` for inherited
+same-name methods, and resolves conservative Python one-statement delegates as
+`WRAPS`. Methods and callables expose searchable `override` and `wrapper` roles,
+so lexical and graph queries can seed these structures directly instead of
+depending on incidental docstrings or symbol names. Derived links are refreshed
+after changed artifacts and stale links are deactivated.
 
 Markdown and other structured documents keep their `SourceFragment` headings and
 also materialize stable `Concept` nodes for those explicit headings. These

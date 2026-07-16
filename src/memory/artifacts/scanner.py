@@ -1,17 +1,20 @@
 """Recursive project scanner for source artifact discovery."""
 from __future__ import annotations
 
+import hashlib
 import os
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
 
+from ..config import default_config
 from ..domain.timeutils import utcnow_iso
 from .fingerprint import (
     DEFAULT_CHUNKING_VERSION,
     DEFAULT_PARSER_VERSION,
     artifact_id,
     file_uri,
-    fingerprint_file,
     normalize_path,
     project_id,
     relative_path,
@@ -20,8 +23,15 @@ from .ignore import build_ignore_matcher
 from .mime import classify_path, is_unsupported_media_file
 from .models import Project, ScanError, ScanResult, ScanSkippedFile, SourceArtifact
 
-DEFAULT_MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024
+DEFAULT_MAX_FILE_SIZE_BYTES = default_config().scan.max_file_size_bytes
 SAMPLE_BYTES = 8192
+
+
+@dataclass(frozen=True, slots=True)
+class _FileScanOutcome:
+    artifact: SourceArtifact | None = None
+    skipped: ScanSkippedFile | None = None
+    error: ScanError | None = None
 
 
 class ProjectScanner:
@@ -37,6 +47,7 @@ class ProjectScanner:
         include_patterns: list[str] | None = None,
         exclude_patterns: list[str] | None = None,
         use_default_ignores: bool = True,
+        use_gitignore: bool = False,
     ) -> None:
         self.max_file_size_bytes = max_file_size_bytes
         self.parser_version = parser_version
@@ -45,8 +56,14 @@ class ProjectScanner:
         self.include_patterns = include_patterns or []
         self.exclude_patterns = exclude_patterns or []
         self.use_default_ignores = use_default_ignores
+        self.use_gitignore = use_gitignore
 
-    def scan(self, root_path: str | Path, *, name: str | None = None) -> ScanResult:
+    def scan(
+        self,
+        root_path: str | Path,
+        *,
+        name: str | None = None,
+    ) -> ScanResult:
         root = Path(root_path).expanduser().resolve(strict=False)
         if not root.exists():
             raise FileNotFoundError(f"Project path does not exist: {root}")
@@ -63,10 +80,15 @@ class ProjectScanner:
             created_at=now,
             updated_at=now,
         )
-        matcher = build_ignore_matcher(root, use_default_ignores=self.use_default_ignores)
+        matcher = build_ignore_matcher(
+            root,
+            use_default_ignores=self.use_default_ignores,
+            use_gitignore=self.use_gitignore,
+        )
         artifacts: list[SourceArtifact] = []
         skipped: list[ScanSkippedFile] = []
         errors: list[ScanError] = []
+        candidates: list[Path] = []
 
         stack = [root]
         while stack:
@@ -103,9 +125,20 @@ class ProjectScanner:
                 if self.include_patterns and not _matches_any(rel, self.include_patterns):
                     skipped.append(ScanSkippedFile(normalize_path(path), rel, "not_included"))
                     continue
-                artifact = self._scan_file(root, path, project, now, skipped, errors)
-                if artifact is not None:
-                    artifacts.append(artifact)
+                candidates.append(path)
+
+        # Hashing dominates scans of large projects. Workers return isolated
+        # outcomes and ``map`` preserves traversal order, keeping results
+        # deterministic without shared mutable state.
+        with ThreadPoolExecutor(thread_name_prefix="reql-scan") as executor:
+            outcomes = executor.map(lambda path: self._scan_file(root, path, project, now), candidates)
+            for outcome in outcomes:
+                if outcome.artifact is not None:
+                    artifacts.append(outcome.artifact)
+                if outcome.skipped is not None:
+                    skipped.append(outcome.skipped)
+                if outcome.error is not None:
+                    errors.append(outcome.error)
 
         counts: dict[str, int] = {}
         for artifact in artifacts:
@@ -119,53 +152,51 @@ class ProjectScanner:
         path: Path,
         project: Project,
         now: str,
-        skipped: list[ScanSkippedFile],
-        errors: list[ScanError],
-    ) -> SourceArtifact | None:
+    ) -> _FileScanOutcome:
         rel = _safe_relative(root, path)
-        try:
-            stat = path.stat()
-        except OSError as exc:
-            errors.append(ScanError(normalize_path(path), rel, str(exc)))
-            return None
-        size = int(stat.st_size)
-        if size > self.max_file_size_bytes:
-            skipped.append(ScanSkippedFile(normalize_path(path), rel, "max_file_size_exceeded", size))
-            return None
-        try:
-            with path.open("rb") as fh:
-                sample = fh.read(SAMPLE_BYTES)
-            fingerprint = fingerprint_file(
-                root,
-                path,
-                parser_version=self.parser_version,
-                chunking_version=self.chunking_version,
-                options=self.options,
-            )
-        except OSError as exc:
-            errors.append(ScanError(normalize_path(path), rel, str(exc)))
-            return None
+        normalized = normalize_path(path)
+        for _attempt in range(3):
+            try:
+                before = path.stat()
+                size = int(before.st_size)
+                if size > self.max_file_size_bytes:
+                    return _FileScanOutcome(skipped=ScanSkippedFile(normalized, rel, "max_file_size_exceeded", size))
+                digest = hashlib.sha256()
+                sample = b""
+                with path.open("rb") as fh:
+                    while chunk := fh.read(1024 * 1024):
+                        if not sample:
+                            sample = chunk[:SAMPLE_BYTES]
+                        digest.update(chunk)
+                after = path.stat()
+            except OSError as exc:
+                return _FileScanOutcome(error=ScanError(normalized, rel, str(exc)))
+            if before.st_size == after.st_size and before.st_mtime_ns == after.st_mtime_ns:
+                stat = after
+                sha256 = digest.hexdigest()
+                break
+        else:
+            return _FileScanOutcome(error=ScanError(normalized, rel, "file changed repeatedly while being scanned"))
         if is_unsupported_media_file(path, sample):
-            skipped.append(ScanSkippedFile(normalize_path(path), rel, "unsupported_media", size))
-            return None
+            return _FileScanOutcome(skipped=ScanSkippedFile(normalized, rel, "unsupported_media", size))
         classification = classify_path(path, sample)
-        return SourceArtifact(
-            id=artifact_id(project.id, fingerprint.relative_path),
+        return _FileScanOutcome(artifact=SourceArtifact(
+            id=artifact_id(project.id, rel),
             project_id=project.id,
             uri=file_uri(path),
-            path=fingerprint.path,
-            relative_path=fingerprint.relative_path,
+            path=normalize_path(path),
+            relative_path=rel,
             artifact_type=classification.artifact_type,
             language=classification.language,
-            size_bytes=fingerprint.size_bytes,
-            sha256=fingerprint.sha256,
-            mtime=fingerprint.mtime,
+            size_bytes=size,
+            sha256=sha256,
+            mtime=float(stat.st_mtime),
             status="active",
             created_at=now,
             updated_at=now,
             last_seen_at=now,
             last_compiled_at=None,
-        )
+        ))
 
 
 def _safe_relative(root: Path, path: Path) -> str:

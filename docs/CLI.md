@@ -12,9 +12,12 @@ reql project compile .
 reql project update .
 reql project compile . --watch
 reql cache status .
+reql project history . --limit 5
+reql project diff .
 
 # Retrieve context
 reql query_context --query "payment service"
+reql query_context --query "payment service serializer" --code
 reql query_explore --query "payment service serialization" --view owners --view code
 reql query_graph --query "payment service" --max-depth 2 --json
 reql query_memories --query "payment service" --limit 8 --json
@@ -25,6 +28,8 @@ reql agent init
 reql agent bus
 reql agent sync
 reql agent session start "Serializer cleanup"
+# Optional explicit activity scope (Codex uses CODEX_THREAD_ID automatically)
+reql agent --agent AGENT_ID --activity TASK_ID session start "Serializer cleanup"
 reql agent add "Read the payment service serializer"
 reql agent task add "Patch serializer error handling"
 reql agent decision add "Reuse the existing graph store"
@@ -90,7 +95,7 @@ integrations. It creates project-local Agent Workspaces, also called Agent
 Working Graphs. Each CLI agent gets its own private working graph under
 `.reql/agents/` and all agents share a small internal bus in
 `.reql/agent-bus.reql`. The Python API follows the bus current agent when one
-exists, and otherwise falls back to the compatible `master` workspace at
+exists. Without a bus selection it uses the default `master` workspace at
 `.reql/agent.reql`.
 The standard graph remains the stable project memory in `.reql/memory.reql`;
 `reql agent init` and `reql agent reset` derive reference nodes and relations
@@ -111,6 +116,11 @@ reql agent status
 reql agent session start "Focused implementation pass"
 ```
 
+`reql agent status` reports the current session as active only when it still has
+open tasks. A completed or otherwise idle session is shown as the last idle
+session, which keeps old session titles visible for recovery without making
+them look like the current working focus.
+
 `reql agent init` returns an `agent_id`, records it on the internal bus, and
 makes it the current agent for later commands in the same project. In a normal
 single-agent integration, the installed instructions keep using
@@ -118,6 +128,12 @@ single-agent integration, the installed instructions keep using
 `reql agent --agent AGENT_ID ...` or set `REQL_AGENT_ID=AGENT_ID` so each worker
 writes to its own private memory while still reading shared bus messages and
 handoffs.
+
+Current sessions are also scoped by activity, so two tasks may safely reuse the
+same `agent_id` without replacing each other's current session during `sync`.
+REQL uses `REQL_AGENT_ACTIVITY_ID` first and `CODEX_THREAD_ID` second when
+available; other clients can pass `--activity ACTIVITY_ID` explicitly. Without
+an activity id, the agent has one current session.
 
 The agent saves observations while analyzing code:
 
@@ -133,7 +149,6 @@ printed by retrieval, `inspect`, or `agent list` can be used directly:
 ```bash
 reql agent task add "Implement agent reset"
 reql agent link TASK_ID artifact:app --relation touches
-reql agent link-task --file test-agent/context_savings.py
 reql agent link-task --task TASK_ID --file src/memory/cli.py
 reql agent link TASK_ID DECISION_ID --relation implements
 reql agent link-many TASK_ID artifact:app function:target --relation touches
@@ -150,9 +165,9 @@ the current session's working set, which is useful when the Agent Workspace has
 older task history that should not dominate the map. You can also pass a
 session id to inspect an earlier session.
 
-`agent link-task --file PATH` resolves a compiled file by readable path and
-links it to the latest open task, preferring the current session when one is
-active. Pass `--task TASK_ID` when you need to link a specific task.
+`agent link-task --task TASK_ID --file PATH` resolves a compiled file by
+readable path and links it to the explicitly selected open task. Requiring the
+task id prevents a code target from being attached to an unrelated recent task.
 When a path has both `File` and `SourceArtifact` graph nodes, `link-task`
 chooses the `File` node and only reports ambiguity for same-priority matches.
 
@@ -260,11 +275,24 @@ Supported agent node types are `note`, `task`, `decision`, `finding`, `file`,
 
 ## Retrieval Commands
 
+When the project-relative path is already known, bypass semantic retrieval and
+graph expansion with `locate`:
+
+```bash
+reql locate "extensions/wp-optimizer/readme"
+reql locate "extensions/wp-optimizer/readme.txt" --json
+```
+
+The lookup is case-insensitive and index-backed. If the input has no extension,
+REQL checks the exact path and the known documentation suffixes `.md`,
+`.markdown`, `.txt`, and `.rst`.
+
 `query_context` composes a deterministic agent-ready context block:
 
 ```bash
 reql query_context --query "payment service"
 reql query_context --query "payment service" --code --json
+reql query_context --query "readme FAQ"
 reql query_context --query "unused imports" --cleanup
 reql query "FINDINGS WHERE finding_type = 'possibly_orphan_directory' RETURN relative_path,file_count,files,cleanup_priority"
 reql query_context --query "unused public API" --cleanup --include-risky
@@ -273,7 +301,11 @@ reql query_context --query "unused public API" --cleanup --include-risky
 It is informative by default and returns matching nodes, file/line references,
 source links, owner candidates, cleanup candidates, working-set records, and
 targeted reads. Use `--code`, `--docs`, or `--test` to limit context to a
-scope. Use `--cleanup` for dead-code and unused-symbol cleanup. Cleanup output
+scope. For small code working sets, exact phrase matches in `SourceFragment`
+nodes can be rendered as snippets so agents can use precise source spans before
+opening full files. In rendered code context, read-plan spans and inspection
+commands are folded into `Code results`; the structured JSON retains the full
+`read_plan`. Use `--cleanup` for dead-code and unused-symbol cleanup. Cleanup output
 is conservative by default and shows safe-remove findings plus medium-priority
 directory aggregate findings. `possibly_orphan_directory` groups multiple
 isolated code files under one containing directory with `file_count` and
@@ -281,16 +313,26 @@ isolated code files under one containing directory with `file_count` and
 `--include-risky` to include public API, low-confidence, test-local, and
 validate/risky `StaticAnalysisFinding` candidates.
 
+For an unscoped informative query, REQL also detects cross-layer file
+relationships when documentation and implementation files in the same project
+share significant query terms. Structured JSON exposes those records as
+`related_files`; they are omitted from the compact rendered context. Translation
+catalogs (`.pot` and `.po`) from that project are
+included when the correlated change can affect translatable code strings.
+
 `query_explore` returns dependency slices for concrete code targets:
 
 ```bash
 reql query_explore --query "payment service serialization" --view owners --view callers --json
 reql query_explore --query "payment service serialization" --serialization-paths-only
+reql query_explore --query "profile template" --structural-duplicates-only
 ```
 
 Views include `owners`, `callers`, `public_surface`, `serialization_paths`,
-`docs_mentions`, and `code`. Use repeated `--view` flags or shortcut flags to
-keep output small.
+`docs_mentions`, `structural_duplicates`, and `code`. The structural duplicate
+view compares template markup hierarchy, parent-child relations, attributes,
+and tag sequences rather than lexical file relevance. It is opt-in by default;
+use repeated `--view` flags or shortcut flags to keep output small.
 
 `query_graph` returns a structured query-centered subgraph:
 
@@ -318,10 +360,26 @@ Use `inspect --node-id NODE_ID --json` to resolve a node id printed by
 retrieval or REQL statements and inspect its location, adjacent records, and
 source hints.
 
+For coding-agent edits, `query_context --code` renders owner symbols,
+bounded source spans, snippets when they are small enough, and research
+commands. JSON output also includes `read_plan` and `change_chain` so another
+agent can follow the intended intervention path without opening whole files or
+patching around missing project context.
+
 Query/retrieval commands write usage events to an append-only journal rather
-than rewriting canonical graph records. Read/query commands open the graph
-read-only, so parallel readers can run together. Compile/update writers wait
-for existing readers and block new readers while opening the write session.
+than rewriting canonical graph records. `project status`, `query_context`, and
+non-mutating `query` statements open a consistent read-only index snapshot, so
+parallel readers can run together. Compile/update writers wait for existing
+readers and block new readers while opening the write session.
+Use `reql storage locks` to see the owning command, lock duration, process
+liveness, watcher state, stale status, and snapshot availability. Add
+`--recover-stale` for conservative cleanup of dead same-host owners. If a live
+writer must remain active, place the global `--snapshot` option before a
+read-only command, for example `reql --snapshot query_context --query "FAQ"`.
+Expected storage failures return exit code `1` without a Python traceback. A
+writer lock prints only one recovery command in the form `reql is locked for
+write: to fix any possible stale: reql --storage "PATH" storage locks
+--recover-stale`.
 
 ## Inspection and Export
 
@@ -329,6 +387,8 @@ for existing readers and block new readers while opening the write session.
 reql stats
 reql storage inspect
 reql storage inspect --json
+reql storage locks
+reql storage locks --recover-stale
 reql storage compact
 reql export --out graph.json
 reql export --json --out reql-json
@@ -395,6 +455,13 @@ standard project graph and Agent Workspace commands such as `reql agent init`,
 `agent reset`. Pass `--project-dir` to target another project root. Pass
 `--user` to write to matching assistant profiles under the home directory.
 
+Generated skills keep the main workflow intentionally compact: bootstrap,
+bounded retrieval, raw-read limits, graph refresh, and the optional Agent
+Workspace lifecycle appear once. Detailed command variants live in routed
+`references/` files and are loaded only for the relevant task. Platform rules
+for Cursor, Copilot, Kilo, and shared instruction files are rendered from the
+same canonical rule set so their behavior does not drift or repeat.
+
 The installer also writes a REQL-owned `reql` command shim; use `--command-dir`
 to select the shim directory. Claude and Gemini hooks are installed by default
 and can be skipped with `--no-hooks`. `reql uninstall` removes REQL-owned skill
@@ -406,7 +473,7 @@ automatic hooks while preserving unrelated content in shared files.
 ```bash
 reql-mcp
 reql-mcp --read-only
-reql-mcp --config conf.yaml --set project.id=team-a --read-only
+reql-mcp --config reql.conf --set project.id=team-a --read-only
 reql-mcp --transport http --host 127.0.0.1 --port 8765 --api-key "change-this-key"
 reql-mcp --transport http --host 0.0.0.0 --port 8765 --api-key "change-this-key" --read-only
 ```
@@ -419,7 +486,7 @@ See [MCP.md](MCP.md) for tools, endpoint details, and client configuration.
 ## Diagnostics
 
 Set `diagnostics.enabled = true` and
-`diagnostics.path: ".reql/profile.jsonl"` in `conf.yaml` to append structured
+`diagnostics.path: ".reql/profile.jsonl"` in `reql.conf` to append structured
 performance events for commands that run compile or retrieval work. The JSONL
 log includes phases such as `compile.scan`, `compile.plan`,
 `compile.artifact`, `compile.transaction`, `retrieval.lexical_search`,
@@ -435,9 +502,24 @@ reql --set scan.max_file_size_mb=2 --set cache.enabled=false project compile .
 reql project compile . --watch
 ```
 
-`conf.yaml` can configure scan limits, include/exclude globs, cache behavior,
+`reql.conf` can configure scan limits, include/exclude globs, cache behavior,
 compile document ingestion, graph analysis toggles, and the default report
-output directory.
+output directory. Set `scan.use_gitignore: true` to apply the project root
+`.gitignore` together with the joined `scan.exclude` rules.
+Set `scan.ignore_defaults: true` when the project's `scan.include` and
+`scan.exclude` lists must replace, rather than extend, the internal defaults.
+
+Document formats are disabled by default. Enable only what the project needs:
+
+```yaml
+compile:
+  documents:
+    markdown: true
+    json: true
+```
+
+The `compile.document_formats` registry associates those names with their
+extensions and optional filenames and can also be overridden per project.
 
 ## REQL
 
@@ -469,6 +551,8 @@ reql project compile . --max-file-size-mb 5
 reql project exclude ".tmp/" "generated/*.json"
 reql project exclude "vendor/" --path PATH
 reql project status . --json
+reql project history . --limit 10
+reql project diff .
 reql project report . --output reports/
 ```
 
@@ -478,13 +562,22 @@ artifacts. It creates or updates project/artifact metadata and parses supported
 content into queryable graph nodes. Image and video files are skipped and are
 not registered as artifacts.
 
-When `conf.yaml` is present, project compile/update, watch mode, and cache
+Every successful tree change also creates an immutable `ProjectRevision`. A
+revision stores a content-addressed tree hash, its parent revision, and file
+transitions (`added`, `modified`, or `deleted`) with old and new SHA-256 values.
+No-op compiles do not create revisions. Use `project history` for the
+newest-first chain and `project diff` (optionally `--revision ID`) for one
+revision's file changes. This is revision metadata for context and auditing; it
+does not store file contents or modify the repository's own Git history.
+
+When `reql.conf` is present, project compile/update, watch mode, and cache
 status apply configured `scan.include` and `scan.exclude` patterns. Compile
 exclusions should be listed in `scan.exclude`. With
 `compile.ingest_documents=true`, text documents become
 structural `SourceFragment` records for provenance and query context.
-`compile.documents` controls which concrete document formats and extensions are
-ingested. Ingested documents also pass through the local deterministic document
+`compile.documents` toggles formats by name; the internal
+`compile.document_formats` registry supplies their extensions and filenames.
+Ingested documents also pass through the local deterministic document
 processor. It creates ranked document `Concept` nodes, underlying `RawEvent`
 observation nodes, `MENTIONS`, `EVIDENCED_BY`, `DERIVED_FROM`, and
 `CO_OCCURS_WITH` edges, and `REFERENCES` edges from document terms to compiled
@@ -492,7 +585,7 @@ code symbols when a fragment explicitly names a symbol. This path runs inside
 `project compile` and does not require model, agent, or coding-agent calls.
 
 `project exclude PATTERN [PATTERN ...]` creates or updates the selected
-project's `conf.yaml` and appends patterns to `scan.exclude`. Use it only for
+project's `reql.conf` and appends patterns to `scan.exclude`. Use it only for
 explicit exclusions or obvious dependency/cache/build-output directories. It
 defaults to the current working directory, accepts `--path PATH` when the
 runtime project path is elsewhere, preserves existing config values, and skips
@@ -525,6 +618,12 @@ compile into a complete indexed graph ready for query as soon as the command
 returns. Deleted files archive their `SourceArtifact`, `File`, and related
 fragment/code nodes. Use
 `project update` for a manual incremental refresh of the same path.
+Cache metadata for a compilation run is flushed once as an atomic batch, so
+cold compilation remains linear in the number of changed artifacts instead of
+rewriting the growing JSON cache once per file. Bounded `FIND` queries use the
+storage type/status/property indexes for candidate counts and top-K selection;
+equality filters such as `WHERE relative_path = 'src/app.py'` avoid a full graph
+scan.
 Compile mode applies built-in default ignore rules for dependency, VCS, cache,
 build-output, and local database paths, then applies configured
 include/exclude patterns and file-size limits.
@@ -539,8 +638,8 @@ compile/rebuild loops. It keeps running until interrupted. Use
 `--watch-debounce` to coalesce event bursts, and `--watch-iterations` for
 bounded automation, or pass an explicit path when the workspace is elsewhere.
 
-Markdown, plain text, and PDF artifacts are parsed by document parsers when
-their `compile.documents` policy has `ingest: true`.
+Markdown, plain text, and PDF artifacts are parsed when their
+`compile.documents.<format>` toggle is `true`.
 Markdown creates heading, paragraph, list, code block, table, and link
 structure. Plain text is chunked by paragraph. PDF parsing uses
 optional dependencies when installed and otherwise stores parser errors plus

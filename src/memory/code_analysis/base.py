@@ -34,7 +34,12 @@ class TreeSitterCodeParser:
         language = _language(artifact)
         parser_language = tree_sitter_language_key(artifact.path, language)
         source = text.removeprefix("\ufeff").encode("utf-8", errors="replace")
-        parser = _parser_for(parser_language)
+        try:
+            parser = _parser_for(parser_language)
+        except ValueError as exc:
+            if "Tree-sitter" not in str(exc):
+                raise
+            return _parser_unavailable_result(artifact, language, str(exc))
         tree = parser.parse(source)
         root = tree.root_node
         if bool(getattr(root, "has_error", False)):
@@ -126,6 +131,36 @@ def _language(artifact: SourceArtifact) -> str:
 def _empty_result(artifact: SourceArtifact, language: str, error: str) -> CodeParseResult:
     module = CodeModule(id=stable_id("module", artifact.id), artifact_id=artifact.id, name=_module_name(artifact.relative_path), path=artifact.relative_path, language=language, metadata={"tree_sitter": True})
     return CodeParseResult(module=module, symbols=[], imports=[], calls=[], references=[], classes=[], functions=[], methods=[], comments=[], docstrings=[], errors=[error], parser_name=TreeSitterCodeParser.parser_name, parser_version=TreeSitterCodeParser.parser_version)
+
+
+def _parser_unavailable_result(artifact: SourceArtifact, language: str, warning: str) -> CodeParseResult:
+    module = CodeModule(
+        id=stable_id("module", artifact.id),
+        artifact_id=artifact.id,
+        name=_module_name(artifact.relative_path),
+        path=artifact.relative_path,
+        language=language,
+        metadata={
+            "tree_sitter": True,
+            "parser_status": "skipped",
+            "parser_warning": warning,
+        },
+    )
+    return CodeParseResult(
+        module=module,
+        symbols=[],
+        imports=[],
+        calls=[],
+        references=[],
+        classes=[],
+        functions=[],
+        methods=[],
+        comments=[],
+        docstrings=[],
+        errors=[],
+        parser_name=TreeSitterCodeParser.parser_name,
+        parser_version=TreeSitterCodeParser.parser_version,
+    )
 
 
 def _syntax_recovery_result(artifact: SourceArtifact, language: str) -> CodeParseResult:

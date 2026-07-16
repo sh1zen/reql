@@ -50,6 +50,18 @@ class AgentWorkspaceTests(unittest.TestCase):
             graph.close()
         return storage
 
+    def _run_cli(self, storage: Path, *args: str) -> dict[str, object]:
+        env = dict(os.environ)
+        env["PYTHONPATH"] = "src"
+        completed = subprocess.run(
+            [sys.executable, "-m", "memory.cli", "--storage", str(storage), *args],
+            capture_output=True,
+            text=True,
+            env=env,
+            check=True,
+        )
+        return json.loads(completed.stdout)
+
     def test_init_derives_standard_graph_references(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = self._standard_graph(Path(td))
@@ -69,6 +81,29 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertEqual(by_id["artifact:app"]["source"], "standard")
             self.assertEqual(by_id["function:target"]["type"], "symbol")
             self.assertEqual(by_id["function:target"]["standard_type"], "Function")
+
+    def test_status_marks_current_session_idle_when_no_open_tasks_remain(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = self._standard_graph(Path(td))
+            workspace = AgentWorkspace(storage)
+            workspace.init()
+            workspace.start_session("Old focused work")
+            old_task = workspace.add_task("Finish old work")["node"]
+            workspace.complete_task(old_task["id"])
+
+            idle_status = workspace.status()
+
+            self.assertEqual(idle_status["current_session_title"], "Old focused work")
+            self.assertEqual(idle_status["current_session_open_tasks"], 0)
+            self.assertTrue(idle_status["current_session_is_idle"])
+
+            workspace.start_session("Current focused work")
+            workspace.add_task("Patch current work")
+            active_status = workspace.status()
+
+            self.assertEqual(active_status["current_session_title"], "Current focused work")
+            self.assertEqual(active_status["current_session_open_tasks"], 1)
+            self.assertFalse(active_status["current_session_is_idle"])
 
     def test_agent_changes_do_not_modify_standard_graph(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -246,27 +281,13 @@ class AgentWorkspaceTests(unittest.TestCase):
             workspace.init()
             task = workspace.add_task("Patch context savings")["node"]
 
-            linked = workspace.link_task(file_path="app.py")
+            linked = workspace.link_task(task_id=task["id"], file_path="app.py")
 
             self.assertEqual(linked["task"]["id"], task["id"])
             self.assertEqual(linked["target"]["id"], "artifact:app")
             self.assertEqual(linked["relation"]["from_id"], task["id"])
             self.assertEqual(linked["relation"]["to_id"], "artifact:app")
             self.assertEqual(linked["relation"]["relation"], "touches")
-
-    def test_link_task_prefers_current_session_latest_open_task(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            storage = self._standard_graph(Path(td))
-            workspace = AgentWorkspace(storage)
-            workspace.init()
-            workspace.add_task("Historical open task")
-            workspace.start_session("Current work")
-            current = workspace.add_task("Current session task")["node"]
-
-            linked = workspace.link_task(file_path="other.py")
-
-            self.assertEqual(linked["task"]["id"], current["id"])
-            self.assertEqual(linked["target"]["id"], "artifact:other")
 
     def test_link_task_prefers_file_node_over_artifact_for_same_path(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -288,7 +309,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             workspace.init()
             task = workspace.add_task("Patch app")["node"]
 
-            linked = workspace.link_task(file_path="app.py")
+            linked = workspace.link_task(task_id=task["id"], file_path="app.py")
 
             self.assertEqual(linked["task"]["id"], task["id"])
             self.assertEqual(linked["target"]["id"], "file:app")
@@ -533,6 +554,42 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertNotIn("payload", compact_handoff)
             self.assertEqual([item["id"] for item in full_handoff["payload"]["open_tasks"]], [alpha_task["id"]])
 
+    def test_same_agent_keeps_current_sessions_isolated_by_activity(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = self._standard_graph(Path(td))
+            first = AgentWorkspace(storage, agent_id="shared", activity_id="activity-one")
+            first.init()
+            first_session = first.start_session("First activity")["session"]
+            first_task = first.add_task("First task")["node"]
+
+            second = AgentWorkspace(storage, agent_id="shared", activity_id="activity-two")
+            second_session = second.start_session("Second activity")["session"]
+            second_task = second.add_task("Second task")["node"]
+            second.sync()
+
+            self.assertEqual(first.status()["current_session_id"], first_session["id"])
+            self.assertEqual(second.status()["current_session_id"], second_session["id"])
+            self.assertEqual([item["id"] for item in first.map(session="current")["open_tasks"]], [first_task["id"]])
+            self.assertEqual([item["id"] for item in second.map(session="current")["open_tasks"]], [second_task["id"]])
+            self.assertEqual(first.show(first_session["id"])["node"]["status"], "active")
+
+    def test_sync_migrates_legacy_current_session_to_activity_scope(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = self._standard_graph(Path(td))
+            legacy = AgentWorkspace(storage, agent_id="shared", activity_id=None)
+            legacy.activity_id = None
+            legacy.init()
+            session = legacy.start_session("Legacy session")["session"]
+
+            scoped = AgentWorkspace(storage, agent_id="shared", activity_id="activity-one")
+            scoped.sync()
+
+            self.assertEqual(scoped.status()["current_session_id"], session["id"])
+            self.assertEqual(
+                scoped.status()["metadata"]["current_session_ids"]["activity-one"],
+                session["id"],
+            )
+
     def test_lock_contention_returns_actionable_error(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = self._standard_graph(Path(td))
@@ -689,6 +746,8 @@ class AgentWorkspaceTests(unittest.TestCase):
                     str(storage),
                     "agent",
                     "link-task",
+                    "--task",
+                    json.loads(task.stdout)["node"]["id"],
                     "--file",
                     "app.py",
                     "--json",
@@ -705,6 +764,17 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertEqual(payload["target"]["id"], "artifact:app")
             self.assertEqual(payload["relation"]["from_id"], task_id)
             self.assertEqual(payload["relation"]["to_id"], "artifact:app")
+
+    def test_cli_link_task_rejects_missing_task_id(self) -> None:
+        result = subprocess.run(
+            [sys.executable, "-m", "memory.cli", "agent", "link-task", "--file", "app.py"],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PYTHONPATH": "src"},
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--task", result.stderr)
 
     def test_cli_agent_session_start_and_map_current_outputs_json(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -774,7 +844,7 @@ class AgentWorkspaceTests(unittest.TestCase):
             )
             task_id = json.loads(task.stdout)["node"]["id"]
             subprocess.run(
-                [sys.executable, "-m", "memory.cli", "--storage", str(storage), "agent", "link-task", "--file", "app.py", "--json"],
+                [sys.executable, "-m", "memory.cli", "--storage", str(storage), "agent", "link-task", "--task", task_id, "--file", "app.py", "--json"],
                 capture_output=True,
                 text=True,
                 env=env,
@@ -803,86 +873,24 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertEqual([item["id"] for item in payload["files"]], ["artifact:app"])
             self.assertIn((task_id, "artifact:app"), {(item["from_id"], item["to_id"]) for item in payload["relations"]})
 
-    def test_cli_agent_init_returns_uid_and_later_commands_use_current_bus_agent(self) -> None:
+    def test_cli_agent_init_selects_bus_agent_and_handoff_uses_it(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = self._standard_graph(Path(td))
-            env = dict(os.environ)
-            env["PYTHONPATH"] = "src"
-            init = subprocess.run(
-                [sys.executable, "-m", "memory.cli", "--storage", str(storage), "agent", "init", "--json"],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-            task = subprocess.run(
-                [sys.executable, "-m", "memory.cli", "--storage", str(storage), "agent", "task", "add", "CLI private task", "--json"],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-            handoff = subprocess.run(
-                [sys.executable, "-m", "memory.cli", "--storage", str(storage), "agent", "handoff", "CLI worker done", "--json"],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-            bus = subprocess.run(
-                [sys.executable, "-m", "memory.cli", "--storage", str(storage), "agent", "bus", "--json"],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-            full_bus = subprocess.run(
-                [sys.executable, "-m", "memory.cli", "--storage", str(storage), "agent", "bus", "--include-payloads", "--json"],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-
-            init_payload = json.loads(init.stdout)
-            task_id = json.loads(task.stdout)["node"]["id"]
-            handoff_payload = json.loads(handoff.stdout)["handoff"]
-            bus_payload = json.loads(bus.stdout)
-            full_bus_payload = json.loads(full_bus.stdout)
+            init_payload = self._run_cli(storage, "agent", "init", "--json")
+            task_id = self._run_cli(storage, "agent", "task", "add", "CLI private task", "--json")["node"]["id"]
+            handoff_payload = self._run_cli(storage, "agent", "handoff", "CLI worker done", "--json")["handoff"]
+            bus_payload = self._run_cli(storage, "agent", "bus", "--json")
+            full_bus_payload = self._run_cli(storage, "agent", "bus", "--include-payloads", "--json")
             self.assertTrue(init_payload["agent_id"].startswith("agent:"))
             self.assertNotEqual(init_payload["agent_storage"], str(AgentWorkspace.default_agent_storage(storage)))
             self.assertEqual(bus_payload["current_agent_id"], init_payload["agent_id"])
+            self.assertIn(init_payload["agent_id"], {item["agent_id"] for item in bus_payload["agents"]})
             self.assertEqual(handoff_payload["agent_id"], init_payload["agent_id"])
             self.assertEqual([item["id"] for item in handoff_payload["payload"]["open_tasks"]], [task_id])
             compact_handoff = next(item for item in bus_payload["handoffs"] if item["id"] == handoff_payload["id"])
             full_handoff = next(item for item in full_bus_payload["handoffs"] if item["id"] == handoff_payload["id"])
             self.assertNotIn("payload", compact_handoff)
             self.assertEqual([item["id"] for item in full_handoff["payload"]["open_tasks"]], [task_id])
-
-    def test_cli_agent_init_immediately_sets_current_bus_agent(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            storage = self._standard_graph(Path(td))
-            env = dict(os.environ)
-            env["PYTHONPATH"] = "src"
-            init = subprocess.run(
-                [sys.executable, "-m", "memory.cli", "--storage", str(storage), "agent", "init", "--json"],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-            bus = subprocess.run(
-                [sys.executable, "-m", "memory.cli", "--storage", str(storage), "agent", "bus", "--json"],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-
-            init_payload = json.loads(init.stdout)
-            bus_payload = json.loads(bus.stdout)
-            self.assertEqual(bus_payload["current_agent_id"], init_payload["agent_id"])
-            self.assertIn(init_payload["agent_id"], {item["agent_id"] for item in bus_payload["agents"]})
 
     def test_cli_sync_outputs_json_and_preserves_agent_items(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -937,119 +945,65 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertEqual(json.loads(sync.stdout)["preserved_agent_nodes"], 1)
             self.assertEqual(json.loads(status.stdout)["agent_nodes"], 1)
 
-    def test_cli_agent_batch_outputs_json_and_links_aliases(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            storage = self._standard_graph(Path(td))
-            batch_file = Path(td) / "agent-batch.json"
-            env = dict(os.environ)
-            env["PYTHONPATH"] = "src"
-            subprocess.run(
-                [sys.executable, "-m", "memory.cli", "--storage", str(storage), "agent", "init", "--json"],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-            batch_file.write_text(
-                json.dumps(
-                    {
-                        "operations": [
-                            {"op": "task.add", "description": "Patch batch command", "as": "task"},
-                            {"op": "decision.add", "text": "Use a single agent workspace lock", "as": "decision"},
-                            {"op": "link", "from": "$task", "to": "$decision", "relation": "implements"},
-                            {"op": "link-many", "from": "$task", "to": ["artifact:app", "function:target"], "relation": "touches"},
-                        ]
-                    }
-                ),
-                encoding="utf-8",
-            )
+    def test_cli_agent_batch_file_and_inline_inputs_link_aliases(self) -> None:
+        for input_mode in ("file", "inline"):
+            with self.subTest(input_mode=input_mode), tempfile.TemporaryDirectory() as td:
+                storage = self._standard_graph(Path(td))
+                self._run_cli(storage, "agent", "init", "--json")
 
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "memory.cli",
-                    "--storage",
-                    str(storage),
-                    "agent",
-                    "batch",
-                    "--json",
-                    str(batch_file),
-                ],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-            payload = json.loads(result.stdout)
-            task_id = payload["aliases"]["task"]
-            decision_id = payload["aliases"]["decision"]
+                if input_mode == "file":
+                    batch_file = Path(td) / "agent-batch.json"
+                    batch_file.write_text(
+                        json.dumps(
+                            {
+                                "operations": [
+                                    {"op": "task.add", "description": "Patch batch command", "as": "task"},
+                                    {"op": "decision.add", "text": "Use a single agent workspace lock", "as": "decision"},
+                                    {"op": "link", "from": "$task", "to": "$decision", "relation": "implements"},
+                                    {
+                                        "op": "link-many",
+                                        "from": "$task",
+                                        "to": ["artifact:app", "function:target"],
+                                        "relation": "touches",
+                                    },
+                                ]
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    args = ("agent", "batch", "--json", str(batch_file))
+                else:
+                    args = (
+                        "agent",
+                        "batch",
+                        "--task",
+                        "task=Patch inline batch command",
+                        "--decision",
+                        "decision=Use inline batch for small planning",
+                        "--link",
+                        "$task",
+                        "implements",
+                        "$decision",
+                        "--touches",
+                        "$task",
+                        "artifact:app,function:target",
+                        "--json",
+                    )
 
-            exported = AgentWorkspace(storage).export(include_metadata=True)
-            relation_pairs = {
-                (item["from_id"], item["to_id"], item["relation"])
-                for item in exported["relations"]
-                if item["source"] == "agent"
-            }
-            self.assertEqual(payload["operations"], 4)
-            self.assertIn((task_id, decision_id, "implements"), relation_pairs)
-            self.assertIn((task_id, "artifact:app", "touches"), relation_pairs)
-            self.assertIn((task_id, "function:target", "touches"), relation_pairs)
+                payload = self._run_cli(storage, *args)
+                task_id = payload["aliases"]["task"]
+                decision_id = payload["aliases"]["decision"]
+                exported = AgentWorkspace(storage).export(include_metadata=True)
+                relation_pairs = {
+                    (item["from_id"], item["to_id"], item["relation"])
+                    for item in exported["relations"]
+                    if item["source"] == "agent"
+                }
 
-    def test_cli_agent_batch_accepts_inline_operations_without_json_file(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            storage = self._standard_graph(Path(td))
-            env = dict(os.environ)
-            env["PYTHONPATH"] = "src"
-            subprocess.run(
-                [sys.executable, "-m", "memory.cli", "--storage", str(storage), "agent", "init", "--json"],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "memory.cli",
-                    "--storage",
-                    str(storage),
-                    "agent",
-                    "batch",
-                    "--task",
-                    "task=Patch inline batch command",
-                    "--decision",
-                    "decision=Use inline batch for small planning",
-                    "--link",
-                    "$task",
-                    "implements",
-                    "$decision",
-                    "--touches",
-                    "$task",
-                    "artifact:app,function:target",
-                    "--json",
-                ],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-            payload = json.loads(result.stdout)
-            task_id = payload["aliases"]["task"]
-            decision_id = payload["aliases"]["decision"]
-
-            exported = AgentWorkspace(storage).export(include_metadata=True)
-            relation_pairs = {
-                (item["from_id"], item["to_id"], item["relation"])
-                for item in exported["relations"]
-                if item["source"] == "agent"
-            }
-            self.assertEqual(payload["operations"], 4)
-            self.assertIn((task_id, decision_id, "implements"), relation_pairs)
-            self.assertIn((task_id, "artifact:app", "touches"), relation_pairs)
-            self.assertIn((task_id, "function:target", "touches"), relation_pairs)
+                self.assertEqual(payload["operations"], 4)
+                self.assertIn((task_id, decision_id, "implements"), relation_pairs)
+                self.assertIn((task_id, "artifact:app", "touches"), relation_pairs)
+                self.assertIn((task_id, "function:target", "touches"), relation_pairs)
 
 
 if __name__ == "__main__":

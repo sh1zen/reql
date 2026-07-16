@@ -22,9 +22,8 @@ Each `MemoryNode` has:
 - evidence and usage counters
 - timestamps
 
-Free-search retrieval ranks active records with lexical coverage and graph
-context. It does not use conversation-memory metrics such as volatility,
-utility, or contradiction signals.
+Free-search retrieval ranks active records with lexical coverage, graph
+context, salience, and usage signals.
 
 ## Edge Records
 
@@ -63,13 +62,13 @@ canonical edge record remains `from_id -> to_id`.
 - `ArtifactCacheEntry`: successful artifact compilation fingerprint.
 - `CompilationRun`: one incremental compilation invocation.
 - `GraphDelta`: change trace for a compile/update run.
+- `ProjectRevision`: immutable content-addressed project tree metadata with its
+  parent id, manifest hashes, and changed paths.
 - `Community`: topological cluster written by deterministic community
   detection.
 
-`Bridge`, `RetrievalTrace`, and related historical memory types remain reserved
-constants, but the current compile/reporting pipeline does not persist them.
-Retrieval usage is stored in a sidecar usage journal, not as `RetrievalTrace`
-nodes or `USED_IN_CONTEXT` edges in the active graph.
+Retrieval usage is stored in the sidecar `<store>.usage.jsonl` journal rather
+than as graph nodes.
 
 ## Main Edge Types
 
@@ -110,12 +109,8 @@ analysis mainly create:
 - `HAS_FINDING`
 - `TESTS`
 - `CONFIGURES`
-
-The domain constants also reserve generic memory edge types such as `ABOUT`,
-`SUPPORTS`, `EXPRESSES`, `EXPLAINS`, `SUPERSEDES`, `COMPILED_IN`, `PART_OF`,
-`SYNTHESIZES`, `UPDATED_BY`, `TRACKS`, `PARTICIPATES_IN`, `SUPPORTED_BY`, and
-`AFFECTED_BY_DELTA`. They are not part of the current project compile/report
-output unless a caller or future service explicitly writes them.
+- `PARENT_REVISION`
+- `CHANGES`
 
 Every edge includes weight, confidence, polarity, origin, timestamps, and
 additional properties.
@@ -133,6 +128,9 @@ File -DEPENDS_ON-> Dependency
 Module -IMPORTS_FROM-> Dependency
 Module -RE_EXPORTS-> Import
 Class -INHERITS-> Class
+ProjectRevision -PARENT_REVISION-> ProjectRevision
+ProjectRevision -DERIVED_FROM-> CompilationRun
+ProjectRevision -CHANGES-> SourceArtifact
 Class -IMPLEMENTS-> Interface
 Function/Method -READS/WRITES/RETURNS/RAISES-> code node
 Function/Method -INSTANTIATES-> Class/Interface

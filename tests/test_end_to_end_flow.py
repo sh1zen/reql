@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from api import MemoryGraph
+from tests.config_helpers import open_graph_with_documents as _open_graph_with_documents
 from memory.domain.models import MemoryEdge, MemoryNode
 
 
@@ -51,7 +52,7 @@ class EndToEndFlowTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            graph = MemoryGraph.open(Path(td) / "memory.reql")
+            graph = _open_graph_with_documents(Path(td) / "memory.reql")
             try:
                 result = graph.compile_project(root)
                 self.assertEqual(result.run.status, "completed")
@@ -113,7 +114,7 @@ class EndToEndFlowTests(unittest.TestCase):
             reports = Path(td) / "reports"
             root.mkdir()
             self._write_project(root)
-            graph = MemoryGraph.open(Path(td) / "memory.reql")
+            graph = _open_graph_with_documents(Path(td) / "memory.reql")
             try:
                 first = graph.compile_project(root, max_file_size_bytes=1024 * 1024)
                 self.assertEqual(first.run.status, "completed")
@@ -291,4 +292,5 @@ class EndToEndFlowTests(unittest.TestCase):
             for right in nodes[i + 1 :]:
                 graph.add_edge(MemoryEdge(from_id=left.id, to_id=right.id, type="RELATED_TO", weight=0.9, confidence=1.0))
         return nodes
+
 

@@ -7,9 +7,11 @@ import re
 from pathlib import Path
 from typing import Any, Mapping
 
-from .models import DEFAULT_CONFIG_DATA, REQLConfig, config_from_mapping, merge_config
+from .models import REQLConfig, config_from_mapping, merge_config
 
 CONFIG_FILENAME = "conf.yaml"
+PROJECT_CONFIG_FILENAME = "reql.conf"
+LOCAL_CONFIG_FILENAME = PROJECT_CONFIG_FILENAME
 CONFIG_PATH_ENV = "REQL_CONFIG"
 CONFIG_OVERRIDES_ENV = "REQL_CONFIG_OVERRIDES"
 
@@ -19,14 +21,14 @@ class ConfigError(ValueError):
 
 
 def find_config_path(start_dir: str | Path | None = None) -> Path | None:
-    """Search upward from ``start_dir`` for a REQL config file."""
+    """Search upward from ``start_dir`` for the nearest project ``reql.conf``."""
 
     current = Path(start_dir or Path.cwd()).expanduser().resolve(strict=False)
     if current.is_file():
         current = current.parent
     for directory in (current, *current.parents):
-        candidate = directory / CONFIG_FILENAME
-        if candidate.exists():
+        candidate = directory / PROJECT_CONFIG_FILENAME
+        if candidate.is_file():
             return candidate
     return None
 
@@ -34,29 +36,31 @@ def find_config_path(start_dir: str | Path | None = None) -> Path | None:
 def canonical_config_path() -> Path:
     """Return the repository canonical ``conf.yaml`` path."""
 
-    for directory in Path(__file__).resolve().parents:
-        candidate = directory / CONFIG_FILENAME
-        if candidate.exists():
-            return candidate
+    candidate = Path(__file__).resolve().with_name(CONFIG_FILENAME)
+    if candidate.is_file():
+        return candidate
     raise ConfigError(f"Canonical {CONFIG_FILENAME} was not found")
 
 
 def load_config(path: str | Path | None = None, *, start_dir: str | Path | None = None) -> REQLConfig:
-    """Load a config file, falling back to the canonical project config."""
+    """Load protected internal defaults joined with one project config."""
 
+    config = _load_config_file(canonical_config_path())
     if path:
         config_path = Path(path).expanduser().resolve(strict=False)
         if not config_path.exists():
             raise ConfigError(f"Configuration file not found: {config_path}")
     else:
-        config_path = find_config_path(start_dir) or canonical_config_path()
-    return _load_config_file(config_path)
+        config_path = find_config_path(start_dir)
+    if config_path is not None:
+        config = _merge_config_file(config, config_path)
+    return config
 
 
 def default_config() -> REQLConfig:
-    """Return deterministic in-memory defaults without project-local opt-ins."""
+    """Return deterministic defaults from the protected internal config."""
 
-    return config_from_mapping(DEFAULT_CONFIG_DATA)
+    return _load_config_file(canonical_config_path())
 
 
 def _load_config_file(config_path: Path) -> REQLConfig:
@@ -65,6 +69,34 @@ def _load_config_file(config_path: Path) -> REQLConfig:
             raise ConfigError(f"Unsupported configuration file type: {config_path}")
         data = _load_yaml(config_path)
         return config_from_mapping(data)
+    except ConfigError:
+        raise
+    except Exception as exc:
+        raise ConfigError(f"Invalid configuration in {config_path}: {exc}") from exc
+
+
+def _merge_config_file(config: REQLConfig, override_path: Path) -> REQLConfig:
+    """Merge a partial YAML config file over an already validated config."""
+
+    try:
+        overrides = _load_yaml(override_path)
+        return merge_config(config, overrides)
+    except ConfigError:
+        raise
+    except Exception as exc:
+        raise ConfigError(f"Invalid configuration in {override_path}: {exc}") from exc
+
+
+def load_project_config_data(path: str | Path) -> dict[str, Any]:
+    """Load and validate the raw settings owned by one project config file."""
+
+    config_path = Path(path).expanduser().resolve(strict=False)
+    if not config_path.is_file():
+        raise ConfigError(f"Configuration file not found: {config_path}")
+    try:
+        data = _load_yaml(config_path)
+        merge_config(default_config(), data)
+        return data
     except ConfigError:
         raise
     except Exception as exc:
@@ -86,7 +118,8 @@ def load_effective_config(
 
     env_values = os.environ if env is None else env
     env_path = env_values.get(CONFIG_PATH_ENV)
-    config = load_config(path or env_path or None, start_dir=start_dir)
+    selected_path = path or env_path or None
+    config = load_config(selected_path, start_dir=start_dir)
 
     env_overrides = env_values.get(CONFIG_OVERRIDES_ENV)
     try:
@@ -99,8 +132,8 @@ def load_effective_config(
     return config
 
 
-def write_sample_config(path: str | Path = CONFIG_FILENAME, *, overwrite: bool = False) -> Path:
-    """Copy the canonical ``conf.yaml`` if the target does not already exist."""
+def write_sample_config(path: str | Path = PROJECT_CONFIG_FILENAME, *, overwrite: bool = False) -> Path:
+    """Create a project ``reql.conf`` initialized from the internal defaults."""
 
     target = Path(path).expanduser().resolve(strict=False)
     if target.exists() and not overwrite:
@@ -161,19 +194,16 @@ def parse_config_overrides(raw: str) -> dict[str, Any]:
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
-    """Parse the small YAML subset used by ``conf.yaml`` without PyYAML."""
+    """Parse the small YAML subset used by REQL config files without PyYAML."""
 
     return _parse_basic_yaml(path.read_text(encoding="utf-8"), path)
 
 
-YAML_SECTION_RE = re.compile(r"^([A-Za-z0-9_.-]+):\s*$")
 YAML_ASSIGN_RE = re.compile(r"^([A-Za-z0-9_.-]+):(?:\s+(.*))?$")
 
 
 def _parse_basic_yaml(text: str, path: Path) -> dict[str, Any]:
-    data: dict[str, dict[str, Any]] = {}
-    section: str | None = None
-    list_key: str | None = None
+    lines: list[tuple[int, str, int, str]] = []
     for line_number, raw_line in enumerate(text.splitlines(), start=1):
         if "\t" in raw_line[: len(raw_line) - len(raw_line.lstrip())]:
             raise ConfigError(f"Invalid YAML syntax in {path} at line {line_number}: tabs are not supported")
@@ -181,36 +211,59 @@ def _parse_basic_yaml(text: str, path: Path) -> dict[str, Any]:
         if not line.strip():
             continue
         indent = len(line) - len(line.lstrip(" "))
-        stripped = line.strip()
-        if indent == 0:
-            section_match = YAML_SECTION_RE.match(stripped)
-            if not section_match:
-                raise ConfigError(f"Invalid YAML syntax in {path} at line {line_number}: {raw_line.strip()}")
-            section = section_match.group(1)
-            data.setdefault(section, {})
-            list_key = None
-            continue
-        if section is None:
-            raise ConfigError(f"Invalid YAML syntax in {path} at line {line_number}: option outside a section")
-        if stripped.startswith("- "):
-            if list_key is None:
+        if indent % 2:
+            raise ConfigError(f"Invalid YAML syntax in {path} at line {line_number}: indentation must use two spaces")
+        lines.append((indent, line.strip(), line_number, raw_line))
+
+    if not lines:
+        return {}
+
+    def parse_block(index: int, expected_indent: int) -> tuple[Any, int]:
+        is_list = lines[index][1].startswith("- ")
+        container: Any = [] if is_list else {}
+        while index < len(lines):
+            indent, stripped, line_number, raw_line = lines[index]
+            if indent < expected_indent:
+                break
+            if indent > expected_indent:
+                raise ConfigError(
+                    f"Invalid YAML syntax in {path} at line {line_number}: unexpected indentation"
+                )
+            if is_list:
+                if not stripped.startswith("- "):
+                    raise ConfigError(f"Invalid YAML syntax in {path} at line {line_number}: mixed list and mapping")
+                item = stripped[2:].strip()
+                if not item:
+                    raise ConfigError(f"Invalid YAML syntax in {path} at line {line_number}: empty list item")
+                container.append(_parse_yaml_value(item, path, line_number))
+                index += 1
+                continue
+            if stripped.startswith("- "):
                 raise ConfigError(f"Invalid YAML syntax in {path} at line {line_number}: list item without a list option")
-            if indent not in {2, 4}:
-                raise ConfigError(f"Invalid YAML syntax in {path} at line {line_number}: expected list indentation")
-            data[section][list_key].append(_parse_yaml_value(stripped[2:].strip(), path, line_number))
-            continue
-        if indent != 2:
-            raise ConfigError(f"Invalid YAML syntax in {path} at line {line_number}: expected two-space indentation")
-        assign_match = YAML_ASSIGN_RE.match(stripped)
-        if not assign_match:
-            raise ConfigError(f"Invalid YAML syntax in {path} at line {line_number}: {raw_line.strip()}")
-        key, value = assign_match.groups()
-        if value is None:
-            data[section][key] = []
-            list_key = key
-            continue
-        data[section][key] = _parse_yaml_value(value.strip(), path, line_number)
-        list_key = None
+            assign_match = YAML_ASSIGN_RE.match(stripped)
+            if not assign_match:
+                raise ConfigError(f"Invalid YAML syntax in {path} at line {line_number}: {raw_line.strip()}")
+            key, value = assign_match.groups()
+            index += 1
+            if value is not None:
+                container[key] = _parse_yaml_value(value.strip(), path, line_number)
+                continue
+            if index < len(lines) and lines[index][0] > expected_indent:
+                child_indent = lines[index][0]
+                if child_indent != expected_indent + 2:
+                    child_line = lines[index][2]
+                    raise ConfigError(
+                        f"Invalid YAML syntax in {path} at line {child_line}: expected two-space indentation"
+                    )
+                container[key], index = parse_block(index, child_indent)
+            else:
+                container[key] = {}
+        return container, index
+
+    data, final_index = parse_block(0, 0)
+    if final_index != len(lines) or not isinstance(data, dict):
+        line_number = lines[final_index][2] if final_index < len(lines) else lines[0][2]
+        raise ConfigError(f"Invalid YAML syntax in {path} at line {line_number}: top level must be a mapping")
     return data
 
 

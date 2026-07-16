@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import os
 import posixpath
 import time
 from typing import Any, Iterable
@@ -77,6 +78,7 @@ class AgentWorkspace:
         agent_id: str | None = None,
         agent_storage: str | Path | None = None,
         bus_storage: str | Path | None = None,
+        activity_id: str | None = None,
         config: REQLConfig | None = None,
     ) -> None:
         standard_path = Path(standard_storage).expanduser().resolve(strict=False)
@@ -94,6 +96,9 @@ class AgentWorkspace:
             if agent_storage is not None
             else self.agent_storage_for(standard_path, self.agent_id),
             bus_storage=resolved_bus_storage,
+        )
+        self.activity_id = self._normalize_activity_id(
+            activity_id or os.environ.get("REQL_AGENT_ACTIVITY_ID") or os.environ.get("CODEX_THREAD_ID")
         )
         self.config = config
 
@@ -151,6 +156,19 @@ class AgentWorkspace:
                 else synced_at
             )
             workspace_props = dict(workspace.properties) if workspace is not None else {}
+            if self.activity_id:
+                current_by_activity = dict(workspace_props.get("current_session_ids") or {})
+                legacy_session_id = str(workspace_props.get("current_session_id") or "").strip()
+                if self.activity_id not in current_by_activity and legacy_session_id:
+                    legacy_session = agent.get_node(legacy_session_id)
+                    legacy_activity = (
+                        str(legacy_session.properties.get("activity_id") or "").strip()
+                        if legacy_session is not None
+                        else ""
+                    )
+                    if not legacy_activity or legacy_activity == self.activity_id:
+                        current_by_activity[self.activity_id] = legacy_session_id
+                workspace_props["current_session_ids"] = current_by_activity
             workspace_props.update(
                 {
                     "format": "reql-agent-workspace-v1",
@@ -226,6 +244,7 @@ class AgentWorkspace:
             return {
                 "synced": True,
                 "agent_id": self.agent_id,
+                "activity_id": self.activity_id,
                 "standard_storage": str(self.paths.standard_storage),
                 "agent_storage": str(self.paths.agent_storage),
                 "bus_storage": str(self.paths.bus_storage),
@@ -251,6 +270,7 @@ class AgentWorkspace:
             return {
                 "exists": False,
                 "agent_id": self.agent_id,
+                "activity_id": self.activity_id,
                 "standard_storage": str(self.paths.standard_storage),
                 "agent_storage": str(self.paths.agent_storage),
                 "bus_storage": str(self.paths.bus_storage),
@@ -271,15 +291,16 @@ class AgentWorkspace:
                 for node in nodes
                 if node.id != WORKSPACE_NODE_ID and node.properties.get("source") != "standard"
             ]
+            session_status = self._current_session_status_payload(nodes, workspace)
             return {
                 "exists": True,
                 "agent_id": self.agent_id,
+                "activity_id": self.activity_id,
                 "standard_storage": str(self.paths.standard_storage),
                 "agent_storage": str(self.paths.agent_storage),
                 "bus_storage": str(self.paths.bus_storage),
                 "initialized_at": workspace.properties.get("initialized_at") if workspace else None,
-                "current_session_id": workspace.properties.get("current_session_id") if workspace else None,
-                "current_session_title": workspace.properties.get("current_session_title") if workspace else None,
+                **session_status,
                 "nodes": len(nodes),
                 "relations": len(edges),
                 "derived_nodes": len(derived_nodes),
@@ -288,6 +309,51 @@ class AgentWorkspace:
             }
         finally:
             graph.close()
+
+    def _current_session_status_payload(self, nodes: list[MemoryNode], workspace: MemoryNode | None) -> dict[str, Any]:
+        if workspace is None:
+            return {
+                "current_session_id": None,
+                "current_session_title": None,
+                "current_session_started_at": None,
+                "current_session_open_tasks": 0,
+                "current_session_is_idle": True,
+            }
+        session_id = self._current_session_id(workspace)
+        if not session_id:
+            return {
+                "current_session_id": None,
+                "current_session_title": None,
+                "current_session_started_at": None,
+                "current_session_open_tasks": 0,
+                "current_session_is_idle": True,
+            }
+        session = next((node for node in nodes if node.id == session_id and node.type == "session"), None)
+        session_title = (
+            session.properties.get("title")
+            if session is not None
+            else workspace.properties.get("current_session_title")
+        )
+        started_at = (
+            session.properties.get("started_at")
+            if session is not None
+            else workspace.properties.get("current_session_started_at")
+        )
+        open_tasks = [
+            node
+            for node in nodes
+            if node.type == "task"
+            and node.status != "done"
+            and node.properties.get("session_id") == session_id
+            and node.properties.get("source") != "standard"
+        ]
+        return {
+            "current_session_id": session_id,
+            "current_session_title": session_title,
+            "current_session_started_at": started_at,
+            "current_session_open_tasks": len(open_tasks),
+            "current_session_is_idle": len(open_tasks) == 0,
+        }
 
     def add_note(self, text: str) -> dict[str, Any]:
         return self.add_node("note", text)
@@ -304,7 +370,7 @@ class AgentWorkspace:
                 if workspace is None:
                     raise ValueError("Agent workspace is not initialized. Run `reql agent init` first.")
                 workspace_props = dict(workspace.properties)
-                previous_id = str(workspace_props.get("current_session_id") or "")
+                previous_id = self._current_session_id(workspace)
                 if previous_id:
                     previous = graph.get_node(previous_id)
                     if previous is not None and previous.type == "session" and previous.status == "active":
@@ -312,13 +378,13 @@ class AgentWorkspace:
                         previous_props["ended_at"] = now
                         previous_props["is_current"] = False
                         graph.store.update_node_fields(previous.id, status="closed", properties=previous_props)
-                session_id = stable_id("agent:session", now, title)
+                session_id = stable_id("agent:session", self.activity_id or "", now, title)
                 session = MemoryNode(
                     id=session_id,
                     type="session",
                     label=title,
                     text=title,
-                    canonical_key=stable_id("agent-session-key", now, title),
+                    canonical_key=stable_id("agent-session-key", self.activity_id or "", now, title),
                     properties={
                         "content": title,
                         "title": title,
@@ -326,6 +392,7 @@ class AgentWorkspace:
                         "source": "agent",
                         "session_id": session_id,
                         "session_title": title,
+                        "activity_id": self.activity_id,
                         "started_at": now,
                         "is_current": True,
                     },
@@ -343,6 +410,10 @@ class AgentWorkspace:
                         "current_session_started_at": now,
                     }
                 )
+                if self.activity_id:
+                    current_by_activity = dict(workspace_props.get("current_session_ids") or {})
+                    current_by_activity[self.activity_id] = stored.id
+                    workspace_props["current_session_ids"] = current_by_activity
                 graph.store.update_node_fields(workspace.id, properties=workspace_props)
             return {"created": created, "session": self._node_payload(stored)}
         finally:
@@ -418,7 +489,7 @@ class AgentWorkspace:
     def link_task(
         self,
         *,
-        task_id: str | None = None,
+        task_id: str,
         file_path: str | None = None,
         relation: str = "touches",
     ) -> dict[str, Any]:
@@ -847,33 +918,17 @@ class AgentWorkspace:
             raise ValueError(f"Agent node not found: {node_id}")
         return {"task": self._node_payload(updated)}
 
-    def _resolve_open_task_for_link(self, graph: MemoryGraph, task_id: str | None) -> MemoryNode:
-        if task_id:
-            node = graph.get_node(task_id)
-            if node is None or node.id == WORKSPACE_NODE_ID or node.properties.get("source") == "standard":
-                raise ValueError(f"Agent task not found: {task_id}")
-            if node.type != "task":
-                raise ValueError(f"Agent node is not a task: {task_id}")
-            if node.status == "done":
-                raise ValueError(f"Agent task is already done: {task_id}")
-            return node
-        nodes = [
-            node
-            for node in graph.store.all_nodes()
-            if node.id != WORKSPACE_NODE_ID
-            and node.type == "task"
-            and node.status != "done"
-            and node.properties.get("source") != "standard"
-        ]
-        workspace = graph.get_node(WORKSPACE_NODE_ID)
-        session_id = str(workspace.properties.get("current_session_id") or "").strip() if workspace is not None else ""
-        if session_id:
-            session_nodes = [node for node in nodes if node.properties.get("session_id") == session_id]
-            if session_nodes:
-                nodes = session_nodes
-        if not nodes:
-            raise ValueError("No open agent task found. Pass --task TASK_ID or create one with `reql agent task add ...`.")
-        return sorted(nodes, key=lambda item: (item.updated_at, item.id), reverse=True)[0]
+    def _resolve_open_task_for_link(self, graph: MemoryGraph, task_id: str) -> MemoryNode:
+        if not task_id:
+            raise ValueError("An explicit task id is required")
+        node = graph.get_node(task_id)
+        if node is None or node.id == WORKSPACE_NODE_ID or node.properties.get("source") == "standard":
+            raise ValueError(f"Agent task not found: {task_id}")
+        if node.type != "task":
+            raise ValueError(f"Agent node is not a task: {task_id}")
+        if node.status == "done":
+            raise ValueError(f"Agent task is already done: {task_id}")
+        return node
 
     def _resolve_file_node_by_path(self, graph: MemoryGraph, file_path: str) -> MemoryNode:
         lookup_keys = self._path_lookup_keys(file_path)
@@ -1138,6 +1193,11 @@ class AgentWorkspace:
         if not value:
             raise ValueError("Agent id must not be empty")
         return value
+
+    @staticmethod
+    def _normalize_activity_id(activity_id: str | None) -> str | None:
+        value = str(activity_id or "").strip()
+        return value[:200] or None
 
     @classmethod
     def _safe_agent_file_stem(cls, agent_id: str) -> str:
@@ -1529,7 +1589,7 @@ class AgentWorkspace:
         workspace = graph.get_node(WORKSPACE_NODE_ID)
         if workspace is None:
             return {}
-        session_id = str(workspace.properties.get("current_session_id") or "").strip()
+        session_id = self._current_session_id(workspace)
         if not session_id:
             return {}
         session = graph.get_node(session_id)
@@ -1538,7 +1598,17 @@ class AgentWorkspace:
         return {
             "session_id": session.id,
             "session_title": session.properties.get("title") or session.label,
+            **({"activity_id": self.activity_id} if self.activity_id else {}),
         }
+
+    def _current_session_id(self, workspace: MemoryNode | None) -> str:
+        if workspace is None:
+            return ""
+        if self.activity_id:
+            current_by_activity = workspace.properties.get("current_session_ids")
+            if isinstance(current_by_activity, dict):
+                return str(current_by_activity.get(self.activity_id) or "").strip()
+        return str(workspace.properties.get("current_session_id") or "").strip()
 
     def _resolve_session_selector(self, graph: MemoryGraph, selector: str) -> str:
         value = selector.strip()
@@ -1546,7 +1616,7 @@ class AgentWorkspace:
             raise ValueError("Agent session selector must not be empty")
         if value.casefold() == "current":
             workspace = graph.get_node(WORKSPACE_NODE_ID)
-            session_id = str(workspace.properties.get("current_session_id") or "").strip() if workspace else ""
+            session_id = self._current_session_id(workspace)
             if not session_id:
                 raise ValueError("No current agent session. Run `reql agent session start \"...\"` first.")
             return session_id
