@@ -38,41 +38,30 @@ PROJECT_SKILL_SOURCE = SkillSource(
         "verification, and final graph refresh without requiring LLM calls."
     ),
     summary=(
-        "REQL is the local deterministic repository index. Agent Workspace is optional durable planning for complex work. "
-        "Follow the core workflow below and load only the one reference that covers a special case."
+        "Use the local deterministic graph for bounded repository context; load detailed guidance only when its trigger occurs."
     ),
     command_examples=(
         CommandExample("project status .", "check whether this project has a compiled REQL graph"),
         CommandExample("project compile .", "bootstrap or refresh the graph, including once after edits"),
         CommandExample('query_context --query "<terms from user request>"', "compact informative context"),
-        CommandExample('query_context --query "<terms from user request>" --code', "compact code-scoped context with files, symbols, and targeted reads"),
+        CommandExample('query_context --query "<terms from user request>" --code', "compact code-scoped context with files, owner symbols, line ranges, and associated tests"),
         CommandExample("agent status", "check whether optional durable planning is already initialized"),
     ),
     workflow_steps=(
         (
-            "Start with `{command_name} project status .`. If it reports `Project not found`, immediately run "
-            "`{command_name} project compile .`; if compile fails, report it and use targeted raw reads."
+            "Run `{command_name} project status .`; if the graph is missing or stale, stop and use the matching route below."
         ),
         (
-            "For an active graph, query with terms from the user's request before browsing source. Use `query_context` and the "
-            "smallest relevant scope (`--code`, `--docs`, or `--test`)."
+            "On an active graph, run `{command_name} query_context --query \"<user terms>\"` with `--code`, `--docs`, or `--test` only when needed."
         ),
         (
-            "Use returned owners, file spans, impact, and test targets to read only the code needed for the change. For a clear "
-            "one-file or exact-symbol edit, stop after one sufficient query and targeted read; do not initialize Agent Workspace."
+            "Read only returned files, owners, line ranges, and tests; on `Confidence: insufficient`, use one targeted `rg` with exact user terms."
         ),
         (
-            "Implement in the existing owner, preserve public contracts unless change is required, and run the repository's documented "
-            "tests. Treat REQL as evidence and source inspection plus tests as verification."
+            "Edit the existing owner, preserve public contracts, and run the repository's documented tests."
         ),
         (
-            "After edits, use an existing watcher or run one `{command_name} project compile .`; do not start a watcher unless continuous "
-            "monitoring was requested. Report versioned files, updated symbols, associated tests, test results, and any separate "
-            "`Local configuration required` action."
-        ),
-        (
-            "Use Agent Workspace only when the task is multi-step, cross-file, ambiguous, recoverable, or delegated; otherwise keep "
-            "the standard graph as the only REQL state."
+            "After changing files, run `{command_name} project watch-status . --json`; if it reports `running`, wait for the watcher to refresh the graph, otherwise run `{command_name} project compile .` before the final response."
         ),
     ),
     rule_points=(
@@ -160,9 +149,6 @@ def skill_markdown(
     command_path: Path,
     fallback_command: str,
 ) -> str:
-    scope = _scope(project)
-    usage = _command_usage(command_name=command_name, command_path=command_path, fallback_command=fallback_command)
-    examples = _format_examples(source, command_name)
     workflow = _numbered(source.workflow_steps, command_name=command_name)
     reference_routing = _reference_routing(source.name)
     return f"""---
@@ -170,44 +156,33 @@ name: {source.name}
 description: {source.description.format(platform_name=platform_name)}
 ---
 
-# {source.title}
+# REQL Fast Path
 
 {source.summary}
 
-## Core Commands
-
-{usage}
-
-```bash
-{examples}
-```
-
-## Core Coding Workflow
-
 {workflow}
-## Special-Case References
+
+## Load only when triggered
 
 {reference_routing}
 
-## Ground Rules
+## Rules
 
-- Follow repository instructions and run its documented tests.
-- Treat graph locations as evidence; inspect exact source before editing and do not invent missing relationships.
-- Keep the deterministic core path usable without LLM calls.
-
-Installed for: {platform_name} ({scope}).
+- Load exactly one relevant reference; do not preload or restate the others.
+- Treat graph locations as evidence and follow repository instructions.
+- Keep REQL deterministic and usable without mandatory LLM calls.
 """
 
 
 def _reference_routing(source_name: str) -> str:
     return "\n".join(
         [
-            "- Read `references/bootstrap.md` when checking project state, compiling for the first time, handling exclusions, or deciding whether to fall back to raw files.",
-            "- Read `references/query.md` when answering a repository question from an existing REQL graph or choosing between `query_context`, `query_memories`, `query_graph`, and REQL statements.",
-            "- Read `references/update-watch.md` after modifying files, when a watcher is running, or when cache/delta state matters.",
-            "- Read `references/reports-exports.md` when generating reports, exporting graph artifacts, inspecting hubs/communities, or wiring MCP.",
-            "- Read `references/document-semantics.md` only when the task involves document ingestion or local document processing.",
-            "- Read `references/agent-workspace.md` when using `reql agent` commands, recovering working context, linking agent tasks to standard graph nodes, or exporting/resetting the Agent Workspace.",
+            "- Missing/stale graph, compile, exclusions, command fallback -> `references/bootstrap.md`.",
+            "- Query choice, raw REQL, or insufficient context -> `references/query.md`.",
+            "- Watch/compile troubleshooting, custom storage, cache, deltas, or special local configuration -> `references/update-watch.md`.",
+            "- Reports, exports, hubs, communities, or MCP -> `references/reports-exports.md`.",
+            "- Document ingestion or local processing -> `references/document-semantics.md`.",
+            "- Durable planning, compaction/handoff recovery, or `reql agent` -> `references/agent-workspace.md`.",
         ]
     )
 
@@ -339,7 +314,7 @@ REQL is not an LLM. It uses tokenization, lexical matching, graph links, and act
 
 ## Query Types
 
-- Informative: use no mode flag for project knowledge, structure, documents, architecture, existence checks, and "is there anything like X" questions. Prefer `{command_name} query_context --query "<terms from user request>"`, `{command_name} query_memories --query "<terms from user request>"`, or `{command_name} query_graph --query "<terms from user request>" --max-depth 2`. Use the rendered files, line references, source evidence, graph links, and embedded raw-query research references.
+- Informative: use no mode flag for project knowledge, structure, documents, architecture, existence checks, and "is there anything like X" questions. Prefer `{command_name} query_context --query "<terms from user request>"`, `{command_name} query_memories --query "<terms from user request>"`, or `{command_name} query_graph --query "<terms from user request>" --max-depth 2`. Code-scoped `query_context` renders at most eight paths with owner symbols, bounded line ranges, and associated tests; use `--json` when graph links or planning fields are needed.
 - Scope filters: use `--code`, `--docs`, and `--test` with informative or cleanup queries when the user asks for a precise section. They restrict results to code symbols/source, documentation/imported documents, or tests.
 - Cleanup: use `--cleanup` for safe-remove dead code, unused imports, unused variables, and removal candidates. Start with `{command_name} query_context --query "<terms from user request>" --cleanup` or the `FINDINGS` query below, then remove only confirmed candidates. Add `--include-risky` only when you intentionally want public API, low-confidence, test-local, or validation-required candidates.
 
@@ -368,7 +343,7 @@ Prefer graph queries over broad repository scans, but still run targeted tests a
 
 Do not use workspace-wide `rg`, recursive directory listings, `find`, `grep -R`, custom scanners, or ad hoc crawlers as the first way to understand the repository. Start with `query_context`, `query_explore`, `query_memories`, `query_graph`, `inspect`, or bounded raw REQL statements.
 
-After REQL returns candidate paths, symbols, owners, source fragments, or line ranges, raw tools may be used for targeted verification: file-scoped `rg`, nearby line reads, exact user-named files, focused caller/import checks, and tests/debugging. If a raw search starts expanding across unrelated directories, stop and refine the REQL query instead.
+After REQL returns candidate paths, symbols, owners, source fragments, or line ranges, raw tools may be used for targeted verification: file-scoped `rg`, nearby line reads, exact user-named files, focused caller/import checks, and tests/debugging. If `query_context` reports `Confidence: insufficient`, one targeted `rg` using the user's exact symbol, path, or error terms is allowed immediately. If a raw search starts expanding across unrelated directories, stop and refine the REQL query instead.
 
 ## Code-Scoped Workflow
 
@@ -422,21 +397,27 @@ Use `--json` only when another tool or script needs structured fields, when you 
 {command_name} inspect --node-id NODE_ID --json
 ```
 """
-    update_watch = f"""# REQL reference: updates, watch mode, cache, and deltas
+    update_watch = f"""# REQL reference: update and watcher troubleshooting
 
-Load this after modifying project files, when a watcher is running, or when the user asks about incremental behavior.
+Load this only when post-edit refresh does not behave as expected, watcher status is `stale` or `unknown`, monitor mode or storage is non-default, cache/delta inspection is needed, or a local configuration requirement must be reported.
 
-## After edits
+## Diagnose post-edit refresh
 
-If no `{command_name} project compile . --watch` process is already maintaining the workspace graph, run:
+Check watcher state through REQL rather than querying the operating-system process table:
+
+```bash
+{command_name} project watch-status . --json
+```
+
+If the result is `stopped`, refresh the graph with:
 
 ```bash
 {command_name} project compile .
 ```
 
-This refreshes only changed/deleted artifacts through the incremental cache and keeps the graph aligned with completed edits. If a watcher is already running, do not start another compile loop; query the maintained graph instead.
+This refreshes only changed/deleted artifacts through the incremental cache. If the watcher is `running`, allow it to process the filesystem event instead of starting another compile. For `stale` or `unknown`, inspect the reported lock metadata and use `storage locks`; do not inspect `ps`, `Get-CimInstance`, or equivalent process listings.
 
-Before the final response for any task that changed files, confirm the graph update path: either the watcher already captured the edits, or run the one-shot compile above and report the result briefly.
+When monitor mode uses an explicit global `--storage`, pass the same option to `watch-status`.
 
 ## Final change classification
 
@@ -461,6 +442,8 @@ The watcher performs an initial cache check, then compiles only dirty or deleted
 {command_name} project compile . --watch --watch-iterations 1
 {command_name} project compile . --watch --watch-interval 2 --watch-debounce 0.5
 ```
+
+At any time, `{command_name} project watch-status .` reports `running`, `stopped`, `stale`, or `unknown`, including PID and liveness when available. It reads the lock sidecar directly, so it works while the watcher owns the graph write lock.
 
 Ask before starting watch mode, manual `project update`, or `cache clear` unless the user explicitly requested that operation.
 
@@ -612,7 +595,6 @@ Initialize from the current standard graph:
 
 ```bash
 {command_name} agent --agent AGENT_ID status
-REQL_AGENT_ID=AGENT_ID {command_name} agent map --session current
 ```
 
 If the standard graph does not exist or is stale, use the `reql-agent` skill first:
@@ -645,29 +627,18 @@ Add information, choices, constraints, assumptions, risks, and blockers:
 Create the task list and link tasks to plan elements:
 
 ```bash
-{command_name} agent task add "Patch agent map to show only touched files"
+{command_name} agent task add "Patch context recovery output"
 {command_name} agent link AGENT_TASK_ID AGENT_DECISION_ID --relation implements
 {command_name} agent link AGENT_TASK_ID AGENT_FINDING_ID --relation depends_on
 {command_name} agent link-many AGENT_TASK_ID STANDARD_FILE_ID STANDARD_SYMBOL_ID --relation touches
-{command_name} agent batch --task task="Patch agent map" --decision decision="Use one workspace lock" --link '$task' implements '$decision'
+{command_name} agent batch --task task="Patch context recovery" --decision decision="Use one workspace lock" --link '$task' implements '$decision'
 ```
 
 Use task descriptions as executable work items, not summaries. Each task should point to the plan item, constraint, file, or symbol that explains it.
 When several items or links are known at once, prefer `{command_name} agent batch --json FILE` or inline `agent batch --task ... --link ...` so the Agent Workspace takes one lock.
+Do not run `agent map` before or after ordinary edits. The current model already knows the plan, task state, and files it just changed; printing the map there only repeats active context.
 
-### 3. Quick Review
-
-Before editing, check that the map has enough structure to recover the work:
-
-```bash
-{command_name} agent map
-{command_name} agent map --session current
-{command_name} agent map --task AGENT_TASK_ID
-```
-
-Review open tasks, choices, constraints, touched files, and missing links. Use `--session current` when old agent history is not relevant. Add only the missing facts.
-
-### 4. Code Linking
+### 3. Code Linking
 
 After REQL returns file or symbol ids, link planned code targets to tasks. If `{command_name} project compile .` created new file or symbol nodes, run `{command_name} agent sync` before linking those new standard nodes. Use this to assemble the implementation from the task graph before writing:
 
@@ -682,7 +653,7 @@ After REQL returns file or symbol ids, link planned code targets to tasks. If `{
 
 Code notes are for short target-specific intent, not long code dumps. The actual code belongs in project files.
 
-### 5. Write
+### 4. Write
 
 Edit the project, then update task state:
 
@@ -692,7 +663,7 @@ Edit the project, then update task state:
 
 Add new decisions or findings only when they change remaining work.
 
-### 6. Handoff To Master
+### 5. Handoff To Master
 
 When a worker has saved the facts the master needs, publish a handoff:
 
@@ -701,7 +672,7 @@ When a worker has saved the facts the master needs, publish a handoff:
 {command_name} agent bus --json
 ```
 
-The handoff snapshots the current saved map: open tasks, decisions, files, symbols, and essential relations. The master can read it from the bus and decide the next step without opening the worker's private store directly.
+The handoff snapshots the current saved working state: open tasks, decisions, files, symbols, and essential relations. The master can read it from the bus and decide the next step without opening the worker's private store directly.
 
 ## Link Agent Items
 
@@ -729,7 +700,7 @@ Supported relation types:
 
 ## Recover Context
 
-Use the map after context loss, thread compaction, or a long pause:
+Use the map only to recover after context loss, thread compaction, a handoff, or a long pause. Do not print it as a routine pre-edit or post-edit summary:
 
 ```bash
 {command_name} agent map

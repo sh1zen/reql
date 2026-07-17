@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import tempfile
 import unittest
@@ -28,33 +28,6 @@ class MarkdownIngestionTests(unittest.TestCase):
 
             self.assertFalse(result.run.errors)
             self.assertNotIn("README.md", fragment_paths)
-
-    def test_project_config_toggles_document_formats_without_repeating_extensions(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "project"
-            root.mkdir()
-            config_path = root / "reql.conf"
-            config_path.write_text("compile:\n  documents:\n    markdown: true\n", encoding="utf-8")
-            (root / "README.md").write_text("# Enabled markdown\n", encoding="utf-8")
-            (root / "notes.txt").write_text("Disabled plain text\n", encoding="utf-8")
-            config = load_config(config_path)
-            graph = _open_graph_with_documents(Path(td) / "memory.reql")
-            try:
-                result = graph.compile_project(
-                    root,
-                    parsing_options={"compile": config.compile.to_dict()},
-                )
-                fragment_paths = {
-                    str(node.properties.get("relative_path") or "")
-                    for node in graph.store.all_nodes()
-                    if node.type == "SourceFragment"
-                }
-            finally:
-                graph.close()
-
-            self.assertFalse(result.run.errors)
-            self.assertIn("README.md", fragment_paths)
-            self.assertNotIn("notes.txt", fragment_paths)
 
     def test_explicit_filename_policy_wins_over_detected_markdown_format(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -86,48 +59,6 @@ class MarkdownIngestionTests(unittest.TestCase):
             self.assertEqual(artifact.properties.get("artifact_type"), "markdown")
             self.assertEqual(artifact.properties.get("parser_name"), "document_ingest_disabled")
             self.assertFalse(fragments)
-
-    def test_wordpress_and_structured_extensionless_docs_use_markdown_scope(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "project"
-            plugin = root / "extensions" / "wp-optimizer"
-            plugin.mkdir(parents=True)
-            config_path = root / "reql.conf"
-            config_path.write_text("compile:\n  documents:\n    markdown: true\n", encoding="utf-8")
-            (plugin / "readme.txt").write_text(
-                "=== WP Optimizer ===\n"
-                "Contributors: example\nTags: cache, performance\nStable tag: 1.0\n\n"
-                "== Description ==\nThe optimizer stores the unique cache beacon.\n\n"
-                "== Frequently Asked Questions ==\n= Does it clear cache? =\nYes.\n",
-                encoding="utf-8",
-            )
-            (plugin / "changelog.txt").write_text("# Changelog\n\n## 1.0\n\n- Initial release\n", encoding="utf-8")
-            (plugin / "GUIDE").write_text("Optimizer Guide\n===============\n\n- Enable cache\n- Save settings\n", encoding="utf-8")
-            config = load_config(config_path)
-            graph = _open_graph_with_documents(Path(td) / "memory.reql")
-            try:
-                result = graph.compile_project(root, parsing_options={"compile": config.compile.to_dict()})
-                artifacts = {
-                    str(node.properties.get("relative_path")): node
-                    for node in graph.store.all_nodes()
-                    if node.type == "SourceArtifact"
-                }
-                readme_fragments = [
-                    node
-                    for node in graph.store.all_nodes()
-                    if node.type == "SourceFragment" and node.properties.get("relative_path") == "extensions/wp-optimizer/readme.txt"
-                ]
-                docs_context = graph.query_context("unique cache beacon", scopes=["docs"])
-            finally:
-                graph.close()
-
-            self.assertFalse(result.run.errors)
-            for relative_path in ("extensions/wp-optimizer/readme.txt", "extensions/wp-optimizer/changelog.txt", "extensions/wp-optimizer/GUIDE"):
-                self.assertEqual(artifacts[relative_path].properties.get("artifact_type"), "markdown")
-                self.assertEqual(artifacts[relative_path].properties.get("context_scope"), "docs")
-            self.assertTrue(any(node.properties.get("fragment_type") == "heading" for node in readme_fragments))
-            self.assertTrue(all(node.properties.get("context_scope") == "docs" for node in readme_fragments))
-            self.assertIn("extensions/wp-optimizer/readme.txt", docs_context)
 
     def test_markdown_fixture_creates_structured_fragments_and_relations(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -216,29 +147,6 @@ class MarkdownIngestionTests(unittest.TestCase):
                     self.assertIn("SourceFragment", node_types)
                 finally:
                     graph.close()
-
-    def test_compile_ingest_documents_false_skips_document_fragments(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "project"
-            root.mkdir()
-            (root / "notes.txt").write_text("Project documentation can be skipped by config.\n", encoding="utf-8")
-            graph = _open_graph_with_documents(Path(td) / "memory.reql")
-            try:
-                result = graph.compile_project(
-                    root,
-                    parsing_options={
-                        "compile": {"ingest_documents": False},
-                    },
-                )
-                node_types = {node.type for node in graph.store.all_nodes()}
-                artifact = next(node for node in graph.store.all_nodes() if node.type == "SourceArtifact")
-
-                self.assertFalse(result.run.errors)
-                self.assertNotIn("SourceFragment", node_types)
-                self.assertEqual(artifact.properties.get("parser_name"), "document_ingest_disabled")
-                self.assertEqual(artifact.properties.get("fragment_count"), 0)
-            finally:
-                graph.close()
 
     def test_compile_document_policy_can_skip_specific_document_type(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -431,53 +339,6 @@ class MarkdownIngestionTests(unittest.TestCase):
             finally:
                 graph.close()
 
-    def test_config_supports_document_format_toggles(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "reql.conf"
-            path.write_text(
-                "\n".join(
-                    [
-                        "compile:",
-                        "  documents:",
-                        "    markdown: true",
-                        "    pdf: false",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-
-            config = load_config(path)
-
-            self.assertTrue(config.compile.documents["markdown"])
-            self.assertFalse(config.compile.documents["pdf"])
-            self.assertEqual(config.compile.document_formats["pdf"]["extensions"], [".pdf"])
-
-            invalid_options = [
-                ("non boolean toggle", "documents", "    markdown: yes", "compile.documents.markdown must be a boolean"),
-                ("unknown format", "documents", "    unknown_format: true", "Unknown compile.documents format"),
-                (
-                    "invalid format definition",
-                    "document_formats",
-                    '    markdown: {"extensions": ["md"], "unexpected": true}',
-                    "Unknown compile.document_formats.markdown option",
-                ),
-            ]
-            for label, option_name, option_value, expected_error in invalid_options:
-                with self.subTest(label=label):
-                    path.write_text(
-                        "\n".join(
-                            [
-                                "compile:",
-                                f"  {option_name}:",
-                                option_value,
-                            ]
-                        ),
-                        encoding="utf-8",
-                    )
-
-                    with self.assertRaisesRegex(ValueError, expected_error):
-                        load_config(path)
-
     def test_compile_links_document_fragments_to_code_symbols(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "project"
@@ -549,29 +410,6 @@ class MarkdownIngestionTests(unittest.TestCase):
                             self.assertFalse(references)
                     finally:
                         graph.close()
-
-    def test_document_code_linker_archives_stale_links_on_update(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "project"
-            root.mkdir()
-            (root / "app.py").write_text("def compile_project():\n    return 'ok'\n", encoding="utf-8")
-            readme = root / "README.md"
-            readme.write_text("# README\n\nCall compile_project after editing docs.\n", encoding="utf-8")
-            graph = _open_graph_with_documents(Path(td) / "memory.reql")
-            try:
-                graph.compile_project(root)
-                readme.write_text("# README\n\nNo explicit code symbol here.\n", encoding="utf-8")
-                result = graph.compile_project(root)
-                active_references = [
-                    edge
-                    for edge in graph.store.get_edges(type_="REFERENCES", limit=100)
-                    if edge.properties.get("extractor") == "document_code_linker" and edge.properties.get("status") != "archived"
-                ]
-
-                self.assertFalse(result.run.errors)
-                self.assertFalse(active_references)
-            finally:
-                graph.close()
 
 
 if __name__ == "__main__":

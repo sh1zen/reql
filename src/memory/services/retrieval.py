@@ -108,6 +108,9 @@ PUBLIC_SURFACE_EDGE_TYPES = {"HANDLES_ROUTE", "IMPLEMENTS", "IMPORTS", "IMPORTS_
 SERIALIZATION_EDGE_TYPES = {"READS", "WRITES", "RETURNS", "RAISES", "REFERENCES", "EVIDENCED_BY", "DEPENDS_ON", "IMPORTS_FROM"}
 QUERY_CONTEXT_MODES = {"informative", "cleanup"}
 QUERY_CONTEXT_SCOPES = {"code", "docs", "test"}
+QUERY_CONTEXT_MIN_CONFIDENCE_SCORE = 0.25
+QUERY_CONTEXT_MAX_RENDERED_FILES = 8
+QUERY_CONTEXT_MAX_RENDERED_TEST_FILES = 3
 STRUCTURED_SEARCH_FIELDS = (
     "name",
     "qualified_name",
@@ -153,6 +156,7 @@ CODE_CONTEXT_GENERIC_QUERY_TOKENS = {
     "workflow",
 }
 _CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+_CANONICAL_TOKEN_RE = re.compile(r"[a-z0-9_][a-z0-9_'-]{1,}")
 
 
 @dataclass(slots=True)
@@ -223,6 +227,35 @@ def _singular_token(token: str) -> str | None:
     if token.endswith("s") and not token.endswith("ss"):
         return token[:-1]
     return None
+
+
+def _canonical_token_overlap(value: str, query_tokens: set[str]) -> set[str]:
+    """Return expanded query-token matches from already-canonical search text."""
+    if not value or not query_tokens:
+        return set()
+    overlap: set[str] = set()
+    for match in _CANONICAL_TOKEN_RE.finditer(value):
+        token = match.group(0).strip("_-")
+        if len(token) < 2:
+            continue
+        for variant in _token_variants(token):
+            if variant in query_tokens:
+                overlap.add(variant)
+    return overlap
+
+
+def _raw_query_token_overlap(parts: Sequence[str], query_tokens: set[str]) -> set[str] | None:
+    """Return a conservative cheap overlap, or ``None`` when Unicode needs normalization."""
+    raw = " ".join(parts)
+    if not raw.isascii():
+        return None
+    folded = raw.casefold()
+    overlap: set[str] = set()
+    for token in query_tokens:
+        needles = (token, f"{token[:-1]}ie") if token.endswith("y") and len(token) > 2 else (token,)
+        if any(needle in folded for needle in needles):
+            overlap.add(token)
+    return overlap
 
 
 class RetrievalEngine:
@@ -311,7 +344,13 @@ class RetrievalEngine:
                 if query_scopes and not self._node_matches_query_context_scope(node, query_scopes):
                     continue
                 metrics = self._node_match_metrics(node, query_profile)
-                if self._is_weak_multiterm_match(node, query_tokens=query_profile.informative_tokens, direct_relevance=metrics["match_score"]):
+                if self._is_weak_multiterm_match(
+                    node,
+                    query_tokens=query_profile.informative_tokens,
+                    direct_relevance=metrics["match_score"],
+                    overlap_count=int(metrics.get("overlap_count", 0.0)),
+                    has_strong_identifier_overlap=bool(metrics.get("strong_identifier_overlap", 0.0)),
+                ):
                     continue
                 adjusted_score = max(score, metrics["match_score"])
                 seed_scores[node.id] = max(seed_scores.get(node.id, 0.0), adjusted_score)
@@ -466,6 +505,12 @@ class RetrievalEngine:
             payload = self._code_agent_context_payload(subgraph, query_mode=query_mode, max_items=max_items, include_risky=include_risky)
         else:
             payload = self._general_agent_context_payload(subgraph, query_mode=query_mode, max_items=max_items, include_risky=include_risky)
+        visible_scores = (
+            [float(item["score"]) for item in payload.get("results", []) if item.get("score") is not None]
+            if scopes == {"docs"}
+            else None
+        )
+        payload["confidence"] = self._query_context_confidence_payload(subgraph, visible_scores=visible_scores)
         payload["scopes"] = sorted(scopes)
         if query_mode == "informative" and not scopes:
             related_files = self._related_file_payload(subgraph, max_items=max_items)
@@ -473,6 +518,29 @@ class RetrievalEngine:
             if related_files:
                 payload["counts"]["related_files"] = len(related_files)
         return payload
+
+    @staticmethod
+    def _query_context_confidence_payload(
+        subgraph: MemorySubgraph,
+        *,
+        visible_scores: Sequence[float] | None = None,
+    ) -> dict[str, Any]:
+        max_score = max(
+            visible_scores if visible_scores is not None else (float(item.score) for item in subgraph.ranked_nodes),
+            default=0.0,
+        )
+        sufficient = max_score >= QUERY_CONTEXT_MIN_CONFIDENCE_SCORE
+        return {
+            "status": "sufficient" if sufficient else "insufficient",
+            "max_score": round(max_score, 4),
+            "threshold": QUERY_CONTEXT_MIN_CONFIDENCE_SCORE,
+            "targeted_rg_fallback_allowed": not sufficient,
+            "reason": (
+                "top ranked result meets the minimum confidence threshold"
+                if sufficient
+                else "top ranked result is below the minimum confidence threshold"
+            ),
+        }
 
     def _related_file_payload(self, subgraph: MemorySubgraph, *, max_items: int) -> list[dict[str, Any]]:
         """Correlate documentation, implementation, and translation files deterministically."""
@@ -624,7 +692,12 @@ class RetrievalEngine:
             if item.node.type in buckets:
                 buckets[item.node.type].append(item)
         has_direct_general_evidence = self._has_direct_general_evidence(subgraph)
-        best_items = self._general_best_match_items(subgraph, max_items=max_items, prefer_general=has_direct_general_evidence)
+        document_scope = self._normalize_query_context_scopes(subgraph.query.context_scopes) == {"docs"}
+        best_items = (
+            self._document_best_match_items(subgraph, max_items=max_items)
+            if document_scope
+            else self._general_best_match_items(subgraph, max_items=max_items, prefer_general=has_direct_general_evidence)
+        )
         source_items = self._agent_source_payloads(subgraph, max_items=max_items, query_text=subgraph.query.text)
         best_payloads = [self._agent_ranked_payload(item, max_text_chars=220) for item in best_items]
         cleanup_payloads = [self._agent_ranked_payload(item, max_text_chars=260) for item in buckets["StaticAnalysisFinding"]]
@@ -704,6 +777,115 @@ class RetrievalEngine:
             selected.append(item)
             if len(selected) >= limit:
                 return selected
+        return selected
+
+    def _document_best_match_items(self, subgraph: MemorySubgraph, *, max_items: int) -> list[RankedNode]:
+        """Rank visible document concepts by their strongest bounded evidence."""
+        limit = min(max_items, 20)
+        query_profile = self._query_profile(subgraph.query.text)
+        nodes = {node.id: node for node in subgraph.nodes}
+        nodes.update({item.node.id: item.node for item in subgraph.ranked_nodes})
+        evidence_by_concept: dict[str, list[MemoryNode]] = {}
+        for edge in subgraph.edges:
+            if edge.type != "EVIDENCED_BY":
+                continue
+            concept = nodes.get(edge.from_id)
+            evidence = nodes.get(edge.to_id)
+            if concept is None or evidence is None or evidence.type != "RawEvent":
+                continue
+            if concept.type == "Concept" and evidence.status not in INACTIVE_STATUSES:
+                evidence_by_concept.setdefault(concept.id, []).append(evidence)
+
+        candidates: list[RankedNode] = []
+        for item in subgraph.ranked_nodes:
+            node = item.node
+            if node.type == "RawEvent" or node.type in {"SourceArtifact", "File"}:
+                continue
+            metrics = self._node_match_metrics(node, query_profile)
+            display_node = node
+            evidence_score = 0.0
+            label_score = 0.0
+            if node.type == "Concept" and node.properties.get("extractor") == "document_processor":
+                label_node = replace(node, text="", canonical_key=node.label or node.canonical_key)
+                label_metrics = self._node_match_metrics(label_node, query_profile)
+                label_score = float(label_metrics["match_score"])
+                if (
+                    float(label_metrics["match_score"]),
+                    float(label_metrics["coverage"]),
+                ) > (
+                    float(metrics["match_score"]),
+                    float(metrics["coverage"]),
+                ):
+                    metrics = label_metrics
+                best_evidence: tuple[float, float, MemoryNode, dict[str, float]] | None = None
+                for evidence in evidence_by_concept.get(node.id, []):
+                    evidence_metrics = self._node_match_metrics(evidence, query_profile)
+                    evidence_rank = (
+                        float(evidence_metrics["match_score"]),
+                        float(evidence_metrics["coverage"]),
+                    )
+                    if best_evidence is None or evidence_rank > best_evidence[:2]:
+                        best_evidence = (*evidence_rank, evidence, evidence_metrics)
+                if best_evidence is not None and best_evidence[0] > float(metrics["match_score"]):
+                    evidence_score, _, evidence, metrics = best_evidence
+                    display_node = replace(
+                        node,
+                        text=evidence.text,
+                        properties={
+                            **node.properties,
+                            "line_start": evidence.properties.get("line_start"),
+                            "line_end": evidence.properties.get("line_end"),
+                            "evidence_node_id": evidence.id,
+                        },
+                    )
+            match_score = float(metrics["match_score"])
+            coverage = float(metrics["coverage"])
+            if match_score <= 0.0:
+                continue
+            score = clamp(0.82 * match_score + 0.18 * coverage)
+            reasons = dict(item.reasons)
+            reasons.update(
+                {
+                    "match_score": match_score,
+                    "coverage": coverage,
+                    "document_evidence_score": evidence_score,
+                    "document_label_score": label_score,
+                }
+            )
+            candidates.append(RankedNode(node=display_node, score=score, reasons=reasons))
+
+        candidates.sort(
+            key=lambda item: (
+                item.score,
+                float(item.reasons.get("coverage", 0.0)),
+                float(item.reasons.get("document_label_score", 0.0)),
+                len(self._node_label(item.node)),
+                self._location_summary(item.node) or "",
+            ),
+            reverse=True,
+        )
+        if not candidates:
+            return []
+
+        top_score = candidates[0].score
+        top_path = self._node_relative_path(candidates[0].node) or ""
+        selected: list[RankedNode] = []
+        seen_evidence: set[tuple[str, str]] = set()
+        per_path: dict[str, int] = {}
+        for item in candidates:
+            path = self._node_relative_path(item.node) or ""
+            relative_floor = top_score * (0.40 if path and path == top_path else 0.60)
+            if item.score < max(0.08, relative_floor):
+                continue
+            text_key = " ".join(str(item.node.text or item.node.label or "").casefold().split())
+            evidence_key = (self._location_summary(item.node) or path, text_key)
+            if evidence_key in seen_evidence or per_path.get(path, 0) >= 3:
+                continue
+            seen_evidence.add(evidence_key)
+            per_path[path] = per_path.get(path, 0) + 1
+            selected.append(item)
+            if len(selected) >= limit:
+                break
         return selected
 
     def query_graph(
@@ -1420,6 +1602,14 @@ class RetrievalEngine:
             phrase_terms=phrase_terms,
         )
 
+    def _nodes_for_types(self, node_types: Sequence[str]) -> list[MemoryNode]:
+        """Load only indexed node types while preserving ``all_nodes`` order."""
+        nodes: dict[str, MemoryNode] = {}
+        for node_type in sorted(set(node_types)):
+            for node in self.store.find_nodes(type_=node_type, limit=2**63 - 1, clone=False):
+                nodes.setdefault(node.id, node)
+        return sorted(nodes.values(), key=lambda node: (node.created_at, node.id))
+
     def _scoped_lexical_search(
         self,
         query: MemoryQuery,
@@ -1430,8 +1620,9 @@ class RetrievalEngine:
         top_k: int,
     ) -> list[tuple[MemoryNode, float]]:
         allowed_types = set(lexical_node_types) if lexical_node_types is not None else None
+        candidates = self._nodes_for_types(allowed_types) if allowed_types is not None else self.store.all_nodes()
         matches: list[tuple[MemoryNode, float]] = []
-        for node in self.store.all_nodes():
+        for node in candidates:
             if allowed_types is not None and node.type not in allowed_types:
                 continue
             if node.type in TECHNICAL_NODE_TYPES:
@@ -1440,11 +1631,25 @@ class RetrievalEngine:
                 continue
             if not self._node_matches_query_context_scope(node, scopes):
                 continue
+            raw_overlap = _raw_query_token_overlap(self._node_search_parts(node), query_profile.informative_tokens)
+            if (
+                raw_overlap is not None
+                and len(query_profile.informative_tokens) >= 4
+                and len(raw_overlap) <= 1
+                and not self._has_strong_identifier_overlap(raw_overlap)
+            ):
+                continue
             metrics = self._node_match_metrics(node, query_profile)
             score = metrics["match_score"]
             if score <= 0.0:
                 continue
-            if self._is_weak_multiterm_match(node, query_tokens=query_profile.informative_tokens, direct_relevance=score):
+            if self._is_weak_multiterm_match(
+                node,
+                query_tokens=query_profile.informative_tokens,
+                direct_relevance=score,
+                overlap_count=int(metrics.get("overlap_count", 0.0)),
+                has_strong_identifier_overlap=bool(metrics.get("strong_identifier_overlap", 0.0)),
+            ):
                 continue
             matches.append((node, score))
         matches.sort(
@@ -1484,6 +1689,22 @@ class RetrievalEngine:
         candidate_edges: OrderedDict[str, MemoryEdge] = OrderedDict()
         queue: list[tuple[str, int, float, float, set[str], list[str]]] = []
         seen_depth: dict[str, int] = {}
+        metrics_by_node: dict[str, dict[str, float]] = {}
+        overlap_by_node: dict[str, set[str]] = {}
+
+        def metrics_for(node: MemoryNode) -> dict[str, float]:
+            metrics = metrics_by_node.get(node.id)
+            if metrics is None:
+                metrics = self._node_match_metrics(node, query_profile)
+                metrics_by_node[node.id] = metrics
+            return metrics
+
+        def overlap_for(node: MemoryNode) -> set[str]:
+            overlap = overlap_by_node.get(node.id)
+            if overlap is None:
+                overlap = self._node_query_token_overlap_tokens(node, query_profile.informative_tokens)
+                overlap_by_node[node.id] = overlap
+            return overlap
 
         for seed_id in seed_node_ids:
             seed = self.store.get_node(seed_id)
@@ -1492,7 +1713,7 @@ class RetrievalEngine:
             if not self._candidate_node_allowed(seed, query, code_context=code_context):
                 continue
             seed_score = seed_scores.get(seed_id, 0.0)
-            seed_tokens = self._node_query_token_overlap_tokens(seed, query_profile.informative_tokens)
+            seed_tokens = overlap_for(seed)
             self._add_path_candidate(
                 candidates,
                 seed,
@@ -1502,6 +1723,7 @@ class RetrievalEngine:
                 depth=0,
                 edge_signal=1.0,
                 edge_ids=[],
+                metrics=metrics_for(seed),
             )
             queue.append((seed_id, 0, seed_score, seed_score, seed_tokens, []))
             seen_depth[seed_id] = 0
@@ -1525,7 +1747,7 @@ class RetrievalEngine:
                 if not self._candidate_node_allowed(neighbor, query, code_context=code_context):
                     continue
                 next_depth = depth + 1
-                neighbor_tokens = self._node_query_token_overlap_tokens(neighbor, query_profile.informative_tokens)
+                neighbor_tokens = overlap_for(neighbor)
                 combined_tokens = set(path_tokens) | neighbor_tokens
                 previous_depth = seen_depth.get(neighbor.id)
                 existing = candidates.get(neighbor.id)
@@ -1536,7 +1758,7 @@ class RetrievalEngine:
                     and existing.coverage >= self._coverage(combined_tokens, query_profile)
                 ):
                     continue
-                metrics = self._node_match_metrics(neighbor, query_profile)
+                metrics = metrics_for(neighbor)
                 if (
                     next_depth > 1
                     and metrics["match_score"] <= 0.0
@@ -1556,6 +1778,7 @@ class RetrievalEngine:
                     depth=next_depth,
                     edge_signal=next_path_score,
                     edge_ids=next_edge_ids,
+                    metrics=metrics,
                 )
                 if previous_depth is None or next_depth < previous_depth:
                     seen_depth[neighbor.id] = next_depth
@@ -1599,8 +1822,9 @@ class RetrievalEngine:
         depth: int,
         edge_signal: float,
         edge_ids: list[str],
+        metrics: dict[str, float] | None = None,
     ) -> None:
-        metrics = self._node_match_metrics(node, query_profile)
+        metrics = metrics or self._node_match_metrics(node, query_profile)
         direct_coverage = metrics["coverage"]
         path_coverage = max(direct_coverage, self._coverage(path_tokens, query_profile))
         type_bonus = self._retrieval_type_bonus(node, metrics["match_score"])
@@ -1650,38 +1874,48 @@ class RetrievalEngine:
         node_key = canonicalize(node_text)
         if not node_key:
             return {"match_score": 0.0, "coverage": 0.0}
-        node_tokens = set(_expanded_tokens(node_text))
-        overlap = query_profile.informative_tokens & node_tokens
+        overlap = _canonical_token_overlap(node_key, query_profile.informative_tokens)
+        overlap_count = float(len(overlap))
+        strong_identifier_overlap = float(self._has_strong_identifier_overlap(overlap))
+
+        def result(match_score: float, coverage: float) -> dict[str, float]:
+            return {
+                "match_score": match_score,
+                "coverage": coverage,
+                "overlap_count": overlap_count,
+                "strong_identifier_overlap": strong_identifier_overlap,
+            }
+
         coverage = self._coverage(overlap, query_profile)
         phrase_coverage = self._phrase_coverage(node_key, query_profile)
         coverage = max(coverage, phrase_coverage)
         if f" {query_key} " in f" {node_key} ":
-            return {"match_score": 0.86, "coverage": max(coverage, 0.90)}
+            return result(0.86, max(coverage, 0.90))
         if node_key.startswith(query_key) or any(part.startswith(query_key) for part in canonical_parts):
-            return {"match_score": 0.78, "coverage": max(coverage, 0.80)}
-        if query_profile.informative_tokens and query_profile.informative_tokens.issubset(node_tokens):
+            return result(0.78, max(coverage, 0.80))
+        if query_profile.informative_tokens and len(overlap) == len(query_profile.informative_tokens):
             score = 0.76 if phrase_coverage >= 0.50 else 0.70
-            return {"match_score": score, "coverage": 1.0}
+            return result(score, 1.0)
         if phrase_coverage >= 0.75 and coverage >= 0.50:
-            return {"match_score": 0.68, "coverage": coverage}
+            return result(0.68, coverage)
         if phrase_coverage >= 0.50 and coverage >= 0.40:
-            return {"match_score": 0.58, "coverage": coverage}
-        if self._has_strong_identifier_overlap(overlap):
-            return {"match_score": 0.64, "coverage": max(coverage, 0.55)}
+            return result(0.58, coverage)
+        if strong_identifier_overlap:
+            return result(0.64, max(coverage, 0.55))
         if coverage >= 0.75:
-            return {"match_score": 0.56, "coverage": coverage}
+            return result(0.56, coverage)
         if coverage >= 0.50:
-            return {"match_score": 0.40, "coverage": coverage}
+            return result(0.40, coverage)
         if coverage > 0:
             phrase_bonus = 0.18 * phrase_coverage
-            return {"match_score": min(0.38, (0.16 * coverage) + phrase_bonus), "coverage": coverage}
+            return result(min(0.38, (0.16 * coverage) + phrase_bonus), coverage)
         source = str(node.properties.get("relative_path") or node.properties.get("path") or "")
-        source_tokens = set(_expanded_tokens(source))
-        source_overlap = query_profile.informative_tokens & source_tokens
+        source_key = canonicalize(" ".join((source, _identifier_expanded_text(source))))
+        source_overlap = _canonical_token_overlap(source_key, query_profile.informative_tokens)
         source_coverage = self._coverage(source_overlap, query_profile)
         if source_coverage >= 0.50:
-            return {"match_score": 0.30 * source_coverage, "coverage": source_coverage}
-        return {"match_score": 0.0, "coverage": 0.0}
+            return result(0.30 * source_coverage, source_coverage)
+        return result(0.0, 0.0)
 
     @staticmethod
     def _coverage(tokens: set[str], query_profile: _QueryProfile) -> float:
@@ -1751,19 +1985,25 @@ class RetrievalEngine:
         *,
         query_tokens: set[str],
         direct_relevance: float,
+        overlap_count: int | None = None,
+        has_strong_identifier_overlap: bool | None = None,
     ) -> bool:
         if len(query_tokens) < 4 or direct_relevance >= 0.10:
             return False
-        overlap_tokens = self._node_query_token_overlap_tokens(node, query_tokens)
-        if self._has_strong_identifier_overlap(overlap_tokens):
+        overlap_tokens: set[str] | None = None
+        if overlap_count is None or has_strong_identifier_overlap is None:
+            overlap_tokens = self._node_query_token_overlap_tokens(node, query_tokens)
+        if has_strong_identifier_overlap is None:
+            has_strong_identifier_overlap = self._has_strong_identifier_overlap(overlap_tokens or set())
+        if has_strong_identifier_overlap:
             return False
-        overlap = len(overlap_tokens)
+        overlap = overlap_count if overlap_count is not None else len(overlap_tokens or set())
         if overlap <= 1:
             return True
         return (overlap / len(query_tokens)) < 0.25
 
     @staticmethod
-    def _node_search_text(node: MemoryNode) -> str:
+    def _node_search_parts(node: MemoryNode) -> list[str]:
         parts: list[str] = []
         for part in (node.text, node.label, node.canonical_key):
             if part:
@@ -1776,6 +2016,11 @@ class RetrievalEngine:
                 parts.extend(str(item) for item in value if item)
             else:
                 parts.append(str(value))
+        return parts
+
+    @classmethod
+    def _node_search_text(cls, node: MemoryNode) -> str:
+        parts = cls._node_search_parts(node)
         expanded_parts = [_identifier_expanded_text(part) for part in parts]
         return " ".join([*parts, *expanded_parts])
 
@@ -1787,7 +2032,9 @@ class RetrievalEngine:
     def _node_query_token_overlap_tokens(cls, node: MemoryNode, query_tokens: set[str]) -> set[str]:
         if not query_tokens:
             return set()
-        return query_tokens & set(_expanded_tokens(cls._node_search_text(node)))
+        node_text = cls._node_search_text(node)
+        node_key = canonicalize(node_text)
+        return _canonical_token_overlap(node_key, query_tokens)
 
     @staticmethod
     def _has_strong_identifier_overlap(tokens: set[str]) -> bool:
@@ -2667,7 +2914,11 @@ class RetrievalEngine:
             "change_chain": change_chain,
             "owner_candidates": owner_candidates,
             "cleanup_candidates": cleanup_candidates,
-            "working_set": self._code_working_set_payload(path_rows, query_mode=query_mode, max_items=compact_items),
+            "working_set": self._code_working_set_payload(
+                path_rows,
+                query_mode=query_mode,
+                max_items=min(max_items, QUERY_CONTEXT_MAX_RENDERED_FILES),
+            ),
             "contracts": contracts,
             "impact": impact,
             "targeted_reads": targeted_reads,
@@ -3064,7 +3315,7 @@ class RetrievalEngine:
         max_items: int,
     ) -> list[dict[str, Any]]:
         payload: list[dict[str, Any]] = []
-        for row in path_rows[: min(max_items, 4)]:
+        for row in path_rows[: min(max_items, QUERY_CONTEXT_MAX_RENDERED_FILES)]:
             line_start = row.get("line_start")
             line_end = row.get("line_end")
             if line_start is not None and line_end is not None and int(line_end) - int(line_start) > 160:
@@ -3295,7 +3546,7 @@ class RetrievalEngine:
 
     def _matching_source_fragments_for_query(self, query_text: str, working_paths: set[str], *, max_items: int) -> list[MemoryNode]:
         matches: list[tuple[float, MemoryNode]] = []
-        for node in self.store.all_nodes():
+        for node in self._nodes_for_types(SOURCE_NODE_TYPES):
             if node.type not in SOURCE_NODE_TYPES:
                 continue
             path = self._node_relative_path(node)
@@ -3878,9 +4129,41 @@ class RetrievalEngine:
 
     def _code_test_targets(self, subgraph: MemorySubgraph, path_rows: list[dict[str, Any]], *, query_text: str, max_items: int) -> list[dict[str, Any]]:
         ranked_by_id = {item.node.id: item for item in subgraph.ranked_nodes}
+        candidate_nodes: OrderedDict[str, MemoryNode] = OrderedDict(
+            (node.id, node) for node in [*subgraph.nodes, *(item.node for item in subgraph.ranked_nodes)]
+        )
+        if not any(self._is_test_context_path(self._node_relative_path(node) or "") for node in candidate_nodes.values()):
+            test_subgraph = self.retrieve(
+                MemoryQuery(
+                    text=query_text,
+                    top_k=max(8, min(max_items * 2, 20)),
+                    max_depth=1,
+                    include_archived=subgraph.query.include_archived,
+                    context_scopes={"test"},
+                    store_trace=False,
+                )
+            )
+            for item in test_subgraph.ranked_nodes:
+                ranked_by_id[item.node.id] = item
+                candidate_nodes.setdefault(item.node.id, item.node)
+            for node in test_subgraph.nodes:
+                candidate_nodes.setdefault(node.id, node)
         query_tokens = set(_expanded_tokens(query_text))
+        working_node_ids = {
+            str(node_id)
+            for row in path_rows
+            for node_id in list(row.get("node_ids") or [])
+        }
+        linked_test_ids: set[str] = set()
+        for edge in subgraph.edges:
+            if edge.type != "TESTS":
+                continue
+            if edge.from_id in working_node_ids:
+                linked_test_ids.add(edge.to_id)
+            if edge.to_id in working_node_ids:
+                linked_test_ids.add(edge.from_id)
         targets: dict[str, dict[str, Any]] = {}
-        for node in [*subgraph.nodes, *(item.node for item in subgraph.ranked_nodes)]:
+        for node in candidate_nodes.values():
             path = self._node_relative_path(node)
             if not path:
                 continue
@@ -3894,18 +4177,41 @@ class RetrievalEngine:
             overlap = self._owner_query_overlap(node, query_tokens)
             ranked = ranked_by_id.get(node.id)
             direct = float(ranked.reasons.get("match_score", 0.0) or 0.0) if ranked is not None else 0.0
+            if kind == "test" and overlap <= 0 and direct <= 0.0 and node.id not in linked_test_ids:
+                continue
             score = (1.0 if kind == "test" else 0.25) + direct + min(0.3, overlap * 0.05)
-            if node.type in {"Function", "Method", "Class", "Test"}:
+            is_owner_symbol = node.type in {"Function", "Method", "Class", "Test"}
+            if is_owner_symbol:
                 score += 0.1
+            line_start, line_end = self._line_span(node)
+            span_size = (
+                max(0, int(line_end) - int(line_start))
+                if line_start is not None and line_end is not None
+                else 1_000_000
+            )
+            priority = (is_owner_symbol, score, -span_size)
             previous = targets.get(normalized)
-            if previous is None or score > float(previous["score"]):
+            if previous is None or priority > tuple(previous["_priority"]):
+                symbol = str(
+                    node.properties.get("qualified_name")
+                    or node.properties.get("symbol_name")
+                    or node.properties.get("name")
+                    or node.label
+                    or ""
+                ).strip()
                 targets[normalized] = {
                     "kind": kind,
                     "path": normalized,
                     "score": round(score, 4),
                     "reason": "test graph match" if kind == "test" else "documentation mention",
+                    "line_start": line_start,
+                    "line_end": line_end,
+                    "symbols": [symbol] if symbol and is_owner_symbol else [],
+                    "_priority": priority,
                 }
         ordered = sorted(targets.values(), key=lambda item: (item["kind"] == "test", float(item["score"])), reverse=True)
+        for item in ordered:
+            item.pop("_priority", None)
         test_rows = [item for item in ordered if item["kind"] == "test"]
         doc_rows = [item for item in ordered if item["kind"] == "docs"]
         selected = test_rows[: min(max_items, 4)]
@@ -4031,66 +4337,70 @@ class RetrievalEngine:
             return self._render_cleanup_context_payload(payload)
 
         lines = self._render_context_header(payload, title="# REQL Context")
-        result_lines: list[str] = []
-        emitted = False
+        if self._query_context_confidence_is_insufficient(payload):
+            return "\n".join(lines).strip()
         working_set = list(payload.get("working_set") or [])
-        small_working_set = 0 < len(working_set) <= 2
-        owner_limit = 3 if small_working_set else 6
-        file_limit = 2 if small_working_set else 6
-        read_limit = 3 if small_working_set else 6
-        merged_read_limit = 8
-        read_plan = list(payload.get("read_plan") or [])
-        plan_by_key = {
-            (item.get("node_id"), item.get("path"), item.get("line_start"), item.get("line_end")): item
-            for item in read_plan
-        }
-        rendered_read_keys: set[tuple[object, object, object, object]] = set()
-        for item in list(payload.get("owner_candidates") or [])[:owner_limit]:
-            location = self._format_path_bracket_span(item.get("path"), item.get("line_start"), item.get("line_end"))
-            location_suffix = f" @ {location}" if location else ""
-            result_lines.append(f"- code `{item['id']}` [{item['type']}] {item.get('name') or item.get('label')}{location_suffix}; score={float(item.get('score', 0.0)):.2f}; {item.get('reason', 'graph match')}")
-            emitted = True
-        for row in working_set[:file_limit]:
-            location = self._format_path_bracket_span(row.get("path"), row.get("line_start"), row.get("line_end"))
-            symbols = ", ".join(row.get("symbols", [])[:4])
-            suffix = f"; symbols={symbols}" if symbols else ""
-            result_lines.append(f"- file `{location}` score={float(row.get('score', 0.0)):.2f}{suffix}; {row.get('reason') or 'graph match'}")
-            emitted = True
-        for item in list(payload.get("targeted_reads") or [])[:read_limit]:
-            location = self._format_path_bracket_span(item.get("path"), item.get("line_start"), item.get("line_end"))
-            key = (item.get("node_id"), item.get("path"), item.get("line_start"), item.get("line_end"))
-            rendered_read_keys.add(key)
-            plan_item = plan_by_key.get(key) or {}
-            snippet_note = "; snippet=embedded" if plan_item.get("snippet_embedded") else ""
-            command = plan_item.get("command")
-            command_note = f"; inspect_node=`{command}`" if command else ""
-            result_lines.append(f"- ref `{location}` from `{item['node_id']}` [{item['type']}] {item['reason']}: {item['label']}{snippet_note}{command_note}")
-            emitted = True
-        for item in read_plan:
-            key = (item.get("node_id"), item.get("path"), item.get("line_start"), item.get("line_end"))
-            if key in rendered_read_keys:
+        owner_candidates = list(payload.get("owner_candidates") or [])
+        targeted_reads = list(payload.get("targeted_reads") or [])
+        tests: list[dict[str, Any]] = []
+        seen_test_paths: set[str] = set()
+        for item in list(payload.get("test_targets") or []):
+            path = str(item.get("path") or "")
+            if item.get("kind") != "test" or not path or path in seen_test_paths:
                 continue
-            if len(rendered_read_keys) >= merged_read_limit:
+            seen_test_paths.add(path)
+            tests.append(item)
+            if len(tests) >= QUERY_CONTEXT_MAX_RENDERED_TEST_FILES:
                 break
-            location = self._format_path_bracket_span(item.get("path"), item.get("line_start"), item.get("line_end"))
-            if not location:
+
+        source_limit = max(5, QUERY_CONTEXT_MAX_RENDERED_FILES - len(tests)) if tests else QUERY_CONTEXT_MAX_RENDERED_FILES
+        source_rows = working_set[:source_limit]
+        rendered_paths = {str(row.get("path") or "") for row in source_rows}
+
+        def best_span(path: str, row: dict[str, Any]) -> tuple[Any, Any]:
+            if row.get("line_start") is not None or row.get("line_end") is not None:
+                return row.get("line_start"), row.get("line_end")
+            for item in owner_candidates:
+                if item.get("path") == path and (item.get("line_start") is not None or item.get("line_end") is not None):
+                    return item.get("line_start"), item.get("line_end")
+            for item in targeted_reads:
+                if item.get("path") == path and (item.get("line_start") is not None or item.get("line_end") is not None):
+                    return item.get("line_start"), item.get("line_end")
+            return None, None
+
+        file_lines: list[str] = []
+        for row in source_rows:
+            path = str(row.get("path") or "")
+            if not path:
                 continue
-            snippet_note = "snippet=embedded" if item.get("snippet_embedded") else "snippet=not_embedded"
-            command = item.get("command")
-            command_note = f"; inspect_node=`{command}`" if command else ""
-            result_lines.append(
-                f"- read `{location}` ({item.get('line_count', '?')} lines) from `{item.get('node_id')}` "
-                f"[{item.get('type')}] reason={item.get('reason')}; {snippet_note}{command_note}"
-            )
-            rendered_read_keys.add(key)
-            emitted = True
-        if not emitted:
-            result_lines.append("- No code results matched this query.")
-        self._append_section(lines, "Code results", result_lines)
-        self._append_section(lines, "Change chain", self._render_change_chain_lines(payload.get("change_chain") or []))
-        self._append_section(lines, "Snippets", self._render_snippet_lines(payload.get("snippets") or [], limit=2 if small_working_set else 3))
-        self._append_section(lines, "Research queries", self._render_research_refs(payload))
-        self._append_section(lines, "Summary", self._render_compact_counts(payload))
+            line_start, line_end = best_span(path, row)
+            location = self._format_path_bracket_span(path, line_start, line_end)
+            symbols: list[str] = []
+            for symbol in list(row.get("symbols") or []):
+                if symbol and symbol not in symbols:
+                    symbols.append(str(symbol))
+            for item in owner_candidates:
+                symbol = item.get("name") or item.get("label")
+                if item.get("path") == path and symbol and symbol not in symbols:
+                    symbols.append(str(symbol))
+            owner_note = f"; owners={', '.join(symbols[:4])}" if symbols else "; owners=none identified"
+            file_lines.append(f"- `{location}`{owner_note}")
+        if not file_lines:
+            file_lines.append("- No source files matched this query.")
+        self._append_section(lines, "Files", file_lines)
+
+        test_lines: list[str] = []
+        for item in tests:
+            path = str(item.get("path") or "")
+            if path in rendered_paths:
+                continue
+            location = self._format_path_bracket_span(path, item.get("line_start"), item.get("line_end"))
+            symbols = [str(symbol) for symbol in list(item.get("symbols") or []) if symbol]
+            owner_note = f"; owners={', '.join(symbols[:3])}" if symbols else ""
+            test_lines.append(f"- `{location}`{owner_note}")
+        if not test_lines:
+            test_lines.append("- No associated tests found in the graph.")
+        self._append_section(lines, "Associated tests", test_lines)
         return "\n".join(lines).strip()
 
     def _render_general_context_payload(self, payload: dict[str, Any]) -> str:
@@ -4098,6 +4408,8 @@ class RetrievalEngine:
             return self._render_cleanup_context_payload(payload)
 
         lines = self._render_context_header(payload, title="# REQL Context")
+        if self._query_context_confidence_is_insufficient(payload):
+            return "\n".join(lines).strip()
         results = list(payload["results"])
         result_lines: list[str] = []
         if results:
@@ -4106,16 +4418,12 @@ class RetrievalEngine:
         else:
             result_lines.append("- No ranked nodes matched this query.")
         self._append_section(lines, "Results", result_lines)
-        link_lines: list[str] = []
-        for line in list(payload.get("graph_links") or [])[:6]:
-            link_lines.append(line.replace("- ", "- link ", 1))
-        self._append_section(lines, "Graph links", link_lines)
-        self._append_section(lines, "Research queries", self._render_research_refs(payload))
-        self._append_section(lines, "Summary", self._render_compact_counts(payload))
         return "\n".join(lines).strip()
 
     def _render_cleanup_context_payload(self, payload: dict[str, Any]) -> str:
         lines = self._render_context_header(payload, title="# REQL Cleanup Context")
+        if self._query_context_confidence_is_insufficient(payload):
+            return "\n".join(lines).strip()
         cleanup_filter = payload.get("cleanup_filter") or {}
         if cleanup_filter:
             mode = cleanup_filter.get("mode") or "safe_remove"
@@ -4210,7 +4518,18 @@ class RetrievalEngine:
         scopes = list(payload.get("scopes") or [])
         if scopes:
             lines.append(f"Scope: {', '.join(scopes)}")
+        confidence = payload.get("confidence") or {}
+        if confidence.get("status") == "insufficient":
+            max_score = float(confidence.get("max_score", 0.0) or 0.0)
+            threshold = float(confidence.get("threshold", QUERY_CONTEXT_MIN_CONFIDENCE_SCORE) or QUERY_CONTEXT_MIN_CONFIDENCE_SCORE)
+            lines.append(
+                f"Confidence: insufficient (max score {max_score:.3f} < {threshold:.3f}); targeted rg fallback allowed."
+            )
         return lines
+
+    @staticmethod
+    def _query_context_confidence_is_insufficient(payload: dict[str, Any]) -> bool:
+        return (payload.get("confidence") or {}).get("status") == "insufficient"
 
     def _render_research_refs(self, payload: dict[str, Any]) -> list[str]:
         query = self._reql_string(str(payload.get("query") or ""))

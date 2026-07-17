@@ -66,6 +66,13 @@ No graph node, edge, property, provenance field, or supported source/document
 format is omitted to obtain this bound; the optimization changes index maintenance,
 not the expressive model compiled from the project.
 
+The human-readable compile summary separates storage work from source changes.
+The `Nodes` and `Edges` counters retain the complete graph upsert totals, while
+`Changed symbols` lists only added, removed, or semantically modified symbols.
+Line-number shifts and equivalent symbols reprocessed with a changed file are
+therefore omitted from that list. The structured `summary.updated_symbols` field
+uses the same focused semantics for API compatibility.
+
 Watch mode wraps the same flow:
 
 ```text
@@ -82,6 +89,17 @@ The watcher uses Python `watchdog` filesystem events. Treat it as monitor mode
 for active editing: run it from the agent's working directory, keep one watcher
 running, and query the maintained graph instead of launching repeated manual
 compile/rebuild loops.
+
+Check watcher liveness without inspecting operating-system processes:
+
+```bash
+reql project watch-status .
+reql project watch-status . --json
+```
+
+The command reads the REQL lock sidecar without opening the graph and therefore
+works while the watcher owns the write lock. It distinguishes running, stopped,
+stale, and unknown-liveness states.
 
 The cache key includes:
 

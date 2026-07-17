@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import PurePosixPath
-from typing import Any
+from typing import Any, Iterable
 
 from ..domain.models import MemoryNode
 from ..storage.graph_store import GraphStore
@@ -26,6 +26,27 @@ ASSOCIATION_EDGE_TYPES = {
 MAX_ASSOCIATION_SEEDS = 250
 MAX_LEXICAL_TESTS = 8
 LEXICAL_ASSOCIATION_NODE_TYPES = {"Module", "Function", "Class", "Method", "Test", "SourceFragment"}
+_NON_SEMANTIC_SYMBOL_FIELDS = {
+    "line",
+    "column",
+    "lineno",
+    "end_lineno",
+    "col_offset",
+    "end_col_offset",
+    "created_at",
+    "updated_at",
+    "source_path",
+    "start_line",
+    "end_line",
+    "line_start",
+    "line_end",
+    "start_column",
+    "end_column",
+    "column_start",
+    "column_end",
+}
+
+SymbolState = dict[str, dict[str, object]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +97,7 @@ def build_compilation_summary(
     *,
     revision: ProjectRevision | None,
     delta: GraphDelta,
+    previous_symbol_state: SymbolState | None = None,
 ) -> CompilationSummary:
     """Build a summary from the revision and the graph delta just persisted."""
     changed_files = [change.to_dict() for change in revision.changes] if revision is not None else []
@@ -83,6 +105,10 @@ def build_compilation_summary(
     node_status = _node_statuses(delta)
     nodes = store.get_nodes(sorted(node_status))
     changed_nodes = [node for node in nodes if _relative_path(node) in changed_paths]
+    current_symbol_state = capture_symbol_state(
+        store,
+        (str(item.get("artifact_id") or "") for item in changed_files),
+    )
     updated_symbols = [
         UpdatedSymbol(
             id=node.id,
@@ -94,6 +120,11 @@ def build_compilation_summary(
         )
         for node in changed_nodes
         if node.type in CODE_SYMBOL_TYPES
+        and (
+            node_status[node.id] != "updated"
+            or previous_symbol_state is None
+            or previous_symbol_state.get(node.id) != current_symbol_state.get(node.id)
+        )
     ]
     updated_symbols.sort(key=lambda item: (item.relative_path, item.line_start or 0, item.type, item.name, item.id))
     associated_tests = _associated_tests(store, changed_paths=changed_paths, seed_nodes=changed_nodes)
@@ -102,6 +133,58 @@ def build_compilation_summary(
         updated_symbols=updated_symbols,
         associated_tests=associated_tests,
     )
+
+
+def capture_symbol_state(store: GraphStore, artifact_ids: Iterable[str]) -> SymbolState:
+    """Capture semantic code-symbol state for a bounded set of artifacts."""
+    nodes: dict[str, MemoryNode] = {}
+    for artifact_id in sorted({str(item) for item in artifact_ids if item}):
+        for node in store.find_nodes_by_property(
+            "artifact_id",
+            artifact_id,
+            status="active",
+            limit=100000,
+            clone=False,
+        ):
+            nodes[node.id] = node
+
+    bodies_by_symbol: dict[str, list[str]] = {}
+    for node in nodes.values():
+        if node.type != "SourceFragment":
+            continue
+        symbol_id = str(node.properties.get("symbol_id") or "")
+        if symbol_id:
+            bodies_by_symbol.setdefault(symbol_id, []).append(node.text)
+
+    return {
+        node.id: _symbol_state(node, bodies_by_symbol.get(node.id, []))
+        for node in nodes.values()
+        if node.type in CODE_SYMBOL_TYPES
+    }
+
+
+def _symbol_state(node: MemoryNode, bodies: list[str]) -> dict[str, object]:
+    return {
+        "type": node.type,
+        "label": node.label,
+        "text": node.text,
+        "canonical_key": node.canonical_key,
+        "status": node.status,
+        "properties": _semantic_value(node.properties),
+        "bodies": sorted(bodies),
+    }
+
+
+def _semantic_value(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            str(key): _semantic_value(item)
+            for key, item in value.items()
+            if str(key) not in _NON_SEMANTIC_SYMBOL_FIELDS
+        }
+    if isinstance(value, (list, tuple)):
+        return [_semantic_value(item) for item in value]
+    return value
 
 
 def _node_statuses(delta: GraphDelta) -> dict[str, str]:

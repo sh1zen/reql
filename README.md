@@ -70,25 +70,30 @@ reql install codex
 
 Replace `codex` with another supported agent platform, or let interactive
 install auto-detect one. The installed instructions make REQL part of the
-agent's normal repository workflow. The commands below are the operations the
-agent integration uses to bootstrap context, retrieve focused evidence, and
-keep working memory:
+agent's normal repository workflow. The generated `SKILL.md` is a 20–30 line
+fast path, while bootstrap, query,
+update, reporting, document, and Agent Workspace details stay in routed
+`references/` files loaded only when their situation occurs.
+The commands below are the operations the agent integration uses to bootstrap
+context, retrieve focused evidence, and keep working memory:
 
 ```bash
 reql project compile .
+reql project explain . --focus "payment workflow"
 reql query_context --query "payment service"
 reql query_memories --query "payment service" --limit 8 --json
 reql query_explore --query "payment service serialization" --view owners --view code
 reql query_explore --query "profile template" --structural-duplicates-only
 ```
 
-For coding-agent tasks, `query_context --code` returns a compact working set
-plus a bounded `read_plan` and `change_chain`: owner symbols to start from,
-exact source spans to inspect before whole files, related contracts or public
-surfaces to preserve, and tests/docs to verify after edits.
-Unscoped informative queries can also end with an `Action plan` that correlates
-matching documentation and implementation spans in the same project and flags
-related `.pot`/`.po` translation catalogs for synchronization.
+For coding-agent tasks, the normal `query_context --code` output shows at most
+eight paths: five to eight source files when available, reduced as needed to
+reserve room for up to three associated tests. Each source row includes its
+owner symbols and best bounded line range. Detailed graph metadata and planning
+fields remain available from `query_context --json` for programmatic consumers.
+When the highest ranked score is below `0.25`, `query_context` short-circuits
+with `Confidence: insufficient` and explicitly allows one targeted `rg`
+fallback using the user's exact symbol, path, or error terms.
 
 Agent Workspace commands store the agent's session-scoped working state while
 it implements, reviews, or documents a repository:
@@ -105,7 +110,6 @@ reql agent link-task --task TASK_ID --file test-agent/context_savings.py
 reql agent link-many TASK_ID artifact:app function:target --relation implements
 reql agent batch --json agent-ops.json
 reql agent batch --task task="Patch CLI" --decision decision="Use one workspace lock" --link '$task' implements '$decision'
-reql agent map --session current
 reql agent handoff "Implementation notes ready for master review"
 reql agent export --json
 reql agent export --json --metadata
@@ -117,11 +121,11 @@ current one for later `reql agent ...` commands. Parallel agents can use
 read `reql agent bus`, publish shared messages, and use `reql agent handoff` to
 return a compact saved working-map snapshot to the master. `agent bus --json`
 omits handoff payload snapshots by default; pass `--include-payloads` only when
-the full saved handoff maps are needed. `agent map`, `agent search`, and
-`agent export` omit metadata by default; use `agent map --session current
---completed` for a completed session summary after tasks are marked done. Pass
-`--metadata` only when timestamps, storage paths, source fields, or the full
-workspace graph are needed.
+the full saved handoff maps are needed. Use `agent map` only to recover context
+after compaction, a handoff, context loss, or a long pause; do not print it
+before and after routine edits. `agent map`, `agent search`, and `agent export`
+omit metadata by default. Pass `--metadata` only when timestamps, storage paths,
+source fields, or the full workspace graph are needed.
 
 Sessions inside one agent memory are isolated by `REQL_AGENT_ACTIVITY_ID` or
 `CODEX_THREAD_ID` when either is present. A client can also pass
@@ -172,8 +176,8 @@ reports, exports, and maintenance workflows.
 - Local project compilation into a property graph with explicit provenance.
 - Retrieval with lexical seed nodes, bounded graph expansion, and chain-aware ranking.
 - Compact `query_context`, `query_explore`, `query_graph`, and `query_memories`
-  outputs for coding-agent workflows, including bounded read plans and
-  graph-derived change chains for code edits.
+  outputs for coding-agent workflows, including owner symbols, bounded source
+  ranges, and associated test targets.
 - Separate `reql agent` working graph for agent notes, tasks, decisions,
   findings, plans, risks, and links without contaminating the standard graph.
 - Local block-file persistence with fixed-size pages, compressed records,
@@ -212,6 +216,10 @@ REQL works as a local repository index backed by a property graph:
 - queries find lexical seed nodes, expand only a bounded graph neighborhood,
   rank the resulting records, and render compact context instead of dumping the
   repository;
+- `project explain` projects technical code facts into business capabilities,
+  architectural layers, multi-evidence semantic workflows with explicit
+  `implemented_by` participants, and focus-specific change guidance without
+  persisting another graph or requiring an LLM;
 - `project update` and watch mode reuse the same incremental compiler and write
   `CompilationRun`, `GraphDelta`, and cache records for changed or deleted
   artifacts.
@@ -263,6 +271,9 @@ documentation lives under `docs/`:
 
 - [Architecture](docs/ARCHITECTURE.md): layers, storage port, compile flow,
   retrieval, maintenance, and deterministic analysis.
+- [Repository explanation](docs/REPOSITORY_EXPLANATION.md): deterministic
+  business capabilities, architecture, workflows, and change guidance derived
+  from the code graph.
 - [CLI](docs/CLI.md): command reference for compilation, retrieval, graph
   queries, exports, configuration, install helpers, and MCP startup.
 - [Configuration](docs/CONFIGURATION.md): `reql.conf`, defaults, overrides, scan rules,

@@ -2599,6 +2599,7 @@ class BlockGraphStore:
         limit: int = 100,
         order_by: str = "salience",
         descending: bool = True,
+        clone: bool = True,
     ) -> list[MemoryNode]:
         allowed_order = {"salience", "activation", "updated_at", "created_at", "confidence", "utility"}
         if order_by not in allowed_order:
@@ -2619,7 +2620,7 @@ class BlockGraphStore:
         )
         select = heapq.nlargest if descending else heapq.nsmallest
         selected = select(limit, nodes, key=lambda item: getattr(item, order_by))
-        return [self._clone_node(node) for node in selected]
+        return [self._clone_node(node) for node in selected] if clone else selected
 
     def find_nodes_by_property(
         self,
@@ -2628,7 +2629,7 @@ class BlockGraphStore:
         *,
         type_: str | None = None,
         status: str | Sequence[str] | None = None,
-        limit: int = 1000,
+        limit: int | None = 1000,
         clone: bool = True,
     ) -> list[MemoryNode]:
         statuses = {status} if isinstance(status, str) else set(status or [])
@@ -2643,7 +2644,7 @@ class BlockGraphStore:
             candidate_ids &= status_ids
         matches = [node for node_id in candidate_ids if (node := self._load_node_from_location(node_id)) is not None and node.properties.get(property_name) == value]
         matches.sort(key=lambda item: item.updated_at, reverse=True)
-        limited = matches[:limit]
+        limited = matches if limit is None else matches[:max(0, limit)]
         return [self._clone_node(node) for node in limited] if clone else limited
 
     def update_node_fields(self, node_id: str, **fields: Any) -> MemoryNode | None:
@@ -2782,7 +2783,7 @@ class BlockGraphStore:
         from_id: str | None = None,
         to_id: str | None = None,
         type_: str | Sequence[str] | None = None,
-        limit: int = 1000,
+        limit: int | None = 1000,
         clone: bool = True,
     ) -> list[MemoryEdge]:
         types = {type_} if isinstance(type_, str) else set(type_ or [])
@@ -2807,7 +2808,7 @@ class BlockGraphStore:
             ):
                 edges.append(edge)
         edges.sort(key=lambda item: item.weight, reverse=True)
-        limited = edges[:limit]
+        limited = edges if limit is None else edges[:max(0, limit)]
         return [self._clone_edge(edge) for edge in limited] if clone else limited
 
     def incident_edges(
@@ -2816,7 +2817,7 @@ class BlockGraphStore:
         *,
         edge_types: set[str] | None = None,
         ignored_edge_types: set[str] | None = None,
-        limit: int = 10000,
+        limit: int | None = 10000,
         clone: bool = True,
     ) -> list[MemoryEdge]:
         ids = set(node_ids)
@@ -2832,7 +2833,7 @@ class BlockGraphStore:
             and (ignored_edge_types is None or edge.type not in ignored_edge_types)
         ]
         edges.sort(key=lambda item: (item.weight, item.updated_at), reverse=True)
-        limited = edges[:limit]
+        limited = edges if limit is None else edges[:max(0, limit)]
         return [self._clone_edge(edge) for edge in limited] if clone else limited
 
     def find_edges_by_property(
@@ -3008,7 +3009,7 @@ class BlockGraphStore:
         self,
         text: str,
         *,
-        top_k: int = 20,
+        top_k: int | None = 20,
         node_types: set[str] | None = None,
         include_archived: bool = False,
     ) -> list[tuple[MemoryNode, float]]:
@@ -3047,7 +3048,7 @@ class BlockGraphStore:
             score = min(1.0, 0.85 * normalized + 0.15 * node.salience + 0.02 * matched_terms[node_id])
             scored.append((self._clone_node(node), score))
         scored.sort(key=lambda item: item[1], reverse=True)
-        return scored[:top_k]
+        return scored if top_k is None else scored[:max(0, top_k)]
 
     def degree(self, node_id: str, *, edge_types: set[str] | None = None) -> int:
         count = 0
@@ -3136,7 +3137,7 @@ class BlockGraphStore:
     def top_nodes_by_degree(
         self,
         *,
-        limit: int = 100,
+        limit: int | None = 100,
         node_types: set[str] | None = None,
         statuses: set[str] | None = None,
         exclude_types: set[str] | None = None,
@@ -3144,7 +3145,7 @@ class BlockGraphStore:
         project_id: str | None = None,
         include_global_project: bool = True,
     ) -> list[tuple[MemoryNode, int, float]]:
-        if limit <= 0:
+        if limit is not None and limit <= 0:
             return []
         rows: list[tuple[MemoryNode, int, float]] = []
         for node_id in set(self._nodes) | set(self._node_locations):
@@ -3173,7 +3174,7 @@ class BlockGraphStore:
                 weighted += edge.weight * edge.confidence
             rows.append((self._clone_node(node), degree, weighted))
         rows.sort(key=lambda item: (item[1], item[2], item[0].salience, item[0].updated_at), reverse=True)
-        return rows[:limit]
+        return rows if limit is None else rows[:limit]
 
     @staticmethod
     def _project_matches(properties: dict[str, Any], project_id: str | None, include_global_project: bool) -> bool:

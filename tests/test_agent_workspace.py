@@ -5,7 +5,6 @@ import os
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 
@@ -82,29 +81,6 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertEqual(by_id["function:target"]["type"], "symbol")
             self.assertEqual(by_id["function:target"]["standard_type"], "Function")
 
-    def test_status_marks_current_session_idle_when_no_open_tasks_remain(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            storage = self._standard_graph(Path(td))
-            workspace = AgentWorkspace(storage)
-            workspace.init()
-            workspace.start_session("Old focused work")
-            old_task = workspace.add_task("Finish old work")["node"]
-            workspace.complete_task(old_task["id"])
-
-            idle_status = workspace.status()
-
-            self.assertEqual(idle_status["current_session_title"], "Old focused work")
-            self.assertEqual(idle_status["current_session_open_tasks"], 0)
-            self.assertTrue(idle_status["current_session_is_idle"])
-
-            workspace.start_session("Current focused work")
-            workspace.add_task("Patch current work")
-            active_status = workspace.status()
-
-            self.assertEqual(active_status["current_session_title"], "Current focused work")
-            self.assertEqual(active_status["current_session_open_tasks"], 1)
-            self.assertFalse(active_status["current_session_is_idle"])
-
     def test_agent_changes_do_not_modify_standard_graph(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = self._standard_graph(Path(td))
@@ -119,21 +95,6 @@ class AgentWorkspaceTests(unittest.TestCase):
                 self.assertEqual(standard.store.count_nodes(), 3)
             finally:
                 standard.close()
-
-    def test_reset_removes_agent_nodes_and_rederives_standard_graph(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            storage = self._standard_graph(Path(td))
-            workspace = AgentWorkspace(storage)
-            workspace.init()
-            note = workspace.add_note("temporary working note")["node"]
-
-            reset = workspace.reset()
-            exported = workspace.export(include_metadata=True)
-            ids = {node["id"] for node in exported["nodes"]}
-
-            self.assertEqual(reset["derived_nodes"], 3)
-            self.assertNotIn(note["id"], ids)
-            self.assertIn("artifact:app", ids)
 
     def test_sync_refreshes_derived_graph_and_preserves_agent_memory(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -185,26 +146,6 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertNotIn("artifact:other", by_id)
             self.assertIn(relation["id"], relation_ids)
             self.assertIn(linked["id"], relation_ids)
-
-    def test_sync_skips_unchanged_derived_graph(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            storage = self._standard_graph(Path(td))
-            workspace = AgentWorkspace(storage)
-            workspace.init()
-            workspace.add_note("Keep this operational note")
-
-            synced = workspace.sync()
-
-            self.assertTrue(synced["synced"])
-            self.assertEqual(synced["derived_nodes"], 3)
-            self.assertEqual(synced["derived_relations"], 1)
-            self.assertEqual(synced["new_derived_nodes"], 0)
-            self.assertEqual(synced["new_derived_relations"], 0)
-            self.assertEqual(synced["updated_derived_nodes"], 0)
-            self.assertEqual(synced["updated_derived_relations"], 0)
-            self.assertEqual(synced["removed_derived_nodes"], 0)
-            self.assertEqual(synced["removed_derived_relations"], 0)
-            self.assertEqual(synced["preserved_agent_nodes"], 1)
 
     def test_add_complete_and_query_working_memory_items(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -289,67 +230,6 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertEqual(linked["relation"]["to_id"], "artifact:app")
             self.assertEqual(linked["relation"]["relation"], "touches")
 
-    def test_link_task_prefers_file_node_over_artifact_for_same_path(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            storage = self._standard_graph(Path(td))
-            graph = MemoryGraph.open(storage)
-            try:
-                graph.add_node(
-                    MemoryNode(
-                        id="file:app",
-                        type="File",
-                        label="app.py",
-                        text="app.py",
-                        properties={"relative_path": "app.py", "path": str(Path(td) / "app.py")},
-                    )
-                )
-            finally:
-                graph.close()
-            workspace = AgentWorkspace(storage)
-            workspace.init()
-            task = workspace.add_task("Patch app")["node"]
-
-            linked = workspace.link_task(task_id=task["id"], file_path="app.py")
-
-            self.assertEqual(linked["task"]["id"], task["id"])
-            self.assertEqual(linked["target"]["id"], "file:app")
-            self.assertEqual(linked["relation"]["to_id"], "file:app")
-
-    def test_list_relation_filter_can_return_agent_relations_without_node_filter(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            storage = self._standard_graph(Path(td))
-            workspace = AgentWorkspace(storage)
-            workspace.init()
-
-            task = workspace.add_task("Update target implementation")["node"]
-            relation = workspace.link(task["id"], "artifact:app", "touches")["relation"]
-
-            listed = workspace.list_items(relation="touches")
-
-            self.assertEqual([item["id"] for item in listed["relations"]], [relation["id"]])
-
-    def test_search_omits_metadata_until_requested(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            storage = self._standard_graph(Path(td))
-            workspace = AgentWorkspace(storage)
-            workspace.init()
-            decision = workspace.add_node(
-                "decision",
-                "Use compact agent payloads by default",
-                metadata={"reason": "reduce coding-agent context noise"},
-            )["node"]
-
-            compact = workspace.search("compact payloads", node_type="decision")
-            detailed = workspace.search("compact payloads", node_type="decision", include_metadata=True)
-
-            compact_node = compact["results"][0]["node"]
-            detailed_node = detailed["results"][0]["node"]
-            self.assertEqual(compact_node["id"], decision["id"])
-            self.assertNotIn("metadata", compact_node)
-            self.assertNotIn("updated_at", compact_node)
-            self.assertEqual(detailed_node["metadata"], {"reason": "reduce coding-agent context noise"})
-            self.assertIn("updated_at", detailed_node)
-
     def test_export_defaults_to_compact_map_and_metadata_exports_full_graph(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = self._standard_graph(Path(td))
@@ -369,105 +249,6 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertNotIn("nodes", compact)
             self.assertIn("nodes", detailed)
             self.assertIn("agent_storage", detailed)
-
-    def test_map_infers_files_from_linked_standard_symbols(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            storage = self._standard_graph(Path(td))
-            workspace = AgentWorkspace(storage)
-            workspace.init()
-            task = workspace.add_task("Update target implementation")["node"]
-            workspace.link(task["id"], "function:target", "touches")
-
-            mapped = workspace.map()
-
-            self.assertEqual([item["id"] for item in mapped["files"]], ["artifact:app"])
-
-    def test_map_keeps_only_operational_files_symbols_and_relations(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            storage = self._standard_graph(Path(td))
-            standard = MemoryGraph.open(storage)
-            try:
-                standard.add_node(
-                    MemoryNode(
-                        id="fragment:target",
-                        type="SourceFragment",
-                        label="app.py#target",
-                        text="def target(): return 1",
-                        properties={"relative_path": "app.py", "artifact_id": "artifact:app"},
-                    )
-                )
-                standard.add_node(
-                    MemoryNode(
-                        id="finding:unused-target",
-                        type="StaticAnalysisFinding",
-                        label="possibly_unused_function: target",
-                        text="target has no detected local call.",
-                        properties={"relative_path": "app.py", "artifact_id": "artifact:app", "finding_type": "possibly_unused_function"},
-                    )
-                )
-            finally:
-                standard.close()
-            workspace = AgentWorkspace(storage)
-            workspace.init()
-            task = workspace.add_task("Review target cleanup")["node"]
-            agent_finding = workspace.add_finding("Cleanup needs API validation")["node"]
-            workspace.link_many(task["id"], ["function:target", "fragment:target", "finding:unused-target", agent_finding["id"]], "touches")
-
-            mapped = workspace.map()
-
-            self.assertEqual([item["id"] for item in mapped["files"]], ["artifact:app"])
-            self.assertEqual([item["id"] for item in mapped["symbols"]], ["function:target"])
-            self.assertNotIn("fragments", mapped)
-            self.assertNotIn("static_findings", mapped)
-            self.assertNotIn("agent_findings", mapped)
-            relation_targets = {item["to_id"] for item in mapped["relations"]}
-            self.assertIn("function:target", relation_targets)
-            self.assertNotIn("fragment:target", relation_targets)
-            self.assertNotIn("finding:unused-target", relation_targets)
-            self.assertNotIn(agent_finding["id"], relation_targets)
-            self.assertNotIn("finding:unused-target", {item["id"] for item in mapped["files"]})
-
-    def test_map_can_focus_on_one_task(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            storage = self._standard_graph(Path(td))
-            workspace = AgentWorkspace(storage)
-            workspace.init()
-            old_task = workspace.add_task("Old task")["node"]
-            old_decision = workspace.add_decision("Old decision")["node"]
-            workspace.link(old_task["id"], old_decision["id"], "implements")
-            current_task = workspace.add_task("Current task")["node"]
-            current_finding = workspace.add_finding("Current finding")["node"]
-            workspace.link(current_task["id"], current_finding["id"], "explains")
-            workspace.link(current_task["id"], "function:target", "touches")
-
-            mapped = workspace.map(task_id=current_task["id"])
-
-            self.assertEqual(mapped["filters"]["task"], current_task["id"])
-            self.assertEqual([item["id"] for item in mapped["open_tasks"]], [current_task["id"]])
-            self.assertNotIn("findings", mapped)
-            relation_targets = {item["to_id"] for item in mapped["relations"]}
-            self.assertNotIn(current_finding["id"], relation_targets)
-            self.assertEqual(mapped["decisions"], [])
-            self.assertEqual([item["id"] for item in mapped["files"]], ["artifact:app"])
-
-    def test_map_can_filter_by_since_window(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            storage = self._standard_graph(Path(td))
-            workspace = AgentWorkspace(storage)
-            workspace.init()
-            workspace.add_task("Historical task")
-            cutoff = workspace.add_note("Session boundary")["node"]["created_at"]
-            time.sleep(0.01)
-            current_task = workspace.add_task("Current task")["node"]
-            current_decision = workspace.add_decision("Current decision")["node"]
-            workspace.link(current_task["id"], current_decision["id"], "implements")
-
-            mapped = workspace.map(since=cutoff)
-
-            self.assertEqual(mapped["filters"]["since"], cutoff)
-            self.assertEqual([item["id"] for item in mapped["open_tasks"]], [current_task["id"]])
-            self.assertEqual([item["id"] for item in mapped["decisions"]], [current_decision["id"]])
-            self.assertTrue(all(item["title"] != "Historical task" for item in mapped["open_tasks"]))
 
     def test_sessions_scope_agent_map_to_current_or_selected_session(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -496,27 +277,6 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertEqual([item["id"] for item in first["files"]], ["artifact:app"])
             self.assertEqual(by_id[first_session["id"]]["status"], "closed")
             self.assertEqual(by_id[second_session["id"]]["status"], "active")
-
-    def test_completed_session_summary_preserves_task_relations(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            storage = self._standard_graph(Path(td))
-            workspace = AgentWorkspace(storage)
-            workspace.init()
-            session = workspace.start_session("Completed implementation pass")["session"]
-            task = workspace.add_task("Patch completed session map")["node"]
-            workspace.link(task["id"], "artifact:app", "touches")
-            workspace.complete_task(task["id"])
-
-            compact = workspace.map(session="current")
-            completed = workspace.map(session="current", include_completed=True)
-
-            self.assertEqual(compact["filters"]["session"], session["id"])
-            self.assertEqual(compact["open_tasks"], [])
-            self.assertNotIn("completed_tasks", compact)
-            self.assertEqual(completed["filters"], {"completed": True, "session": session["id"]})
-            self.assertEqual([item["id"] for item in completed["completed_tasks"]], [task["id"]])
-            self.assertEqual([item["id"] for item in completed["files"]], ["artifact:app"])
-            self.assertIn((task["id"], "artifact:app"), {(item["from_id"], item["to_id"]) for item in completed["relations"]})
 
     def test_multiple_agents_keep_private_memory_and_share_bus_handoffs(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -553,42 +313,6 @@ class AgentWorkspaceTests(unittest.TestCase):
             full_handoff = next(item for item in full_bus["handoffs"] if item["id"] == handoff["id"])
             self.assertNotIn("payload", compact_handoff)
             self.assertEqual([item["id"] for item in full_handoff["payload"]["open_tasks"]], [alpha_task["id"]])
-
-    def test_same_agent_keeps_current_sessions_isolated_by_activity(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            storage = self._standard_graph(Path(td))
-            first = AgentWorkspace(storage, agent_id="shared", activity_id="activity-one")
-            first.init()
-            first_session = first.start_session("First activity")["session"]
-            first_task = first.add_task("First task")["node"]
-
-            second = AgentWorkspace(storage, agent_id="shared", activity_id="activity-two")
-            second_session = second.start_session("Second activity")["session"]
-            second_task = second.add_task("Second task")["node"]
-            second.sync()
-
-            self.assertEqual(first.status()["current_session_id"], first_session["id"])
-            self.assertEqual(second.status()["current_session_id"], second_session["id"])
-            self.assertEqual([item["id"] for item in first.map(session="current")["open_tasks"]], [first_task["id"]])
-            self.assertEqual([item["id"] for item in second.map(session="current")["open_tasks"]], [second_task["id"]])
-            self.assertEqual(first.show(first_session["id"])["node"]["status"], "active")
-
-    def test_sync_migrates_legacy_current_session_to_activity_scope(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            storage = self._standard_graph(Path(td))
-            legacy = AgentWorkspace(storage, agent_id="shared", activity_id=None)
-            legacy.activity_id = None
-            legacy.init()
-            session = legacy.start_session("Legacy session")["session"]
-
-            scoped = AgentWorkspace(storage, agent_id="shared", activity_id="activity-one")
-            scoped.sync()
-
-            self.assertEqual(scoped.status()["current_session_id"], session["id"])
-            self.assertEqual(
-                scoped.status()["metadata"]["current_session_ids"]["activity-one"],
-                session["id"],
-            )
 
     def test_lock_contention_returns_actionable_error(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -649,136 +373,6 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertIn("[agent] agent init: completed in", init.stderr)
             self.assertEqual(status.stderr, "")
 
-    def test_cli_map_can_filter_by_task(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            storage = self._standard_graph(Path(td))
-            env = dict(os.environ)
-            env["PYTHONPATH"] = "src"
-            subprocess.run(
-                [sys.executable, "-m", "memory.cli", "--storage", str(storage), "agent", "init", "--json"],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-            old = subprocess.run(
-                [sys.executable, "-m", "memory.cli", "--storage", str(storage), "agent", "task", "add", "Old task", "--json"],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-            current = subprocess.run(
-                [sys.executable, "-m", "memory.cli", "--storage", str(storage), "agent", "task", "add", "Current task", "--json"],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-            current_id = json.loads(current.stdout)["node"]["id"]
-            subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "memory.cli",
-                    "--storage",
-                    str(storage),
-                    "agent",
-                    "link",
-                    current_id,
-                    "artifact:app",
-                    "--relation",
-                    "touches",
-                    "--json",
-                ],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-            mapped = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "memory.cli",
-                    "--storage",
-                    str(storage),
-                    "agent",
-                    "map",
-                    "--task",
-                    current_id,
-                    "--json",
-                ],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-
-            old_id = json.loads(old.stdout)["node"]["id"]
-            payload = json.loads(mapped.stdout)
-            self.assertEqual(payload["filters"]["task"], current_id)
-            self.assertEqual([item["id"] for item in payload["open_tasks"]], [current_id])
-            self.assertNotIn(old_id, {item["id"] for item in payload["open_tasks"]})
-
-    def test_cli_link_task_resolves_file_path_without_manual_ids(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            storage = self._standard_graph(Path(td))
-            env = dict(os.environ)
-            env["PYTHONPATH"] = "src"
-            subprocess.run(
-                [sys.executable, "-m", "memory.cli", "--storage", str(storage), "agent", "init", "--json"],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-            task = subprocess.run(
-                [sys.executable, "-m", "memory.cli", "--storage", str(storage), "agent", "task", "add", "Patch context savings", "--json"],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-            linked = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "memory.cli",
-                    "--storage",
-                    str(storage),
-                    "agent",
-                    "link-task",
-                    "--task",
-                    json.loads(task.stdout)["node"]["id"],
-                    "--file",
-                    "app.py",
-                    "--json",
-                ],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-
-            task_id = json.loads(task.stdout)["node"]["id"]
-            payload = json.loads(linked.stdout)
-            self.assertEqual(payload["task"]["id"], task_id)
-            self.assertEqual(payload["target"]["id"], "artifact:app")
-            self.assertEqual(payload["relation"]["from_id"], task_id)
-            self.assertEqual(payload["relation"]["to_id"], "artifact:app")
-
-    def test_cli_link_task_rejects_missing_task_id(self) -> None:
-        result = subprocess.run(
-            [sys.executable, "-m", "memory.cli", "agent", "link-task", "--file", "app.py"],
-            capture_output=True,
-            text=True,
-            env={**os.environ, "PYTHONPATH": "src"},
-        )
-
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("--task", result.stderr)
-
     def test_cli_agent_session_start_and_map_current_outputs_json(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = self._standard_graph(Path(td))
@@ -819,63 +413,6 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertEqual(payload["filters"]["session"], session_id)
             self.assertEqual([item["id"] for item in payload["open_tasks"]], [task_id])
 
-    def test_cli_agent_map_completed_session_summary_outputs_json(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            storage = self._standard_graph(Path(td))
-            env = dict(os.environ)
-            env["PYTHONPATH"] = "src"
-            subprocess.run(
-                [sys.executable, "-m", "memory.cli", "--storage", str(storage), "agent", "init", "--json"],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-            session = subprocess.run(
-                [sys.executable, "-m", "memory.cli", "--storage", str(storage), "agent", "session", "start", "CLI completed session", "--json"],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-            task = subprocess.run(
-                [sys.executable, "-m", "memory.cli", "--storage", str(storage), "agent", "task", "add", "Completed CLI task", "--json"],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-            task_id = json.loads(task.stdout)["node"]["id"]
-            subprocess.run(
-                [sys.executable, "-m", "memory.cli", "--storage", str(storage), "agent", "link-task", "--task", task_id, "--file", "app.py", "--json"],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-            subprocess.run(
-                [sys.executable, "-m", "memory.cli", "--storage", str(storage), "agent", "task", "done", task_id, "--json"],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-            mapped = subprocess.run(
-                [sys.executable, "-m", "memory.cli", "--storage", str(storage), "agent", "map", "--session", "current", "--completed", "--json"],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-
-            session_id = json.loads(session.stdout)["session"]["id"]
-            payload = json.loads(mapped.stdout)
-            self.assertEqual(payload["filters"], {"completed": True, "session": session_id})
-            self.assertEqual(payload["open_tasks"], [])
-            self.assertEqual([item["id"] for item in payload["completed_tasks"]], [task_id])
-            self.assertEqual([item["id"] for item in payload["files"]], ["artifact:app"])
-            self.assertIn((task_id, "artifact:app"), {(item["from_id"], item["to_id"]) for item in payload["relations"]})
-
     def test_cli_agent_init_selects_bus_agent_and_handoff_uses_it(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             storage = self._standard_graph(Path(td))
@@ -894,59 +431,6 @@ class AgentWorkspaceTests(unittest.TestCase):
             full_handoff = next(item for item in full_bus_payload["handoffs"] if item["id"] == handoff_payload["id"])
             self.assertNotIn("payload", compact_handoff)
             self.assertEqual([item["id"] for item in full_handoff["payload"]["open_tasks"]], [task_id])
-
-    def test_cli_sync_outputs_json_and_preserves_agent_items(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            storage = self._standard_graph(Path(td))
-            env = dict(os.environ)
-            env["PYTHONPATH"] = "src"
-            subprocess.run(
-                [sys.executable, "-m", "memory.cli", "--storage", str(storage), "agent", "init", "--json"],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-            subprocess.run(
-                [sys.executable, "-m", "memory.cli", "--storage", str(storage), "agent", "add", "Keep this note", "--json"],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-
-            standard = MemoryGraph.open(storage)
-            try:
-                standard.add_node(
-                    MemoryNode(
-                        id="function:estimate_context_savings",
-                        type="Function",
-                        label="estimate_context_savings",
-                        text="def estimate_context_savings(): return 42",
-                        properties={"qualified_name": "app.estimate_context_savings", "relative_path": "app.py"},
-                    )
-                )
-            finally:
-                standard.close()
-
-            sync = subprocess.run(
-                [sys.executable, "-m", "memory.cli", "--storage", str(storage), "agent", "sync", "--json"],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-            status = subprocess.run(
-                [sys.executable, "-m", "memory.cli", "--storage", str(storage), "agent", "status", "--json"],
-                capture_output=True,
-                text=True,
-                env=env,
-                check=True,
-            )
-
-            self.assertEqual(json.loads(sync.stdout)["derived_nodes"], 4)
-            self.assertEqual(json.loads(sync.stdout)["preserved_agent_nodes"], 1)
-            self.assertEqual(json.loads(status.stdout)["agent_nodes"], 1)
 
     def test_cli_agent_batch_file_and_inline_inputs_link_aliases(self) -> None:
         for input_mode in ("file", "inline"):

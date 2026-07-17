@@ -132,6 +132,11 @@ available. Use `reql query_context --code --json` or `reql query_context
 --cleanup --json` when another tool should consume the compact payload directly;
 payloads include `query_mode`, `scopes`, `cleanup_filter`, `owner_candidates`,
 `cleanup_candidates`, `working_set`, and `targeted_reads`.
+For `--docs`, document concepts are ranked against their strongest bounded
+evidence excerpt. Raw ingestion events remain hidden, repeated broad excerpts
+are deduplicated, weak results from unrelated documents are dropped relative to
+the strongest match, and confidence is calculated from the results actually
+returned to the caller.
 For small code working sets, informative code context can also embed exact
 `SourceFragment` snippets when a source fragment strongly matches the query
 phrase; this keeps phrase-level hits, such as UI labels inside PHP templates,

@@ -30,6 +30,7 @@ from memory.artifacts.fingerprint import normalize_relative_lookup_path
 from memory.services.incremental_compilation import CompileProjectResult, IncrementalCompilationService
 from memory.services.project_watch import ProjectWatchEvent, ProjectWatchService
 from memory.services.retrieval import RetrievalEngine
+from memory.explanation import RepositoryExplanation, RepositoryExplanationService
 
 
 MemoryGraphT = TypeVar("MemoryGraphT", bound="MemoryGraph")
@@ -73,6 +74,7 @@ class MemoryGraph:
         self.project_reporter = ProjectReportGenerator(store)
         self.projects = ProjectRegistry(store)
         self.revisions = RevisionRepository(store)
+        self.repository_explainer = RepositoryExplanationService(store)
         self.incremental = IncrementalCompilationService(
             store,
             compiler=ArtifactCompiler(),
@@ -379,6 +381,29 @@ class MemoryGraph:
 
     def project_status(self, path: str | Path) -> dict[str, Any] | None:
         return self.projects.project_status(path)
+
+    def explain_project(
+        self,
+        path: str | Path,
+        *,
+        focus: str | None = None,
+        max_capabilities: int = 12,
+        max_workflows: int = 8,
+    ) -> RepositoryExplanation:
+        """Return a deterministic business-oriented explanation of a project."""
+
+        status = self.projects.project_status(path)
+        if status is None:
+            raise ValueError(f"Project not found: {path}")
+        project = self.store.get_node(str(status["project"]["id"]), clone=False)
+        if project is None:
+            raise ValueError(f"Project not found: {path}")
+        return self.repository_explainer.explain(
+            project,
+            focus=focus,
+            max_capabilities=max_capabilities,
+            max_workflows=max_workflows,
+        )
 
     def project_history(self, path: str | Path, *, limit: int = 20) -> list[ProjectRevision]:
         """Return newest-first immutable revisions for a registered project."""

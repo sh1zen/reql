@@ -94,7 +94,7 @@ def _print_compile_result(result: Any) -> None:
 
 def _print_compile_summary(summary: Any, *, limit: int = 20) -> None:
     changed_files = summary.changed_files
-    updated_symbols = summary.updated_symbols
+    changed_symbols = summary.updated_symbols
     associated_tests = summary.associated_tests
     print("Summary:")
     print(f"  Changed files ({len(changed_files)}):")
@@ -102,14 +102,14 @@ def _print_compile_summary(summary: Any, *, limit: int = 20) -> None:
         print(f"    {str(item.get('status') or 'changed'):8} {item.get('path')}")
     if len(changed_files) > limit:
         print(f"    ... {len(changed_files) - limit} more")
-    print(f"  Updated symbols ({len(updated_symbols)}):")
-    for item in updated_symbols[:limit]:
+    print(f"  Changed symbols ({len(changed_symbols)}):")
+    for item in changed_symbols[:limit]:
         location = item.relative_path
         if item.line_start is not None:
             location = f"{location}:{item.line_start}"
         print(f"    {item.status:8} {item.type} {item.name} @ {location}")
-    if len(updated_symbols) > limit:
-        print(f"    ... {len(updated_symbols) - limit} more")
+    if len(changed_symbols) > limit:
+        print(f"    ... {len(changed_symbols) - limit} more")
     print(f"  Associated tests ({len(associated_tests)}):")
     for item in associated_tests[:limit]:
         print(f"    {item.path} ({item.reason})")
@@ -325,6 +325,54 @@ def _print_storage_locks(payload: dict[str, Any]) -> None:
         print(f"Snapshot command: {payload['snapshot_hint']}")
 
 
+def _project_watch_status(storage_path: str | Path, project_path: str | Path) -> dict[str, Any]:
+    locks = inspect_store_locks(Path(storage_path))
+    writer = locks.get("writer")
+    watcher = writer if isinstance(writer, dict) and bool(writer.get("watcher")) else None
+    process_alive = watcher.get("process_alive") if watcher is not None else None
+    stale = bool(watcher.get("stale")) if watcher is not None else False
+    if watcher is None:
+        status = "stopped"
+        running: bool | None = False
+    elif stale or process_alive is False:
+        status = "stale"
+        running = False
+    elif process_alive is True:
+        status = "running"
+        running = True
+    else:
+        status = "unknown"
+        running = None
+    return {
+        "status": status,
+        "running": running,
+        "project_path": str(Path(project_path).expanduser().resolve(strict=False)),
+        "storage_path": str(Path(storage_path).expanduser().resolve(strict=False)),
+        "pid": watcher.get("pid") if watcher is not None else None,
+        "host": watcher.get("host") if watcher is not None else None,
+        "process_alive": process_alive,
+        "started_at": watcher.get("created_at") if watcher is not None else None,
+        "duration_seconds": watcher.get("duration_seconds") if watcher is not None else None,
+        "command": watcher.get("command") if watcher is not None else None,
+        "stale": stale,
+        "blocked_by_other_writer": writer is not None and watcher is None,
+    }
+
+
+def _print_project_watch_status(payload: dict[str, Any]) -> None:
+    print(f"Watcher: {payload['status']}")
+    print(f"Project: {payload['project_path']}")
+    print(f"Storage: {payload['storage_path']}")
+    if payload.get("pid") is not None:
+        print(f"PID: {payload['pid']}")
+        print(f"Process alive: {payload.get('process_alive')}")
+        print(f"Started: {payload.get('started_at') or 'unknown'}")
+        print(f"Duration: {float(payload.get('duration_seconds') or 0.0):.3f}s")
+        print(f"Command: {payload.get('command') or 'unknown'}")
+    elif payload.get("blocked_by_other_writer"):
+        print("Writer active: yes (not a watcher)")
+
+
 def _print_storage_compaction(payload: dict[str, Any]) -> None:
     print(f"Compacted: {payload['path']}")
     print(f"Generation: {payload['generation_id_before']} -> {payload['generation_id_after']}")
@@ -530,7 +578,7 @@ def _query_requires_write(args: argparse.Namespace) -> bool:
 def _is_read_only_command(args: argparse.Namespace) -> bool:
     command = str(getattr(args, "command", ""))
     if command == "project":
-        return str(getattr(args, "project_command", "")) in {"status", "history", "diff"}
+        return str(getattr(args, "project_command", "")) in {"status", "watch-status", "history", "diff", "explain"}
     return command in _READ_ONLY_COMMANDS and not _query_requires_write(args)
 
 
@@ -949,7 +997,7 @@ def build_parser() -> argparse.ArgumentParser:
     config_init = config_sub.add_parser("init", help="Create a sample reql.conf if absent")
     config_init.add_argument("--path", default=PROJECT_CONFIG_FILENAME, help="Target project config file path")
 
-    project = sub.add_parser("project", help="Project commands: compile, update, status, history, diff, report, exclude")
+    project = sub.add_parser("project", help="Project commands: compile, update, status, explain, watch-status, history, diff, report, exclude")
     project_sub = project.add_subparsers(dest="project_command", required=True)
 
     project_compile = project_sub.add_parser("compile", help="Scan and incrementally compile dirty artifacts")
@@ -967,6 +1015,17 @@ def build_parser() -> argparse.ArgumentParser:
     project_status = project_sub.add_parser("status", help="Show registered project artifact status")
     project_status.add_argument("path")
     project_status.add_argument("--json", action="store_true", help="Print structured JSON result")
+
+    project_explain = project_sub.add_parser("explain", help="Explain repository capabilities, architecture, workflows, and change starting points")
+    project_explain.add_argument("path", nargs="?", default=".", help="Registered project path; defaults to the current working directory")
+    project_explain.add_argument("--focus", default=None, help="Feature, behavior, or business concept used to rank change guidance")
+    project_explain.add_argument("--max-capabilities", type=int, default=12, help="Maximum business capabilities to return")
+    project_explain.add_argument("--max-workflows", type=int, default=8, help="Maximum inferred workflows to return")
+    project_explain.add_argument("--json", action="store_true", help="Print structured JSON result")
+
+    project_watch_status = project_sub.add_parser("watch-status", help="Check watcher liveness without opening the graph")
+    project_watch_status.add_argument("path", nargs="?", default=".", help="Project path; defaults to the current working directory")
+    project_watch_status.add_argument("--json", action="store_true", help="Print structured JSON result")
 
     project_history = project_sub.add_parser("history", help="Show newest-first content-addressed project revisions")
     project_history.add_argument("path", nargs="?", default=".", help="Registered project path; defaults to the current working directory")
@@ -1332,6 +1391,14 @@ def _main(argv: list[str] | None = None) -> int:
             _print_json(config.to_dict())
             return 0
 
+    if args.command == "project" and args.project_command == "watch-status":
+        payload = _project_watch_status(args.storage, args.path)
+        if args.json:
+            _print_json(payload)
+        else:
+            _print_project_watch_status(payload)
+        return 0
+
     if args.command == "agent":
         from memory.agent import AgentWorkspace
 
@@ -1653,6 +1720,22 @@ def _main(argv: list[str] | None = None) -> int:
                             f"{revision.id}\t{revision.created_at}\t"
                             f"files={len(revision.changes)}\tparent={revision.parent_id or '-'}"
                         )
+                return 0
+            if args.project_command == "explain":
+                try:
+                    explanation = graph.explain_project(
+                        args.path,
+                        focus=args.focus,
+                        max_capabilities=args.max_capabilities,
+                        max_workflows=args.max_workflows,
+                    )
+                except ValueError as exc:
+                    print(str(exc), file=sys.stderr)
+                    return 2
+                if args.json:
+                    _print_json(explanation.to_dict())
+                else:
+                    print(explanation.to_markdown())
                 return 0
             if args.project_command == "diff":
                 status = graph.project_status(args.path)

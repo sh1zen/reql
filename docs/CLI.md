@@ -14,6 +14,7 @@ reql project compile . --watch
 reql cache status .
 reql project history . --limit 5
 reql project diff .
+reql project explain . --focus "payment workflow"
 
 # Retrieve context
 reql query_context --query "payment service"
@@ -36,7 +37,6 @@ reql agent decision add "Reuse the existing graph store"
 reql agent link TASK_ID NODE_ID --relation touches
 reql agent link-many TASK_ID NODE_ID OTHER_NODE_ID --relation implements
 reql agent batch --json agent-ops.json
-reql agent map --session current
 reql agent handoff "Serializer cleanup ready for review"
 reql agent export --json
 reql agent export --json --metadata
@@ -58,6 +58,30 @@ reql install codex --user
 reql uninstall codex,claude
 reql-mcp --read-only
 ```
+
+## Repository Explanation
+
+```bash
+reql project explain .
+reql project explain . --focus "payment retries"
+reql project explain . --focus "payment retries" --max-capabilities 8 --max-workflows 4 --json
+```
+
+`project explain` reads an already compiled project and returns a
+business-oriented view of its code:
+
+- capabilities inferred from cohesive module and symbol ownership;
+- interface, application, domain, core, and infrastructure layers;
+- semantic workflows with intent, trigger, inputs, outputs, invariants, explicit
+  `implemented_by` participants, and corroborating graph/document evidence;
+- code owners, primary paths, dependencies, and associated tests;
+- focus-specific starting points for planning a change.
+
+The command is read-only. It computes the view on demand from deterministic
+graph facts and does not create capability nodes or require model calls. Use
+`--json` for the versioned structured payload or omit it for Markdown. Focus
+ranks workflow candidates but does not create triggers. If the project is
+missing, run `reql project compile .` first.
 
 ## Entry Points
 
@@ -143,7 +167,7 @@ reql agent finding add "agent commands should run before opening the main graph 
 reql agent decision add "Store the working graph in .reql/agent.reql"
 ```
 
-The agent creates a task map and links work to standard graph references. IDs
+The agent creates a task graph and links work to standard graph references. IDs
 printed by retrieval, `inspect`, or `agent list` can be used directly:
 
 ```bash
@@ -152,18 +176,23 @@ reql agent link TASK_ID artifact:app --relation touches
 reql agent link-task --task TASK_ID --file src/memory/cli.py
 reql agent link TASK_ID DECISION_ID --relation implements
 reql agent link-many TASK_ID artifact:app function:target --relation touches
+```
+
+`agent session start "TITLE"` starts a new current working session and closes
+the previous current session. New notes, tasks, decisions, findings, and agent
+links are tagged with that session. Do not print `agent map` during normal
+planning, editing, or verification; the active model already holds that state.
+Use it only after context loss, compaction, a handoff, or a long pause:
+
+```bash
 reql agent map
 reql agent map --session current
 reql agent map --task TASK_ID
 reql agent map --since 2026-06-29T12:00:00+00:00
 ```
 
-`agent session start "TITLE"` starts a new current working session and closes
-the previous current session. New notes, tasks, decisions, findings, and agent
-links are tagged with that session. `agent map --session current` shows only
-the current session's working set, which is useful when the Agent Workspace has
-older task history that should not dominate the map. You can also pass a
-session id to inspect an earlier session.
+`agent map --session current` limits recovery to the current session. You can
+also pass a session id to recover an earlier session.
 
 `agent link-task --task TASK_ID --file PATH` resolves a compiled file by
 readable path and links it to the explicitly selected open task. Requiring the
@@ -233,16 +262,16 @@ worker's private store directly.
 
 `agent list` keeps relation output focused on agent-created relations and,
 when node filters are present, relations connected to the listed nodes.
-`agent map` reports a compact operational working set: open tasks, agent
+For recovery only, `agent map` reports a compact operational working set: open tasks, agent
 decisions, files, symbols, and essential relations. The `files` section
 contains actual file artifacts or inferred file payloads. It intentionally
 skips findings, fragments, timestamps, storage paths, and raw metadata unless a
 command explicitly requests metadata.
-Use `agent map --task TASK_ID` to focus on one task and agent items connected
-to it by agent-created relations. Use `agent map --session current` to focus on
+Use `agent map --task TASK_ID` to recover one task and agent items connected
+to it by agent-created relations. Use `agent map --session current` to recover
 the current working session without remembering a task id. Use `agent map
---session current --completed` after closing tasks to produce a completed
-session summary that keeps completed tasks and their operational relations.
+--session current --completed` only when recovering a completed session and its
+operational relations.
 Use `agent map --since TIMESTAMP` to show only agent items or relations updated
 inside a time window. If another process holds the agent store lock, commands
 retry briefly and then report that the Agent Workspace is busy, including the
@@ -255,9 +284,10 @@ as late but final, so a slow storage open is not mistaken for an unfinished
 operation. JSON remains isolated on stdout. Use `reql agent --no-progress
 COMMAND ...` when a caller requires silent stderr.
 
-Use `agent map --metadata`, `agent search --metadata`, or `agent export
---metadata` only when a coding agent needs timestamps, source fields, storage
-paths, stored metadata, or the full workspace graph.
+During recovery, use `agent map --metadata` only when timestamps, source fields,
+storage paths, or stored metadata are necessary. `agent search --metadata` and
+`agent export --metadata` expose the equivalent detailed fields for their own
+workflows.
 
 After `reql project compile .` updates the standard graph, refresh the Agent
 Workspace references without deleting agent-created notes, tasks, decisions,
@@ -459,14 +489,14 @@ By default, installs write project-local files such as
 `.agents/skills/reql-agent/SKILL.md`, and agent-specific skill/rule
 directories. `reql-agent` covers compile/query/report/update workflows for the
 standard project graph and Agent Workspace commands such as `reql agent init`,
-`agent task add`, `agent link`, `agent map`, `agent export --json`, and
+`agent task add`, `agent link`, recovery via `agent map`, `agent export --json`, and
 `agent reset`. Pass `--project-dir` to target another project root. Pass
 `--user` to write to matching assistant profiles under the home directory.
 
-Generated skills keep the main workflow intentionally compact: bootstrap,
-bounded retrieval, raw-read limits, graph refresh, and the optional Agent
-Workspace lifecycle appear once. Detailed command variants live in routed
-`references/` files and are loaded only for the relevant task. Platform rules
+Generated `SKILL.md` files keep a 20–30 line fast path for status, bounded
+retrieval, targeted reads, edits, tests, and routing. Bootstrap, query variants,
+graph refresh, reports, documents, and Agent Workspace guidance live only in
+routed `references/` files and are loaded when that situation occurs. Platform rules
 for Cursor, Copilot, Kilo, and shared instruction files are rendered from the
 same canonical rule set so their behavior does not drift or repeat.
 
@@ -617,6 +647,7 @@ symbols, communities, hubs, and memory health.
 ```bash
 reql project compile .
 reql project update .
+reql project watch-status .
 reql cache status .
 reql cache clear .
 reql query "DELTAS LIMIT 10"
@@ -641,6 +672,13 @@ scan.
 Compile mode applies built-in default ignore rules for dependency, VCS, cache,
 build-output, and local database paths, then applies configured
 include/exclude patterns and file-size limits.
+
+`project watch-status [PATH]` checks the watcher lock directly without opening
+the graph, so it remains usable while monitor mode owns the write lock. It
+reports `running`, `stopped`, `stale`, or `unknown`, plus PID, process liveness,
+start time, duration, and command when available. Add `--json` for automation;
+when monitor mode uses an explicit global `--storage`, pass the same option to
+`watch-status`.
 
 Use `project compile . --watch` from the working directory while Codex, Claude, or
 another coding agent is actively changing files. The watcher uses Python

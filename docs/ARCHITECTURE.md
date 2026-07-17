@@ -97,6 +97,24 @@ context instead of dumping the full store. Lower-level source fragments can
 contribute evidence and surrounding text, but query semantics operate over the
 higher-level code graph.
 
+## Repository Explanation
+
+`memory.explanation.RepositoryExplanationService` is a read-only projection
+over the compiled technical graph. It groups modules and high-signal symbols
+into business capabilities, assigns architectural roles, builds semantic
+workflow entities from corroborating call, dependency, structure, convention,
+signature, and documentation evidence, and ranks code starting points for an
+optional focus phrase.
+
+The projection is computed on demand by `MemoryGraph.explain_project` and
+`reql project explain`. It does not persist inferred capability or workflow
+nodes, does not mutate graph metrics, and does not require an LLM. Every owner,
+workflow participant, workflow evidence item, and change starting point retains
+a node id and source location. Workflow participants are exposed through
+`implemented_by` relations rather than an invented linear call path. This keeps
+the business view explainable while allowing the underlying code graph to
+remain the single source of truth.
+
 ## Maintenance
 
 ```text

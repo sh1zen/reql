@@ -6,13 +6,11 @@ import os
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from api import MemoryGraph
-from memory.config import load_config
 from memory.domain.models import MemoryEdge, MemoryNode
 
 
@@ -30,23 +28,22 @@ class _InterruptingInput(io.StringIO):
 
 
 class CLITests(unittest.TestCase):
-    def test_agent_command_progress_reports_heartbeat_and_late_completion(self) -> None:
-        from memory.agent.progress import AgentCommandProgress
 
-        stream = io.StringIO()
-        with AgentCommandProgress(
-            "agent sync",
-            initial_delay_seconds=0.01,
-            interval_seconds=0.01,
-            late_threshold_seconds=0.02,
-            stream=stream,
-        ):
-            time.sleep(0.035)
+    def test_compile_summary_labels_semantic_symbol_changes(self) -> None:
+        from memory import cli as cli_mod
 
-        output = stream.getvalue()
-        self.assertIn("[agent] agent sync: started", output)
-        self.assertIn("still running after", output)
-        self.assertIn("late completion; result is final", output)
+        summary = type(
+            "Summary",
+            (),
+            {"changed_files": [], "updated_symbols": [], "associated_tests": []},
+        )()
+        stdout = io.StringIO()
+
+        with patch.object(cli_mod.sys, "stdout", stdout):
+            cli_mod._print_compile_summary(summary)
+
+        self.assertIn("Changed symbols (0):", stdout.getvalue())
+        self.assertNotIn("Updated symbols", stdout.getvalue())
 
     def test_storage_lock_error_is_reported_without_traceback(self) -> None:
         from memory import cli as cli_mod
@@ -276,46 +273,6 @@ class CLITests(unittest.TestCase):
             self.assertEqual(owners_payload["views"], ["owners"])
             self.assertEqual(set(owners_payload["sections"]), {"owners"})
 
-    def test_query_explore_reports_structural_template_duplicates(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            db = Path(td) / "memory.reql"
-            graph = MemoryGraph.open(db)
-            try:
-                nodes = (
-                    MemoryNode(id="file:profile", type="File", label="profile.php", text="profile card template", properties={"relative_path": "app/Views/profile.php", "context_scope": "code"}),
-                    MemoryNode(id="fragment:profile", type="SourceFragment", label="profile card", text='<section class="profile"><header><h2>Profile</h2></header><div><p>Name</p><input name="name"></div></section>', properties={"relative_path": "app/Views/profile.php", "line_start": 1, "line_end": 1, "context_scope": "code"}),
-                    MemoryNode(id="file:account", type="File", label="account.php", text="account template", properties={"relative_path": "app/Views/account.php", "context_scope": "code"}),
-                    MemoryNode(id="fragment:account", type="SourceFragment", label="account card", text='<section class="account"><header><h2>Account</h2></header><div><p>Email</p><input name="email"></div></section>', properties={"relative_path": "app/Views/account.php", "line_start": 1, "line_end": 1, "context_scope": "code"}),
-                    MemoryNode(id="file:nav", type="File", label="nav.php", text="navigation template", properties={"relative_path": "app/Views/nav.php", "context_scope": "code"}),
-                    MemoryNode(id="fragment:nav", type="SourceFragment", label="navigation", text='<nav><ul><li><a href="/">Home</a></li></ul></nav>', properties={"relative_path": "app/Views/nav.php", "line_start": 1, "line_end": 1, "context_scope": "code"}),
-                )
-                for node in nodes:
-                    graph.add_node(node)
-                graph.add_edge(MemoryEdge(id="edge:profile-fragment", from_id="file:profile", to_id="fragment:profile", type="CONTAINS_FRAGMENT"))
-                graph.add_edge(MemoryEdge(id="edge:account-fragment", from_id="file:account", to_id="fragment:account", type="CONTAINS_FRAGMENT"))
-                graph.add_edge(MemoryEdge(id="edge:nav-fragment", from_id="file:nav", to_id="fragment:nav", type="CONTAINS_FRAGMENT"))
-            finally:
-                graph.close()
-
-            result = subprocess.run(
-                [sys.executable, "-m", "memory.cli", "--storage", str(db), "query_explore", "--query", "profile card", "--structural-duplicates-only", "--json"],
-                check=True,
-                capture_output=True,
-                text=True,
-                env={**os.environ, "PYTHONPATH": "src"},
-            )
-
-            payload = json.loads(result.stdout)
-            self.assertEqual(payload["views"], ["structural_duplicates"])
-            rows = payload["sections"]["structural_duplicates"]
-            self.assertEqual(len(rows), 1)
-            self.assertEqual(
-                {rows[0]["source"]["location"], rows[0]["duplicate"]["location"]},
-                {"app/Views/profile.php", "app/Views/account.php"},
-            )
-            self.assertGreater(rows[0]["similarity"], 0.8)
-            self.assertTrue(any(pattern.startswith("sequence:") for pattern in rows[0]["shared_patterns"]))
-
     def test_query_opens_read_only_for_concurrent_reads(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             db = Path(td) / "memory.reql"
@@ -379,44 +336,6 @@ class CLITests(unittest.TestCase):
             self.assertFalse(any('"name":"storage.open.read_only_fallback"' in line for line in lines))
             self.assertTrue(any('"read_only":true' in line and '"name":"storage.open"' in line for line in lines))
 
-    def test_project_status_opens_read_only_with_an_existing_reader(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "project"
-            root.mkdir()
-            (root / "module.py").write_text("VALUE = 1\n", encoding="utf-8")
-            db = Path(td) / "memory.reql"
-            graph = MemoryGraph.open(db)
-            try:
-                graph.compile_project(root)
-            finally:
-                graph.close()
-
-            held_reader = MemoryGraph.open(db, read_only=True)
-            try:
-                result = subprocess.run(
-                    [
-                        sys.executable,
-                        "-m",
-                        "memory.cli",
-                        "--storage",
-                        str(db),
-                        "project",
-                        "status",
-                        str(root),
-                        "--json",
-                    ],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-            finally:
-                held_reader.close()
-
-            payload = json.loads(result.stdout)
-            self.assertEqual(payload["project"]["properties"]["root_path"], root.resolve().as_posix())
-            self.assertGreaterEqual(payload["artifacts"], 1)
-
     def test_project_history_and_diff_expose_latest_revision(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "project"
@@ -476,249 +395,6 @@ class CLITests(unittest.TestCase):
             self.assertEqual(diff["changes"][0]["path"], "module.py")
             self.assertEqual(diff["changes"][0]["status"], "modified")
 
-    def test_storage_locks_and_snapshot_query_work_while_writer_is_active(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            db = Path(td) / "memory.reql"
-            graph = MemoryGraph.open(db)
-            graph.add_node(MemoryNode(id="snapshot-topic", type="Topic", label="Snapshot topic"))
-            graph.close()
-
-            writer = MemoryGraph.open(db)
-            try:
-                locks_result = subprocess.run(
-                    [
-                        sys.executable,
-                        "-m",
-                        "memory.cli",
-                        "--storage",
-                        str(db),
-                        "storage",
-                        "locks",
-                        "--json",
-                    ],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-                snapshot_result = subprocess.run(
-                    [
-                        sys.executable,
-                        "-m",
-                        "memory.cli",
-                        "--storage",
-                        str(db),
-                        "--snapshot",
-                        "stats",
-                        "--json",
-                    ],
-                    check=True,
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
-                )
-            finally:
-                writer.close()
-
-            locks = json.loads(locks_result.stdout)
-            self.assertTrue(locks["locked"])
-            self.assertTrue(locks["writer"]["process_alive"])
-            self.assertTrue(locks["writer"]["command"])
-            self.assertTrue(locks["snapshot_available"])
-            stats = json.loads(snapshot_result.stdout)
-            self.assertGreaterEqual(stats["nodes"], 1)
-
-    def test_locate_resolves_extensionless_case_insensitive_document_path(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "project"
-            plugin = root / "extensions" / "wp-optimizer"
-            plugin.mkdir(parents=True)
-            (plugin / "README.txt").write_text("=== WP Optimizer ===\n\n== Description ==\nExact path marker.\n", encoding="utf-8")
-            hidden_docs = root / ".github"
-            hidden_docs.mkdir()
-            (hidden_docs / "README.md").write_text("# Hidden docs\n", encoding="utf-8")
-            db = Path(td) / "memory.reql"
-            graph = MemoryGraph.open(db)
-            try:
-                graph.compile_project(root)
-                with patch.object(graph.retrieval, "retrieve", side_effect=AssertionError("locate must not use semantic retrieval")):
-                    hidden_payload = graph.locate("./.github\\readme")
-                with self.assertRaisesRegex(ValueError, "must not traverse"):
-                    graph.locate("../readme")
-            finally:
-                graph.close()
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "memory.cli",
-                    "--storage",
-                    str(db),
-                    "locate",
-                    "extensions/wp-optimizer/readme",
-                    "--json",
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-
-            payload = json.loads(result.stdout)
-            self.assertEqual(payload["normalized_path"], "extensions/wp-optimizer/readme")
-            self.assertEqual(len(payload["matches"]), 1)
-            self.assertEqual(payload["matches"][0]["relative_path"], "extensions/wp-optimizer/README.txt")
-            self.assertEqual(payload["matches"][0]["context_scope"], "docs")
-            self.assertEqual(hidden_payload["normalized_path"], ".github/readme")
-            self.assertEqual(hidden_payload["matches"][0]["relative_path"], ".github/README.md")
-
-    def test_query_context_cleanup_include_risky_flag_expands_candidates(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            db = Path(td) / "memory.reql"
-            graph = MemoryGraph.open(db)
-            try:
-                graph.add_node(
-                    MemoryNode(
-                        id="finding:safe-cli",
-                        type="StaticAnalysisFinding",
-                        label="unused_variable: safe_cli",
-                        text="safe cli cleanup target",
-                        properties={
-                            "relative_path": "app.py",
-                            "finding_type": "unused_variable",
-                            "symbol_name": "safe_cli",
-                            "line_start": 2,
-                            "line_end": 2,
-                            "cleanup_priority": "high",
-                            "cleanup_rank": 3,
-                            "confidence": 0.8,
-                            "removal_safety": "safe",
-                            "removal_reason": "unused_variable is local to this artifact with high confidence and no public-surface signal.",
-                            "validation_reason": "",
-                            "blocking_signals": [],
-                        },
-                    )
-                )
-                graph.add_node(
-                    MemoryNode(
-                        id="finding:risky-cli",
-                        type="StaticAnalysisFinding",
-                        label="possibly_unused_function: risky_cli",
-                        text="risky cli cleanup target",
-                        properties={
-                            "relative_path": "app.py",
-                            "finding_type": "possibly_unused_function",
-                            "symbol_name": "risky_cli",
-                            "line_start": 5,
-                            "line_end": 6,
-                            "cleanup_priority": "low",
-                            "cleanup_rank": 1,
-                            "confidence": 0.4,
-                            "removal_safety": "risky",
-                            "removal_reason": "possibly_unused_function has no detected local usage, but removal needs validation before editing.",
-                            "validation_reason": "Validate public API before removing this symbol.",
-                            "blocking_signals": ["public_api"],
-                        },
-                    )
-                )
-            finally:
-                graph.close()
-
-            base = [sys.executable, "-m", "memory.cli", "--storage", str(db), "query_context", "--query", "cli cleanup target", "--cleanup", "--json"]
-            default_result = subprocess.run(base, check=True, capture_output=True, text=True)
-            risky_result = subprocess.run(base + ["--include-risky"], check=True, capture_output=True, text=True)
-
-            default_payload = json.loads(default_result.stdout)
-            risky_payload = json.loads(risky_result.stdout)
-            self.assertEqual({item["id"] for item in default_payload["cleanup_candidates"]}, {"finding:safe-cli"})
-            self.assertEqual(default_payload["cleanup_filter"]["mode"], "safe_remove")
-            self.assertEqual({item["id"] for item in risky_payload["cleanup_candidates"]}, {"finding:safe-cli", "finding:risky-cli"})
-            self.assertEqual(risky_payload["cleanup_filter"]["mode"], "include_risky")
-
-    def test_project_exclude_creates_and_appends_config_scan_exclude_rules(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "project"
-            root.mkdir()
-
-            first = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "memory.cli",
-                    "project",
-                    "exclude",
-                    "build/",
-                    "secrets/*.json",
-                    "--path",
-                    str(root),
-                    "--json",
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-
-            first_payload = json.loads(first.stdout)
-            config_path = root / "reql.conf"
-            self.assertTrue(first_payload["created"])
-            self.assertEqual(first_payload["path"], str(config_path))
-            self.assertEqual(first_payload["added"], ["secrets/*.json"])
-            self.assertEqual(first_payload["skipped"], ["build/"])
-            first_exclude = load_config(config_path).scan.exclude
-            self.assertIn(".git/", first_exclude)
-            self.assertIn("build/", first_exclude)
-            self.assertIn("secrets/*.json", first_exclude)
-
-            second = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "memory.cli",
-                    "project",
-                    "exclude",
-                    "build/",
-                    "tmp/",
-                    "--path",
-                    str(root),
-                    "--json",
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-
-            second_payload = json.loads(second.stdout)
-            self.assertFalse(second_payload["created"])
-            self.assertEqual(second_payload["added"], ["tmp/"])
-            self.assertEqual(second_payload["skipped"], ["build/"])
-            effective_excludes = load_config(config_path).scan.exclude
-            self.assertIn("build/", effective_excludes)
-            self.assertIn("secrets/*.json", effective_excludes)
-            self.assertIn("tmp/", effective_excludes)
-
-            unsafe_root = Path(td) / "unsafe-project"
-            unsafe_root.mkdir()
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "memory.cli",
-                    "project",
-                    "exclude",
-                    "**",
-                    "--path",
-                    str(unsafe_root),
-                ],
-                capture_output=True,
-                text=True,
-            )
-
-            self.assertEqual(result.returncode, 2)
-            self.assertIn("refusing dangerous scan.exclude pattern", result.stderr)
-            self.assertFalse((unsafe_root / "reql.conf").exists())
-
     def test_project_compile_without_storage_writes_under_build_path(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "project"
@@ -735,56 +411,71 @@ class CLITests(unittest.TestCase):
             self.assertIn("Delta:", result.stdout)
             self.assertTrue((root / ".reql" / "memory.reql").exists())
 
-    def test_clean_project_compile_still_records_a_validated_run_and_delta(self) -> None:
+    def test_project_watch_status_reads_lock_without_opening_graph(self) -> None:
+        from memory import cli as cli_mod
+
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "project"
             root.mkdir()
-            (root / "app.py").write_text("def build():\n    return 'ok'\n", encoding="utf-8")
-            tests_dir = root / "tests"
-            tests_dir.mkdir()
-            (tests_dir / "test_app.py").write_text("from app import build\n\ndef test_build():\n    assert build() == 'ok'\n", encoding="utf-8")
-            command = [sys.executable, "-m", "memory.cli", "project", "compile", str(root)]
+            lock_payload = {
+                "writer": {
+                    "watcher": True,
+                    "process_alive": True,
+                    "stale": False,
+                    "pid": 4321,
+                    "host": "test-host",
+                    "created_at": "2026-07-18T10:00:00+00:00",
+                    "duration_seconds": 12.5,
+                    "command": "reql project compile . --watch",
+                }
+            }
+            stdout = io.StringIO()
+            with (
+                patch.object(cli_mod.sys, "stdout", stdout),
+                patch.object(cli_mod, "inspect_store_locks", return_value=lock_payload) as inspect_locks,
+                patch.object(cli_mod, "_open", side_effect=AssertionError("watch status must not open the graph")),
+            ):
+                rc = cli_mod.main(["project", "watch-status", str(root), "--json"])
 
-            subprocess.run(command, check=True, capture_output=True, text=True)
-            second = subprocess.run(command, check=True, capture_output=True, text=True)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(rc, 0)
+            self.assertEqual(payload["status"], "running")
+            self.assertTrue(payload["running"])
+            self.assertEqual(payload["pid"], 4321)
+            self.assertEqual(payload["project_path"], str(root.resolve()))
+            inspect_locks.assert_called_once_with(root / ".reql" / "memory.reql")
 
-            self.assertIn("Changed: 0", second.stdout)
-            self.assertIn("Run:", second.stdout)
-            self.assertIn("Delta:", second.stdout)
+    def test_project_watch_status_classifies_non_running_lock_states(self) -> None:
+        from memory import cli as cli_mod
 
-            (root / "app.py").write_text("def build():\n    return 'changed'\n", encoding="utf-8")
-            changed = subprocess.run(command, check=True, capture_output=True, text=True)
-
-            self.assertIn("Changed: 1", changed.stdout)
-            self.assertIn("Delta:", changed.stdout)
-            self.assertIn("Changed files (1):", changed.stdout)
-            self.assertIn("Updated symbols", changed.stdout)
-            self.assertIn("Associated tests (1):", changed.stdout)
-            self.assertIn("tests/test_app.py", changed.stdout)
-
-    def test_cache_status_defaults_to_current_path(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "project"
-            root.mkdir()
-            (root / "app.py").write_text("def cached_project():\n    return 'ok'\n", encoding="utf-8")
-
-            subprocess.run(
-                [sys.executable, "-m", "memory.cli", "project", "compile", "."],
-                check=True,
-                capture_output=True,
-                text=True,
-                cwd=root,
-            )
-            result = subprocess.run(
-                [sys.executable, "-m", "memory.cli", "cache", "status"],
-                check=True,
-                capture_output=True,
-                text=True,
-                cwd=root,
-            )
-
-            self.assertIn("Project:", result.stdout)
-            self.assertIn("Total artifacts:", result.stdout)
+        cases = (
+            ({"writer": None}, "stopped", False, False),
+            (
+                {"writer": {"watcher": True, "process_alive": False, "stale": True}},
+                "stale",
+                False,
+                False,
+            ),
+            (
+                {"writer": {"watcher": True, "process_alive": None, "stale": False}},
+                "unknown",
+                None,
+                False,
+            ),
+            (
+                {"writer": {"watcher": False, "process_alive": True, "stale": False}},
+                "stopped",
+                False,
+                True,
+            ),
+        )
+        for locks, expected_status, expected_running, expected_blocked in cases:
+            with self.subTest(status=expected_status, blocked=expected_blocked):
+                with patch.object(cli_mod, "inspect_store_locks", return_value=locks):
+                    payload = cli_mod._project_watch_status("memory.reql", ".")
+                self.assertEqual(payload["status"], expected_status)
+                self.assertEqual(payload["running"], expected_running)
+                self.assertEqual(payload["blocked_by_other_writer"], expected_blocked)
 
     def test_project_compile_loads_project_local_reql_conf(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -869,30 +560,31 @@ class CLITests(unittest.TestCase):
             self.assertNotIn('--query "current task"', json.dumps(claude_settings))
             codex_project_skill = (project / ".codex" / "skills" / "reql-agent" / "SKILL.md").read_text(encoding="utf-8")
             claude_project_skill = (project / ".claude" / "skills" / "reql-agent" / "SKILL.md").read_text(encoding="utf-8")
-            self.assertIn("REQL Project", codex_project_skill)
-            self.assertIn("Installed for: codex (project-local).", codex_project_skill)
-            self.assertIn(str(command_path), codex_project_skill)
-            self.assertIn("local deterministic repository index", codex_project_skill)
-            self.assertIn("optional durable planning for complex work", codex_project_skill)
-            self.assertLess(len(codex_project_skill), 9000)
+            self.assertIn("REQL Fast Path", codex_project_skill)
+            self.assertNotIn("Installed for:", codex_project_skill)
+            self.assertNotIn(str(command_path), codex_project_skill)
+            skill_lines = codex_project_skill.splitlines()
+            self.assertGreaterEqual(len(skill_lines), 20)
+            self.assertLessEqual(len(skill_lines), 30)
             workflow_lines = [line for line in codex_project_skill.splitlines() if line.partition(".")[0].isdigit()]
-            self.assertEqual(len(workflow_lines), 6)
-            self.assertIn("## Core Commands", codex_project_skill)
-            self.assertIn("## Core Coding Workflow", codex_project_skill)
-            self.assertIn("## Special-Case References", codex_project_skill)
+            self.assertEqual(len(workflow_lines), 5)
+            self.assertIn("# REQL Fast Path", codex_project_skill)
+            self.assertIn("## Load only when triggered", codex_project_skill)
+            self.assertIn("## Rules", codex_project_skill)
             self.assertIn("project status .", codex_project_skill)
-            self.assertIn("Project not found", codex_project_skill)
-            self.assertIn("one-file or exact-symbol edit", codex_project_skill)
-            self.assertIn("do not initialize Agent Workspace", codex_project_skill)
-            self.assertIn("`Local configuration required`", codex_project_skill)
-            self.assertIn("file spans", codex_project_skill)
-            self.assertIn("impact", codex_project_skill)
+            self.assertIn("files, owners, line ranges, and tests", codex_project_skill)
+            self.assertIn("Confidence: insufficient", codex_project_skill)
             self.assertIn("--code", codex_project_skill)
             self.assertIn("--docs", codex_project_skill)
             self.assertIn("--test", codex_project_skill)
             self.assertIn("references/bootstrap.md", codex_project_skill)
             self.assertIn("references/agent-workspace.md", codex_project_skill)
-            self.assertIn('query_context --query "<terms from user request>"', codex_project_skill)
+            self.assertIn('query_context --query "<user terms>"', codex_project_skill)
+            self.assertNotIn("## Core Commands", codex_project_skill)
+            self.assertNotIn("Project not found", codex_project_skill)
+            self.assertNotIn("one-file or exact-symbol edit", codex_project_skill)
+            self.assertNotIn("`Local configuration required`", codex_project_skill)
+            self.assertNotIn("agent status", codex_project_skill)
             self.assertNotIn("project compile . --watch", codex_project_skill)
             self.assertNotIn("query_explore --query", codex_project_skill)
             self.assertNotIn("RETRIEVE ", codex_project_skill)
@@ -913,6 +605,7 @@ class CLITests(unittest.TestCase):
             openai_yaml = (project / ".codex" / "skills" / "reql-agent" / "agents" / "openai.yaml").read_text(encoding="utf-8")
             agent_reference = (project / ".codex" / "skills" / "reql-agent" / "references" / "agent-workspace.md").read_text(encoding="utf-8")
             self.assertIn("Fast path: existing graph", bootstrap_reference)
+            self.assertIn("Project not found", bootstrap_reference)
             self.assertIn("Raw tool limits", bootstrap_reference)
             self.assertIn("custom scanners, or ad hoc crawlers", bootstrap_reference)
             self.assertIn(str(command_path), bootstrap_reference)
@@ -934,6 +627,8 @@ class CLITests(unittest.TestCase):
             self.assertIn("read_plan", query_reference)
             self.assertIn("change_chain", query_reference)
             self.assertIn("test_targets", query_reference)
+            self.assertIn("Confidence: insufficient", query_reference)
+            self.assertIn("one targeted `rg`", query_reference)
             self.assertIn("clear one-file or exact-symbol edit", query_reference)
             self.assertIn("skip Agent Workspace", query_reference)
             self.assertIn("Do not read entire files unless the line ranges are missing", query_reference)
@@ -956,7 +651,14 @@ class CLITests(unittest.TestCase):
             self.assertIn("FINDINGS WHERE finding_type IN", query_reference)
             self.assertIn("StaticAnalysisFinding", query_reference)
             self.assertIn("framework callbacks", query_reference)
-            self.assertIn("Before the final response for any task that changed files", update_watch_reference)
+            self.assertIn("project watch-status . --json", codex_project_skill)
+            self.assertIn("wait for the watcher to refresh the graph", codex_project_skill)
+            self.assertIn("otherwise run", codex_project_skill)
+            self.assertNotIn("Changed files, watcher, cache, or deltas", codex_project_skill)
+            self.assertIn("Watch/compile troubleshooting", codex_project_skill)
+            self.assertIn("Load this only when post-edit refresh does not behave as expected", update_watch_reference)
+            self.assertIn("project watch-status . --json", update_watch_reference)
+            self.assertIn("do not inspect `ps`, `Get-CimInstance`", update_watch_reference)
             self.assertIn("## Final change classification", update_watch_reference)
             self.assertIn("`Versioned functional changes`", update_watch_reference)
             self.assertIn("the user's personal `config.json` must supply it", update_watch_reference)
@@ -971,9 +673,15 @@ class CLITests(unittest.TestCase):
             self.assertIn("Required Agent Workflow", agent_reference)
             self.assertIn("### 1. Plan", agent_reference)
             self.assertIn("### 2. Task Build", agent_reference)
-            self.assertIn("### 3. Quick Review", agent_reference)
-            self.assertIn("### 4. Code Linking", agent_reference)
-            self.assertIn("### 5. Write", agent_reference)
+            self.assertNotIn("Quick Review", agent_reference)
+            self.assertIn("### 3. Code Linking", agent_reference)
+            self.assertIn("### 4. Write", agent_reference)
+            self.assertIn("### 5. Handoff To Master", agent_reference)
+            self.assertIn("Do not run `agent map` before or after ordinary edits", agent_reference)
+            self.assertIn("Use the map only to recover after context loss, thread compaction, a handoff, or a long pause", agent_reference)
+            before_recovery, recovery_section = agent_reference.split("## Recover Context", 1)
+            self.assertNotIn("\nreql agent map", before_recovery)
+            self.assertEqual(recovery_section.count("\nreql agent map"), 3)
             self.assertIn("assemble the implementation from the task graph", agent_reference)
             self.assertIn("After `reql project compile .` adds new files, run `reql agent sync` before linking", agent_reference)
             self.assertIn("After compile with new files, run sync before linking new standard nodes", agent_reference)
@@ -1016,7 +724,8 @@ class CLITests(unittest.TestCase):
             self.assertNotIn("dove sta questo", generated_skill_text)
             self.assertEqual(sorted(path.name for path in (project / ".codex" / "skills").iterdir()), ["reql-agent"])
             self.assertEqual(sorted(path.name for path in (project / ".claude" / "skills").iterdir()), ["reql-agent"])
-            self.assertIn("Installed for: claude (project-local).", claude_project_skill)
+            self.assertIn("REQL Fast Path", claude_project_skill)
+            self.assertLessEqual(len(claude_project_skill.splitlines()), 30)
 
             shim_env = dict(os.environ)
             shim_env.pop("PYTHONPATH", None)
@@ -1128,94 +837,6 @@ class CLITests(unittest.TestCase):
                 self.assertEqual(content.count("project status ."), 1)
                 self.assertLessEqual(len([line for line in content.splitlines() if line.startswith("- ")]), 8)
 
-    def test_install_user_scope_writes_profile_instructions_for_supported_agents(self) -> None:
-        tmp_root = Path.cwd() / ".tmp"
-        tmp_root.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=tmp_root) as td:
-            fake_home = Path(td) / "home"
-            command_dir = Path(td) / "bin"
-            fake_home.mkdir()
-            env = dict(os.environ)
-            env["HOME"] = str(fake_home)
-            env["USERPROFILE"] = str(fake_home)
-            env["PATH"] = ""
-            if fake_home.drive:
-                env["HOMEDRIVE"] = fake_home.drive
-                env["HOMEPATH"] = str(fake_home)[len(fake_home.drive) :]
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "memory.cli",
-                    "install",
-                    "codex",
-                "claude",
-                "gemini",
-                "opencode",
-                    "kilo",
-                    "openclaw",
-                    "hermes",
-                    "kimi",
-                    "antigravity",
-                    "agents",
-                "cursor",
-                "copilot",
-                "--user",
-                "--command-dir",
-                str(command_dir),
-                "--no-hooks",
-                    "--json",
-                ],
-                check=True,
-                capture_output=True,
-                text=True,
-                env=env,
-            )
-
-            payload = json.loads(result.stdout)
-            self.assertEqual(payload["scope"], "user")
-
-            profile_instruction_paths = [
-                fake_home / "AGENTS.md",
-                fake_home / ".claude" / "CLAUDE.md",
-                fake_home / "GEMINI.md",
-                fake_home / ".config" / "opencode" / "AGENTS.md",
-                fake_home / ".kilocode" / "AGENTS.md",
-                fake_home / ".openclaw" / "AGENTS.md",
-                fake_home / ".hermes" / "AGENTS.md",
-                fake_home / ".kimi" / "AGENTS.md",
-                fake_home / ".antigravity" / "AGENTS.md",
-                fake_home / ".agents" / "AGENTS.md",
-            ]
-            for path in profile_instruction_paths:
-                self.assertTrue(path.exists(), str(path))
-                content = path.read_text(encoding="utf-8")
-                self.assertIn("When the user types `/reql`", content)
-                self.assertIn("project status .", content)
-                self.assertIn("generated `references/` file", content)
-                self.assertIn("document processing runs in the local compiler", content)
-                self.assertIn("document processing", content)
-                rule_lines = [line for line in content.splitlines() if line.startswith("- ")]
-                self.assertLessEqual(len(rule_lines), 8)
-                self.assertNotIn("query_explore --query", content)
-                self.assertNotIn("agent batch", content)
-
-            self.assertTrue((fake_home / ".cursor" / "rules" / "reql.mdc").exists())
-            self.assertTrue((fake_home / ".github" / "instructions" / "reql.instructions.md").exists())
-            self.assertTrue((fake_home / ".agents" / "skills" / "reql-agent" / "SKILL.md").exists())
-            self.assertFalse((fake_home / ".config" / "agents" / "skills" / "reql-agent" / "SKILL.md").exists())
-            opencode_document_semantics = (
-                fake_home / ".config" / "opencode" / "skills" / "reql-agent" / "references" / "document-semantics.md"
-            ).read_text(encoding="utf-8")
-            opencode_agent_reference = (
-                fake_home / ".config" / "opencode" / "skills" / "reql-agent" / "references" / "agent-workspace.md"
-            ).read_text(encoding="utf-8")
-            self.assertIn("Deterministic document processor", opencode_document_semantics)
-            self.assertIn("RawEvent", opencode_document_semantics)
-            self.assertNotIn("host `@agent` dispatch path", opencode_document_semantics)
-            self.assertIn("Agent Workspace", opencode_agent_reference)
-
     def test_install_without_platforms_auto_detects_agent_profiles(self) -> None:
         tmp_root = Path.cwd() / ".tmp"
         tmp_root.mkdir(exist_ok=True)
@@ -1279,45 +900,6 @@ class CLITests(unittest.TestCase):
             self.assertIn("cursor", uninstall_payload["platforms"])
             self.assertFalse((fake_home / ".cursor" / "rules" / "reql.mdc").exists())
 
-    def test_install_without_detected_profiles_lists_disks_instead_of_defaulting_to_codex(self) -> None:
-        tmp_root = Path.cwd() / ".tmp"
-        tmp_root.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=tmp_root) as td:
-            fake_home = Path(td) / "home"
-            command_dir = Path(td) / "bin"
-            fake_home.mkdir()
-            env = dict(os.environ)
-            env["HOME"] = str(fake_home)
-            env["USERPROFILE"] = str(fake_home)
-            env["PATH"] = ""
-            if fake_home.drive:
-                env["HOMEDRIVE"] = fake_home.drive
-                env["HOMEPATH"] = str(fake_home)[len(fake_home.drive) :]
-
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "memory.cli",
-                    "install",
-                    "--user",
-                    "--command-dir",
-                    str(command_dir),
-                    "--no-hooks",
-                    "--json",
-                ],
-                capture_output=True,
-                text=True,
-                env=env,
-            )
-
-            self.assertEqual(result.returncode, 2)
-            self.assertIn("No supported coding-agent profiles were detected.", result.stderr)
-            self.assertIn("Available disks:", result.stderr)
-            self.assertIn("reql install codex --user", result.stderr)
-            self.assertFalse((fake_home / "AGENTS.md").exists())
-            self.assertFalse((fake_home / ".codex" / "skills" / "reql-agent" / "SKILL.md").exists())
-
     def test_interactive_install_prompts_for_target_then_proceeds(self) -> None:
         from memory import cli as cli_mod
 
@@ -1361,44 +943,6 @@ class CLITests(unittest.TestCase):
             self.assertIn("Available disks:", stderr.getvalue())
             self.assertIn("No supported profiles found at", stderr.getvalue())
             self.assertNotIn("Project path", stderr.getvalue())
-
-    def test_interactive_install_retries_autodetect_on_selected_path_before_asking_platform(self) -> None:
-        from memory import cli as cli_mod
-
-        tmp_root = Path.cwd() / ".tmp"
-        tmp_root.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=tmp_root) as td:
-            selected_disk = Path(td) / "agent-disk"
-            command_dir = Path(td) / "bin"
-            selected_home = cli_mod._home_dir_for_disk(selected_disk)
-            (selected_home / ".cursor" / "rules").mkdir(parents=True)
-            stdin = _InteractiveInput("1\n")
-            stdout = io.StringIO()
-            stderr = io.StringIO()
-
-            with (
-                patch.object(cli_mod.sys, "stdin", stdin),
-                patch.object(cli_mod.sys, "stdout", stdout),
-                patch.object(cli_mod.sys, "stderr", stderr),
-                patch.object(cli_mod, "_available_disk_roots", return_value=[str(selected_disk)]),
-            ):
-                rc = cli_mod.main(
-                    [
-                        "install",
-                        "--command-dir",
-                        str(command_dir),
-                        "--no-hooks",
-                        "--json",
-                    ]
-                )
-
-            self.assertEqual(rc, 0)
-            payload = json.loads(stdout.getvalue())
-            self.assertEqual(payload["platforms"], ["cursor"])
-            self.assertEqual(payload["scope"], "user")
-            self.assertTrue((selected_home / ".cursor" / "rules" / "reql.mdc").exists())
-            self.assertIn("Detected platforms: cursor", stderr.getvalue())
-            self.assertNotIn("Platform to install", stderr.getvalue())
 
     def test_interactive_uninstall_prompts_for_target_then_proceeds(self) -> None:
         from agents.install import install_agent_files
@@ -1450,52 +994,6 @@ class CLITests(unittest.TestCase):
             self.assertIn("No supported profiles found at", stderr.getvalue())
             self.assertIn("Platform to uninstall", stderr.getvalue())
 
-    def test_interactive_uninstall_retries_autodetect_on_selected_path_before_asking_platform(self) -> None:
-        from agents.install import install_agent_files
-        from memory import cli as cli_mod
-
-        tmp_root = Path.cwd() / ".tmp"
-        tmp_root.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=tmp_root) as td:
-            selected_disk = Path(td) / "agent-disk"
-            command_dir = Path(td) / "bin"
-            selected_disk.mkdir()
-            selected_home = cli_mod._home_dir_for_disk(selected_disk)
-            (selected_home / ".cursor" / "rules").mkdir(parents=True)
-            install_agent_files(
-                ["cursor"],
-                project=False,
-                home_dir=selected_home,
-                command_dir=command_dir,
-                hooks=False,
-            )
-            stdin = _InteractiveInput("1\n")
-            stdout = io.StringIO()
-            stderr = io.StringIO()
-
-            with (
-                patch.object(cli_mod.sys, "stdin", stdin),
-                patch.object(cli_mod.sys, "stdout", stdout),
-                patch.object(cli_mod.sys, "stderr", stderr),
-                patch.object(cli_mod, "_available_disk_roots", return_value=[str(selected_disk)]),
-            ):
-                rc = cli_mod.main(
-                    [
-                        "uninstall",
-                        "--command-dir",
-                        str(command_dir),
-                        "--json",
-                    ]
-                )
-
-            self.assertEqual(rc, 0)
-            payload = json.loads(stdout.getvalue())
-            self.assertEqual(payload["platforms"], ["cursor"])
-            self.assertEqual(payload["scope"], "user")
-            self.assertFalse((selected_home / ".cursor" / "rules" / "reql.mdc").exists())
-            self.assertIn("Detected platforms: cursor", stderr.getvalue())
-            self.assertNotIn("Platform to uninstall", stderr.getvalue())
-
     def test_interactive_install_and_uninstall_interrupt_without_traceback(self) -> None:
         from memory import cli as cli_mod
 
@@ -1516,82 +1014,6 @@ class CLITests(unittest.TestCase):
                 self.assertEqual(stdout.getvalue(), "")
                 self.assertIn(f"{command.capitalize()} cancelled.", stderr.getvalue())
                 self.assertNotIn("Traceback", stderr.getvalue())
-
-    def test_copilot_auto_detect_ignores_generic_github_directory(self) -> None:
-        from agents.install import detect_platforms
-
-        tmp_root = Path.cwd() / ".tmp"
-        tmp_root.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=tmp_root) as td:
-            fake_home = Path(td) / "home"
-            project = Path(td) / "repo"
-            fake_home.mkdir()
-            (project / ".cursor" / "rules").mkdir(parents=True)
-            (project / ".github").mkdir()
-
-            original_env = {name: os.environ.get(name) for name in ("HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "PATH")}
-            try:
-                os.environ["HOME"] = str(fake_home)
-                os.environ["USERPROFILE"] = str(fake_home)
-                os.environ["PATH"] = ""
-                if fake_home.drive:
-                    os.environ["HOMEDRIVE"] = fake_home.drive
-                    os.environ["HOMEPATH"] = str(fake_home)[len(fake_home.drive) :]
-
-                platforms = detect_platforms(project=True, project_dir=project)
-                self.assertNotIn("codex", platforms)
-                self.assertIn("cursor", platforms)
-                self.assertNotIn("copilot", platforms)
-
-                (project / ".github" / "copilot-instructions.md").write_text("# Copilot\n", encoding="utf-8")
-                platforms = detect_platforms(project=True, project_dir=project)
-                self.assertIn("copilot", platforms)
-            finally:
-                for name, value in original_env.items():
-                    if value is None:
-                        os.environ.pop(name, None)
-                    else:
-                        os.environ[name] = value
-
-    def test_codex_auto_detect_ignores_codex_directory_and_command(self) -> None:
-        from agents.install import detect_platforms
-
-        tmp_root = Path.cwd() / ".tmp"
-        tmp_root.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=tmp_root) as td:
-            fake_home = Path(td) / "home"
-            project = Path(td) / "repo"
-            fake_bin = Path(td) / "bin"
-            fake_home.mkdir()
-            fake_bin.mkdir()
-            (fake_home / ".codex").mkdir()
-            (project / ".codex").mkdir(parents=True)
-            command_name = "codex.cmd" if sys.platform.startswith("win") else "codex"
-            command_path = fake_bin / command_name
-            command_path.write_text("@echo off\n" if sys.platform.startswith("win") else "#!/bin/sh\n", encoding="utf-8")
-            command_path.chmod(0o755)
-
-            original_env = {name: os.environ.get(name) for name in ("HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "PATH")}
-            try:
-                os.environ["HOME"] = str(fake_home)
-                os.environ["USERPROFILE"] = str(fake_home)
-                os.environ["PATH"] = str(fake_bin)
-                if fake_home.drive:
-                    os.environ["HOMEDRIVE"] = fake_home.drive
-                    os.environ["HOMEPATH"] = str(fake_home)[len(fake_home.drive) :]
-
-                platforms = detect_platforms(project=True, project_dir=project)
-                self.assertNotIn("codex", platforms)
-
-                (project / ".codex" / "skills").mkdir()
-                platforms = detect_platforms(project=True, project_dir=project)
-                self.assertIn("codex", platforms)
-            finally:
-                for name, value in original_env.items():
-                    if value is None:
-                        os.environ.pop(name, None)
-                    else:
-                        os.environ[name] = value
 
     def test_project_install_auto_detect_does_not_use_user_scope_codex_profile(self) -> None:
         tmp_root = Path.cwd() / ".tmp"

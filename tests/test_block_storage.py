@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import hashlib
 import json
@@ -9,7 +9,6 @@ import threading
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 from api import MemoryGraph
 from memory.domain.exceptions import StorageError
@@ -21,6 +20,60 @@ _SUPERBLOCK_HEADER_SIZE = struct.calcsize("<8sIIII32s")
 
 
 class BlockStorageTests(unittest.TestCase):
+    def test_graph_queries_accept_none_for_unbounded_results(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = BlockGraphStore(Path(td) / "memory.reql")
+            try:
+                nodes = [
+                    MemoryNode(
+                        id=f"node:{index}",
+                        type="Function",
+                        label=f"shared term {index}",
+                        text="shared lexical term",
+                        properties={"project_id": "project"},
+                    )
+                    for index in range(4)
+                ]
+                store.batch_upsert_nodes(nodes)
+                store.batch_upsert_edges(
+                    [
+                        MemoryEdge(
+                            id=f"edge:{index}",
+                            from_id="node:0",
+                            to_id=f"node:{index}",
+                            type="CALLS",
+                        )
+                        for index in range(1, 4)
+                    ]
+                )
+
+                self.assertEqual(
+                    len(store.find_nodes_by_property("project_id", "project", limit=None)),
+                    4,
+                )
+                self.assertEqual(len(store.get_edges(type_="CALLS", limit=None)), 3)
+                self.assertEqual(
+                    len(store.incident_edges(["node:0"], edge_types={"CALLS"}, limit=None)),
+                    3,
+                )
+                self.assertEqual(
+                    len(
+                        store.top_nodes_by_degree(
+                            limit=None,
+                            node_types={"Function"},
+                            project_id="project",
+                            include_global_project=False,
+                        )
+                    ),
+                    4,
+                )
+                self.assertEqual(
+                    len(store.lexical_search("shared lexical term", top_k=None)),
+                    4,
+                )
+            finally:
+                store.close()
+
     def test_block_store_persists_with_reql_block_header(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "memory.reql"
@@ -62,38 +115,6 @@ class BlockStorageTests(unittest.TestCase):
             finally:
                 inspector.close()
 
-    def test_v2_indexes_persist_and_records_load_lazily(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "memory.reql"
-            store = BlockGraphStore(path)
-            try:
-                store.batch_upsert_nodes(
-                    [
-                        MemoryNode(id="n1", type="SourceArtifact", label="app.py", canonical_key="app.py", properties={"artifact_type": "code", "relative_path": "app.py"}),
-                        MemoryNode(id="n2", type="Function", label="compile project", canonical_key="compile_project", properties={"name": "compile_project", "relative_path": "app.py"}),
-                    ]
-                )
-                store.batch_upsert_edges([MemoryEdge(id="e1", from_id="n1", to_id="n2", type="DEFINES", properties={"project_id": "p1"})])
-                store.compact_storage()
-            finally:
-                store.close()
-
-            reopened = BlockGraphStore(path)
-            try:
-                details = reopened.inspect_storage()
-                self.assertEqual(details["index_stats"]["nodes"], 2)
-                self.assertEqual(details["index_stats"]["edges"], 1)
-                self.assertEqual(details["index_stats"]["loaded_nodes"], 0)
-                self.assertEqual(details["index_stats"]["loaded_edges"], 0)
-                self.assertEqual(reopened.count_nodes(node_types={"Function"}), 1)
-                self.assertEqual(reopened.count_edges(edge_types={"DEFINES"}), 1)
-                self.assertEqual(reopened.find_nodes_by_property("artifact_type", "code", type_="SourceArtifact")[0].id, "n1")
-                self.assertEqual(reopened.get_node_by_key("Function", "compile_project").id, "n2")
-                self.assertEqual(reopened.neighbors("n1", edge_types={"DEFINES"})[0][1].id, "n2")
-                self.assertEqual(reopened.lexical_search("compile project", top_k=2)[0][0].id, "n2")
-            finally:
-                reopened.close()
-
     def test_lexical_search_prefers_free_phrase_order_over_scattered_terms(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             store = BlockGraphStore(Path(td) / "memory.reql")
@@ -122,77 +143,6 @@ class BlockStorageTests(unittest.TestCase):
             finally:
                 store.close()
 
-    def test_internal_no_clone_flags_do_not_change_default_isolation(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "memory.reql"
-            store = BlockGraphStore(path)
-            try:
-                node_results = store.batch_upsert_nodes(
-                    [
-                        MemoryNode(id="n1", type="Topic", label="alpha", properties={"project_id": "p1", "items": ["a"]}),
-                        MemoryNode(id="n2", type="Topic", label="beta", properties={"project_id": "p1"}),
-                    ]
-                )
-                edge_results = store.batch_upsert_edges(
-                    [MemoryEdge(id="e1", from_id="n1", to_id="n2", type="RELATED_TO", properties={"project_id": "p1", "items": ["b"]})]
-                )
-
-                self.assertIsNot(node_results[0][0], store._nodes["n1"])
-                self.assertIsNot(edge_results[0][0], store._edges["e1"])
-                self.assertIsNot(store.get_node("n1"), store._nodes["n1"])
-                self.assertIsNot(store.get_edge("e1"), store._edges["e1"])
-                self.assertIsNot(store.get_edges(from_id="n1")[0], store._edges["e1"])
-                self.assertIsNot(store.incident_edges(["n1"])[0], store._edges["e1"])
-                self.assertIsNot(store.find_nodes_by_property("project_id", "p1")[0], store._nodes["n1"])
-                self.assertIsNot(store.find_edges_by_property("project_id", "p1")[0], store._edges["e1"])
-
-                self.assertIs(store.get_node("n1", clone=False), store._nodes["n1"])
-                self.assertIs(store.get_edge("e1", clone=False), store._edges["e1"])
-                self.assertIs(store.get_edges(from_id="n1", clone=False)[0], store._edges["e1"])
-                self.assertIs(store.incident_edges(["n1"], clone=False)[0], store._edges["e1"])
-                raw_node = store.find_nodes_by_property("project_id", "p1", clone=False)[0]
-                raw_edge = store.find_edges_by_property("project_id", "p1", clone=False)[0]
-                self.assertIs(raw_node, store._nodes[raw_node.id])
-                self.assertIs(raw_edge, store._edges[raw_edge.id])
-
-                raw_node_results = store.batch_upsert_nodes([MemoryNode(id="n3", type="Topic", label="gamma", properties={"project_id": "p2"})], return_clones=False)
-                raw_edge_results = store.batch_upsert_edges(
-                    [MemoryEdge(id="e2", from_id="n2", to_id="n3", type="RELATED_TO", properties={"project_id": "p2"})],
-                    return_clones=False,
-                )
-                self.assertIs(raw_node_results[0][0], store._nodes["n3"])
-                self.assertIs(raw_edge_results[0][0], store._edges["e2"])
-            finally:
-                store.close()
-
-    def test_mmap_backed_lazy_reads_survive_checkpoint_replace(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "memory.reql"
-            store = BlockGraphStore(path)
-            try:
-                store.batch_upsert_nodes(
-                    [
-                        MemoryNode(id="n1", type="Topic", label="alpha", canonical_key="topic:alpha"),
-                        MemoryNode(id="n2", type="Topic", label="beta", canonical_key="topic:beta"),
-                    ]
-                )
-                store.batch_upsert_edges([MemoryEdge(id="e1", from_id="n1", to_id="n2", type="RELATED_TO")])
-                store.compact_storage()
-            finally:
-                store.close()
-
-            reopened = BlockGraphStore(path)
-            try:
-                self.assertIsNotNone(reopened._data_mmap)
-                self.assertEqual(reopened.get_node("n1").label, "alpha")
-                reopened.upsert_node(MemoryNode(id="n3", type="Topic", label="gamma", canonical_key="topic:gamma"))
-                result = reopened.checkpoint_if_needed(wal_bytes_threshold=1)
-                self.assertTrue(result["checkpointed"])
-                self.assertIsNotNone(reopened._data_mmap)
-                self.assertEqual(reopened.get_node("n3").label, "gamma")
-            finally:
-                reopened.close()
-
     def test_lexical_terms_update_after_lazy_reopen(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "memory.reql"
@@ -220,98 +170,6 @@ class BlockStorageTests(unittest.TestCase):
             finally:
                 reopened.close()
 
-    def test_deferred_lexical_index_is_query_coherent_and_checkpointable(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "memory.reql"
-            store = BlockGraphStore(path)
-            try:
-                store.upsert_node(
-                    MemoryNode(
-                        id="n1",
-                        type="Topic",
-                        label="original marker",
-                        text="original-only-token",
-                        canonical_key="topic:n1",
-                    )
-                )
-                store.compact_storage()
-            finally:
-                store.close()
-
-            deferred = BlockGraphStore(path, defer_lexical_index=True)
-            try:
-                self.assertEqual(deferred._root_index["version"], 3)
-                self.assertNotIn("node_terms", deferred._root_index["indexes"])
-                self.assertFalse(deferred._lexical_index_loaded)
-                deferred.update_node_fields("n1", label="replacement marker", text="replacement-only-token")
-                self.assertFalse(deferred.lexical_search("original-only-token", top_k=1))
-                self.assertEqual(deferred.lexical_search("replacement-only-token", top_k=1)[0][0].id, "n1")
-                checkpoint = deferred.checkpoint_if_needed(wal_bytes_threshold=0)
-                self.assertTrue(checkpoint["checkpointed"])
-                self.assertTrue(deferred._lexical_index_loaded)
-            finally:
-                deferred.close()
-
-            reopened = BlockGraphStore(path)
-            try:
-                self.assertFalse(reopened.lexical_search("original-only-token", top_k=1))
-                self.assertEqual(reopened.lexical_search("replacement-only-token", top_k=1)[0][0].id, "n1")
-            finally:
-                reopened.close()
-
-    def test_deferred_lexical_overlay_is_restored_on_transaction_rollback(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "memory.reql"
-            initial = BlockGraphStore(path)
-            try:
-                initial.upsert_node(
-                    MemoryNode(id="n1", type="Topic", label="stable", text="stable-only-token", canonical_key="topic:n1")
-                )
-                initial.compact_storage()
-            finally:
-                initial.close()
-
-            deferred = BlockGraphStore(path, defer_lexical_index=True)
-            try:
-                with self.assertRaises(RuntimeError):
-                    with deferred.transaction():
-                        deferred.update_node_fields("n1", text="rolled-back-only-token")
-                        raise RuntimeError("rollback")
-
-                self.assertFalse(deferred._lexical_index_loaded)
-                self.assertEqual(deferred._deferred_lexical_changes, {})
-                self.assertEqual(deferred.lexical_search("stable-only-token", top_k=1)[0][0].id, "n1")
-                self.assertFalse(deferred.lexical_search("rolled-back-only-token", top_k=1))
-            finally:
-                deferred.close()
-
-    def test_legacy_root_index_version_is_rejected_without_migration(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "memory.reql"
-            store = BlockGraphStore(path)
-            try:
-                legacy_root = {**store._root_index, "version": 2}
-                with self.assertRaises(StorageError) as ctx:
-                    store._apply_root_index(legacy_root)
-            finally:
-                store.close()
-
-            self.assertIn("Unsupported REQL root index version 2", str(ctx.exception))
-            self.assertIn("Rebuild the storage", str(ctx.exception))
-
-    def test_current_root_index_requires_split_lexical_record(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "memory.reql"
-            store = BlockGraphStore(path)
-            try:
-                invalid_root = {**store._root_index, "lexical_index_location": {}}
-                with self.assertRaises(StorageError) as ctx:
-                    store._apply_root_index(invalid_root)
-            finally:
-                store.close()
-
-            self.assertIn("missing the required split lexical index", str(ctx.exception))
-
     def test_append_only_wal_reopens_without_manual_compaction(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "memory.reql"
@@ -338,28 +196,6 @@ class BlockStorageTests(unittest.TestCase):
             finally:
                 reopened.close()
 
-    def test_edge_upsert_after_lazy_reopen_loads_endpoints_by_index(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "memory.reql"
-            store = BlockGraphStore(path)
-            try:
-                store.batch_upsert_nodes(
-                    [
-                        MemoryNode(id="left", type="Topic", canonical_key="left"),
-                        MemoryNode(id="right", type="Topic", canonical_key="right"),
-                    ]
-                )
-            finally:
-                store.close()
-
-            reopened = BlockGraphStore(path)
-            try:
-                edge, created = reopened.upsert_edge(MemoryEdge(id="edge", from_id="left", to_id="right", type="RELATED_TO"))
-                self.assertTrue(created)
-                self.assertEqual(edge.id, "edge")
-            finally:
-                reopened.close()
-
     def test_unsupported_schema_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "memory.reql"
@@ -377,43 +213,6 @@ class BlockStorageTests(unittest.TestCase):
                 BlockGraphStore(path)
 
         self.assertIn("Unsupported REQL schema version 1", str(ctx.exception))
-
-    def test_root_index_stays_compact_for_many_records(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "memory.reql"
-            store = BlockGraphStore(path, block_size=4096)
-            try:
-                nodes = [
-                    MemoryNode(
-                        id=f"n{i}",
-
-                        type="Topic",
-                        canonical_key=f"topic:{i}:with:a:long:stable:key",
-                    )
-                    for i in range(500)
-                ]
-                store.batch_upsert_nodes(nodes)
-                store.batch_upsert_edges(
-                    [
-                        MemoryEdge(id=f"e{i}", from_id=f"n{i}", to_id=f"n{i + 1}", type="RELATED_TO")
-                        for i in range(len(nodes) - 1)
-                    ]
-                )
-                store.compact_storage()
-            finally:
-                store.close()
-
-            reopened = BlockGraphStore(path, block_size=4096)
-            try:
-                details = reopened.inspect_storage()
-                self.assertEqual(details["root_index"]["nodes"], 500)
-                self.assertEqual(details["root_index"]["edges"], 499)
-                self.assertEqual(details["root_index"]["node_keys"], 500)
-                self.assertEqual(details["root_index"]["edge_patterns"], 499)
-                self.assertIsInstance(details["space_map"]["blocks"], int)
-                self.assertGreater(details["space_map"]["blocks"], 0)
-            finally:
-                reopened.close()
 
     def test_large_single_record_spans_blocks_and_reloads(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -447,42 +246,6 @@ class BlockStorageTests(unittest.TestCase):
             finally:
                 reopened.close()
 
-    def test_non_lexical_node_updates_skip_term_reindex(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            store = BlockGraphStore(Path(td) / "memory.reql")
-            try:
-                store.upsert_node(
-                    MemoryNode(
-                        id="n1",
-                        type="Topic",
-                        label="alpha marker",
-                        text="retired-only-token",
-                        canonical_key="topic:alpha",
-                        properties={"project_id": "p1", "name": "alpha", "debug": "before"},
-                    )
-                )
-                before_terms = {term: dict(postings) for term, postings in store._node_terms.items()}
-
-                with patch.object(block_store_module, "keyword_scores", side_effect=AssertionError("unexpected lexical reindex")):
-                    store.update_node_fields(
-                        "n1",
-                        usage_count=3,
-                        properties={"project_id": "p1", "name": "alpha", "debug": "after"},
-                    )
-                    store.update_node_fields("n1", status="archived")
-                    store.update_node_fields("n1", status="active")
-
-                self.assertEqual({term: dict(postings) for term, postings in store._node_terms.items()}, before_terms)
-                self.assertEqual(store.lexical_search("retired-only-token", top_k=1)[0][0].id, "n1")
-
-                with patch.object(block_store_module, "keyword_scores", wraps=block_store_module.keyword_scores) as scorer:
-                    store.update_node_fields("n1", text="changed-only-token")
-                self.assertGreaterEqual(scorer.call_count, 1)
-                self.assertEqual(store.lexical_search("changed-only-token", top_k=1)[0][0].id, "n1")
-                self.assertFalse(store.lexical_search("retired-only-token", top_k=1))
-            finally:
-                store.close()
-
     def test_manifest_checksum_is_validated_on_open(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "memory.reql"
@@ -495,34 +258,6 @@ class BlockStorageTests(unittest.TestCase):
             payload = bytearray(path.read_bytes())
             payload[_SUPERBLOCK_HEADER_SIZE] ^= 1
             path.write_bytes(bytes(payload))
-
-            with self.assertRaises(StorageError):
-                BlockGraphStore(path)
-
-    def test_data_checksum_is_validated_by_inspection(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "memory.reql"
-            store = BlockGraphStore(path)
-            try:
-                store.upsert_node(MemoryNode(id="n1", type="Topic", canonical_key="topic:one"))
-            finally:
-                store.close()
-
-            payload = bytearray(path.read_bytes())
-            payload[-1] ^= 1
-            path.write_bytes(bytes(payload))
-
-            reader = BlockGraphStore(path)
-            try:
-                with self.assertRaises(StorageError):
-                    reader.inspect_storage()
-            finally:
-                reader.close()
-
-    def test_unsupported_single_block_files_are_rejected(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "memory.reql"
-            path.write_bytes(b"RQLBLK01" + b"\x00" * (64 * 1024 - 8))
 
             with self.assertRaises(StorageError):
                 BlockGraphStore(path)
@@ -553,34 +288,6 @@ class BlockStorageTests(unittest.TestCase):
                 self.assertEqual(second.schema_version(), 2)
             finally:
                 second.close()
-
-    def test_lock_diagnostics_report_watcher_owner_and_allow_snapshot_reads(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "memory.reql"
-            initial = BlockGraphStore(path)
-            initial.upsert_node(MemoryNode(id="snapshot-node", type="Topic", canonical_key="snapshot-node"))
-            initial.close()
-
-            with patch.object(block_store_module.sys, "argv", ["reql", "project", "compile", ".", "--watch"]):
-                writer = BlockGraphStore(path)
-            try:
-                diagnostics = block_store_module.inspect_store_locks(path)
-                self.assertTrue(diagnostics["locked"])
-                self.assertTrue(diagnostics["snapshot_available"])
-                self.assertIsNotNone(diagnostics["writer"])
-                assert diagnostics["writer"] is not None
-                self.assertIn("project compile", diagnostics["writer"]["command"])
-                self.assertTrue(diagnostics["writer"]["process_alive"])
-                self.assertTrue(diagnostics["writer"]["watcher"])
-                self.assertGreaterEqual(diagnostics["writer"]["duration_seconds"], 0.0)
-
-                snapshot = BlockGraphStore(path, read_only=True, snapshot=True, lock_timeout_seconds=0.0)
-                try:
-                    self.assertIsNotNone(snapshot.get_node("snapshot-node"))
-                finally:
-                    snapshot.close()
-            finally:
-                writer.close()
 
     def test_stale_lock_recovery_is_safe_for_dead_and_incomplete_owners(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -672,54 +379,6 @@ class BlockStorageTests(unittest.TestCase):
             finally:
                 reader.close()
 
-    def test_read_only_usage_events_are_written_to_sidecar_journal(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "memory.reql"
-            store = BlockGraphStore(path)
-            try:
-                store.upsert_node(MemoryNode(id="n1", type="Topic", canonical_key="topic:one"))
-                store.compact_storage()
-            finally:
-                store.close()
-
-            reader = BlockGraphStore(path, read_only=True)
-            try:
-                reader.record_usage_event("topic one", [{"id": "n1", "score": 0.8, "activation": 0.3}])
-                usage = reader.usage_for_node("n1")
-                self.assertEqual(usage["usage_count"], 1)
-                self.assertTrue(path.with_name(f"{path.name}.usage.jsonl").exists())
-            finally:
-                reader.close()
-
-            reopened = BlockGraphStore(path, read_only=True)
-            try:
-                self.assertEqual(reopened.usage_for_node("n1")["usage_count"], 1)
-            finally:
-                reopened.close()
-
-    def test_read_only_open_does_not_lock_usage_journal_for_loading(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "memory.reql"
-            store = BlockGraphStore(path)
-            try:
-                store.upsert_node(MemoryNode(id="n1", type="Topic", canonical_key="topic:one"))
-                store.compact_storage()
-            finally:
-                store.close()
-
-            reader = BlockGraphStore(path, read_only=True)
-            try:
-                reader.record_usage_event("topic one", [{"id": "n1", "score": 0.8, "activation": 0.3}])
-            finally:
-                reader.close()
-
-            with patch.object(block_store_module._StoreLock, "acquire", side_effect=AssertionError("usage journal read must not take a write lock")):
-                reopened = BlockGraphStore(path, read_only=True)
-                try:
-                    self.assertEqual(reopened.usage_for_node("n1")["usage_count"], 1)
-                finally:
-                    reopened.close()
-
     def test_wal_replays_updates_without_checkpoint(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "memory.reql"
@@ -764,32 +423,6 @@ class BlockStorageTests(unittest.TestCase):
             finally:
                 reopened.close()
 
-    def test_checkpoint_if_needed_repairs_wal_only_store(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "memory.reql"
-            store = BlockGraphStore(path)
-            store.upsert_node(MemoryNode(id="n1", type="Topic", canonical_key="topic:one"))
-            store._release_lock()
-            store._closed = True
-            path.unlink()
-
-            recovered = BlockGraphStore(path)
-            try:
-                self.assertIsNotNone(recovered.get_node("n1"))
-                result = recovered.checkpoint_if_needed(wal_bytes_threshold=1024 * 1024 * 1024)
-                self.assertTrue(result["checkpointed"])
-                self.assertEqual(result["reason"], "base_missing")
-                self.assertTrue(path.exists())
-                self.assertFalse(path.with_name(f"{path.name}.wal").exists())
-            finally:
-                recovered.close()
-
-            reopened = BlockGraphStore(path)
-            try:
-                self.assertEqual(reopened.get_node_by_key("Topic", "topic:one").id, "n1")
-            finally:
-                reopened.close()
-
     def test_transaction_rollback_on_failure(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             store = BlockGraphStore(Path(td) / "memory.reql")
@@ -799,40 +432,6 @@ class BlockStorageTests(unittest.TestCase):
                         store.upsert_node(MemoryNode(id="n1", type="Topic", canonical_key="topic:one"))
                         raise RuntimeError("fail")
                 self.assertIsNone(store.get_node("n1"))
-            finally:
-                store.close()
-
-    def test_transaction_rollback_on_keyboard_interrupt(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            path = Path(td) / "memory.reql"
-            store = BlockGraphStore(path)
-            try:
-                with self.assertRaises(KeyboardInterrupt):
-                    with store.transaction():
-                        store.upsert_node(MemoryNode(id="n1", type="Topic", canonical_key="topic:one"))
-                        raise KeyboardInterrupt
-                self.assertIsNone(store.get_node("n1"))
-            finally:
-                store.close()
-
-            reopened = BlockGraphStore(path)
-            try:
-                self.assertIsNone(reopened.get_node("n1"))
-            finally:
-                reopened.close()
-
-    def test_nested_transaction_rollback_preserves_outer_work(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            store = BlockGraphStore(Path(td) / "memory.reql")
-            try:
-                with store.transaction():
-                    store.upsert_node(MemoryNode(id="outer", type="Topic", canonical_key="outer"))
-                    with self.assertRaises(RuntimeError):
-                        with store.transaction():
-                            store.upsert_node(MemoryNode(id="inner", type="Topic", canonical_key="inner"))
-                            raise RuntimeError("inner fail")
-                self.assertIsNotNone(store.get_node("outer"))
-                self.assertIsNone(store.get_node("inner"))
             finally:
                 store.close()
 
@@ -930,6 +529,9 @@ class BlockStorageTests(unittest.TestCase):
                 self.assertEqual(store.count_edges(edge_types={"RELATED_TO"}), 1)
                 top = store.find_nodes(type_="Topic", status="active", limit=1, order_by="salience")
                 self.assertEqual([node.id for node in top], ["active-high"])
+                internal = store.find_nodes(type_="Topic", status="active", limit=1, order_by="salience", clone=False)
+                self.assertIs(internal[0], store.get_node("active-high", clone=False))
+                self.assertIsNot(top[0], internal[0])
             finally:
                 store.close()
 

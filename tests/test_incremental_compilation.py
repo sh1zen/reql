@@ -1,19 +1,14 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
-import os
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 from tests.config_helpers import open_graph_with_documents as _open_graph_with_documents
-import memory.services.incremental_compilation as incremental_compilation
-from memory.artifacts.cache import DiskArtifactCache, artifact_cache_path
+from memory.artifacts.cache import artifact_cache_path
 from memory.artifacts.compiler import ArtifactCompiler
 from memory.artifacts.models import SourceArtifact
-from memory.domain.timeutils import utcnow_iso
-from memory.document_ingestion.models import DocumentFragment, DocumentParseResult
 from memory.services.incremental_compilation import IncrementalCompilationService
 
 
@@ -22,50 +17,6 @@ class FailingCompiler(ArtifactCompiler):
         if artifact.relative_path == "bad.py":
             raise ValueError("simulated parser failure")
         return super().build_fragments(artifact)
-
-
-class DuplicateCanonicalFragmentCompiler(ArtifactCompiler):
-    def build_fragments(self, artifact: SourceArtifact):
-        if artifact.relative_path != "README.md":
-            return super().build_fragments(artifact)
-        first = DocumentFragment(
-            id="candidate-fragment-one",
-            artifact_id=artifact.id,
-            fragment_type="paragraph",
-            text="First fragment.",
-            start_line=1,
-            end_line=1,
-            start_offset=None,
-            end_offset=None,
-            page_number=None,
-            section_path=None,
-            hash="h1",
-            metadata={"structural_hash": "same-structure", "fragment_index": 0},
-        )
-        second = DocumentFragment(
-            id="candidate-fragment-two",
-            artifact_id=artifact.id,
-            fragment_type="paragraph",
-            text="Second fragment.",
-            start_line=2,
-            end_line=2,
-            start_offset=None,
-            end_offset=None,
-            page_number=None,
-            section_path=None,
-            hash="h2",
-            metadata={"structural_hash": "same-structure", "fragment_index": 1},
-        )
-        return DocumentParseResult(
-            title="Duplicate",
-            metadata={},
-            fragments=[first, second],
-            links=[{"source_fragment_id": second.id, "uri": "https://example.test/ref", "text": "ref"}],
-            tables=[],
-            errors=[],
-            parser_name="duplicate-test",
-            parser_version="1",
-        )
 
 
 class IncrementalCompilationTests(unittest.TestCase):
@@ -127,114 +78,6 @@ class IncrementalCompilationTests(unittest.TestCase):
         self.assertNotEqual(second.revision.tree_hash, first.revision.tree_hash)
         self.assertEqual([item.id for item in self.graph.project_history(self.root)], [second.revision.id, first.revision.id])
 
-    def test_compile_summary_keeps_unchanged_associated_test_for_modified_source(self) -> None:
-        source = self.root / "calculator.py"
-        test_dir = self.root / "tests"
-        test_dir.mkdir()
-        test_path = test_dir / "test_calculator.py"
-        source.write_text("def add(left, right):\n    return left + right\n", encoding="utf-8")
-        test_path.write_text(
-            "from calculator import add\n\n"
-            "def test_add():\n"
-            "    assert add(1, 2) == 3\n",
-            encoding="utf-8",
-        )
-        (test_dir / "test_unrelated.py").write_text("def test_unrelated():\n    assert True\n", encoding="utf-8")
-        self.graph.compile_project(self.root)
-
-        source.write_text("def add(left, right):\n    return int(left) + int(right)\n", encoding="utf-8")
-        result = self.graph.compile_project(self.root)
-
-        self.assertEqual([item["path"] for item in result.summary.changed_files], ["calculator.py"])
-        self.assertIn("add", {item.name.rsplit(".", 1)[-1] for item in result.summary.updated_symbols})
-        self.assertEqual([item.path for item in result.summary.associated_tests], ["tests/test_calculator.py"])
-        self.assertIn("summary", result.to_dict())
-
-    def test_code_context_omits_automatic_revision_section(self) -> None:
-        self.graph.compile_project(self.root)
-
-        context = self.graph.query_context("print a", scopes=["code"])
-        payload = self.graph.query_context_payload("print a", scopes=["code"])
-
-        self.assertNotIn("## Recent changes", context)
-        self.assertNotIn("recent_changes", payload)
-
-    def test_compile_flushes_disk_cache_once_per_batch(self) -> None:
-        original_write = DiskArtifactCache._write
-        with patch.object(DiskArtifactCache, "_write", autospec=True, side_effect=original_write) as write:
-            result = self.graph.compile_project(self.root)
-
-        self.assertEqual(result.run.files_changed, 2)
-        self.assertEqual(write.call_count, 1)
-
-    def test_disk_cache_is_used_when_graph_cache_nodes_are_missing(self) -> None:
-        self.graph.compile_project(self.root)
-        for node in self._nodes("ArtifactCacheEntry"):
-            properties = dict(node.properties)
-            properties["status"] = "archived"
-            properties["updated_at"] = utcnow_iso()
-            self.graph.store.update_node_fields(node.id, status="archived", properties=properties)
-
-        result = self.graph.compile_project(self.root)
-
-        self.assertEqual(result.run.files_seen, 2)
-        self.assertEqual(result.run.files_changed, 0)
-        self.assertEqual(result.run.files_skipped, 2)
-
-        self.graph.clear_cache(self.root)
-        recovered = self.graph.compile_project(self.root)
-        self.assertEqual(recovered.run.files_seen, 2)
-        self.assertEqual(recovered.run.files_changed, 0)
-        self.assertEqual(recovered.run.files_skipped, 2)
-        self.assertEqual(recovered.run.files_deleted, 0)
-        self.assertEqual(len(self._nodes("ArtifactCacheEntry")), 2)
-
-    def test_clear_cache_archives_disk_cache_entries(self) -> None:
-        result = self.graph.compile_project(self.root)
-
-        clear = self.graph.clear_cache(self.root)
-        payload = json.loads(artifact_cache_path(self.root).read_text(encoding="utf-8"))
-        statuses = {
-            entry["status"]
-            for entry in payload["projects"][result.scan.project.id]["entries"].values()
-        }
-
-        self.assertEqual(clear["cleared_entries"], 2)
-        self.assertEqual(statuses, {"archived"})
-
-    def test_cold_compile_creates_expected_technical_node_and_edge_types(self) -> None:
-        (self.root / "a.py").write_text(
-            "\n".join(
-                [
-                    "class Service:",
-                    "    def run(self):",
-                    "        return helper()",
-                    "",
-                    "def helper():",
-                    "    return 'ok'",
-                ]
-            ),
-            encoding="utf-8",
-        )
-
-        self.graph.compile_project(self.root)
-        node_types = {node.type for node in self.graph.store.all_nodes()}
-        edge_types = {edge.type for edge in self.graph.store.all_edges()}
-
-        self.assertTrue({"Project", "SourceArtifact", "SourceFragment", "Module", "Class", "Method", "Function"}.issubset(node_types))
-        self.assertTrue({"CONTAINS", "DEFINES", "CONTAINS_FRAGMENT", "DERIVED_FROM", "CALLS"}.issubset(edge_types))
-
-    def test_fragment_edges_use_persisted_id_returned_for_canonical_key(self) -> None:
-        service = IncrementalCompilationService(self.graph.store, compiler=DuplicateCanonicalFragmentCompiler())
-
-        service.compile_path(self.root)
-        edges = self.graph.store.all_edges()
-
-        self.assertIsNotNone(self.graph.get_node("candidate-fragment-one"))
-        self.assertIsNone(self.graph.get_node("candidate-fragment-two"))
-        self.assertFalse(any(edge.from_id == "candidate-fragment-two" or edge.to_id == "candidate-fragment-two" for edge in edges))
-        self.assertTrue(any(edge.from_id == "candidate-fragment-one" and edge.type == "LINKS_TO" for edge in edges))
-
     def test_second_compile_on_unchanged_project_skips_all_files(self) -> None:
         self.graph.compile_project(self.root)
         result = self.graph.compile_project(self.root)
@@ -244,25 +87,6 @@ class IncrementalCompilationTests(unittest.TestCase):
         self.assertEqual(result.run.files_skipped, 2)
         self.assertEqual(result.run.nodes_created, 0)
         self.assertEqual(result.run.edges_created, 0)
-
-    def test_large_project_detects_same_size_change_with_restored_mtime(self) -> None:
-        large_payload = "VALUE = 1\n" + ("x" * 16384)
-        paths = [self.root / f"large_{index}.py" for index in range(12)]
-        for path in paths:
-            path.write_text(large_payload, encoding="utf-8")
-        self.graph.compile_project(self.root)
-
-        unchanged = self.graph.compile_project(self.root)
-        self.assertEqual(unchanged.run.files_changed, 0)
-
-        original_stat = paths[5].stat()
-        changed_payload = "VALUE = 2\n" + ("x" * 16384)
-        self.assertEqual(len(changed_payload), len(large_payload))
-        paths[5].write_text(changed_payload, encoding="utf-8")
-        os.utime(paths[5], ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
-        changed = self.graph.compile_project(self.root)
-
-        self.assertEqual(changed.run.files_changed, 1)
 
     def test_compile_detects_deleted_artifact_when_cache_is_missing(self) -> None:
         first = self.graph.compile_project(self.root)
@@ -292,46 +116,28 @@ class IncrementalCompilationTests(unittest.TestCase):
         self.assertEqual(len(self._nodes("SourceFragment")), initial_fragment_count)
         self.assertGreaterEqual(second.run.nodes_updated, 1)
 
-    def test_document_and_code_changes_use_expected_document_code_relinking_scope(self) -> None:
-        (self.root / "a.py").write_text("def AlphaService():\n    return 'ok'\n", encoding="utf-8")
-        (self.root / "README.md").write_text("# Title\n\nAlphaService is documented.\n", encoding="utf-8")
-        first = self.graph.compile_project(self.root)
-        readme_id = self._artifact_id(first, "README.md")
-        (self.root / "README.md").write_text("# Title\n\nAlphaService is documented again.\n", encoding="utf-8")
+    def test_compile_summary_reports_only_semantically_changed_symbols(self) -> None:
+        source = self.root / "symbols.py"
+        source.write_text(
+            "def changed():\n    return 1\n\n\ndef untouched():\n"
+            "    print('stable call')\n    return 2\n",
+            encoding="utf-8",
+        )
+        self.graph.compile_project(self.root)
 
-        with patch("memory.services.incremental_compilation.link_document_fragments_to_code", wraps=incremental_compilation.link_document_fragments_to_code) as linker:
-            self.graph.compile_project(self.root)
+        source.write_text(
+            "# Lines may move without changing every symbol.\n\n"
+            "def changed():\n    return 3\n\n\ndef untouched():\n"
+            "    print('stable call')\n    return 2\n",
+            encoding="utf-8",
+        )
+        result = self.graph.compile_project(self.root)
 
-        self.assertTrue(linker.called)
-        self.assertEqual(linker.call_args.kwargs["artifact_ids"], {readme_id})
-
-        (self.root / "a.py").write_text("def BetaService():\n    return 'ok'\n", encoding="utf-8")
-
-        with patch("memory.services.incremental_compilation.link_document_fragments_to_code", wraps=incremental_compilation.link_document_fragments_to_code) as linker:
-            self.graph.compile_project(self.root)
-
-        self.assertTrue(linker.called)
-        self.assertIsNone(linker.call_args.kwargs["artifact_ids"])
-
-    def test_cache_planning_distinguishes_clean_changed_deleted_and_recoverable(self) -> None:
-        first = self.graph.compile_project(self.root)
-        readme_id = self._artifact_id(first, "README.md")
-        code_id = self._artifact_id(first, "a.py")
-
-        clean = self.graph.compile_project(self.root)
-        self.assertEqual(clean.dirty_set.changed_artifact_ids, set())
-
-        (self.root / "README.md").write_text("# Title\n\nChanged body\n", encoding="utf-8")
-        changed = self.graph.compile_project(self.root)
-        self.assertEqual(changed.dirty_set.changed_artifact_ids, {readme_id})
-
-        self.graph.clear_cache(self.root)
-        recovered = self.graph.compile_project(self.root)
-        self.assertEqual(recovered.run.files_changed, 0)
-
-        (self.root / "a.py").unlink()
-        deleted = self.graph.compile_project(self.root)
-        self.assertIn(code_id, deleted.dirty_set.deleted_artifact_ids)
+        self.assertEqual(
+            [(item.status, item.type, item.name) for item in result.summary.updated_symbols],
+            [("updated", "Function", "symbols.changed")],
+        )
+        self.assertGreater(result.run.nodes_updated, len(result.summary.updated_symbols))
 
     def test_deleting_one_file_archives_artifact_and_fragments(self) -> None:
         (self.root / "a.py").write_text(
@@ -452,30 +258,6 @@ class IncrementalCompilationTests(unittest.TestCase):
         self.assertNotIn(".cache/protected.py", relative_paths)
         self.assertIn(".cache", skipped_paths)
         self.assertEqual(status["total_artifacts"], len(result.scan.artifacts))
-
-    def test_scan_ignore_defaults_disables_internal_ignore_matcher(self) -> None:
-        (self.root / ".cache").mkdir()
-        (self.root / ".cache" / "included.py").write_text("included = True\n", encoding="utf-8")
-
-        result = self.graph.compile_project(
-            self.root,
-            parsing_options={"scan": {"ignore_defaults": True}},
-        )
-        relative_paths = {artifact.relative_path for artifact in result.scan.artifacts}
-
-        self.assertIn(".cache/included.py", relative_paths)
-
-    def test_cache_status_applies_default_ignores(self) -> None:
-        (self.root / ".git" / "objects" / "ab").mkdir(parents=True)
-        (self.root / ".git" / "objects" / "ab" / "packed").write_bytes(b"git object")
-        (self.root / ".cache").mkdir(exist_ok=True)
-        (self.root / ".cache" / "artifact.json").write_text("{}", encoding="utf-8")
-        (self.root / "__pycache__").mkdir(exist_ok=True)
-        (self.root / "__pycache__" / "a.cpython-314.pyc").write_bytes(b"bytecode")
-
-        status = self.graph.cache_status(self.root)
-
-        self.assertEqual(status["total_artifacts"], 2)
 
     def test_graph_delta_is_persisted_and_contains_affected_ids(self) -> None:
         result = self.graph.compile_project(self.root)

@@ -8,7 +8,7 @@ from typing import Any
 
 from ..diagnostics import PerformanceLogger
 from ..artifacts.cache import ArtifactCache, ArtifactCacheEntry, DirtySet, artifact_cache_path
-from ..artifacts.compile_summary import CompilationSummary, build_compilation_summary
+from ..artifacts.compile_summary import CompilationSummary, build_compilation_summary, capture_symbol_state
 from ..artifacts.compiler import ArtifactCompilationResult, ArtifactCompiler, archive_artifact_fragments, link_document_fragments_to_code
 from ..artifacts.context_scope import artifact_context_scope
 from ..artifacts.delta import CompilationRun, DeltaRepository, GraphDelta
@@ -174,6 +174,10 @@ class IncrementalCompilationService:
         run.files_deleted = len(dirty.deleted_artifact_ids)
 
         artifacts_by_id = {artifact.id: artifact for artifact in scan.artifacts}
+        previous_symbol_state = capture_symbol_state(
+            self.store,
+            dirty.changed_artifact_ids | dirty.deleted_artifact_ids,
+        )
         aggregate = _Aggregate()
         if profile:
             profile.event(
@@ -204,7 +208,12 @@ class IncrementalCompilationService:
                 errors=len(run.errors),
                 checkpointed=bool(checkpoint.get("checkpointed")) if checkpoint else False,
             )
-        summary = build_compilation_summary(self.store, revision=revision, delta=delta)
+        summary = build_compilation_summary(
+            self.store,
+            revision=revision,
+            delta=delta,
+            previous_symbol_state=previous_symbol_state,
+        )
         return CompileProjectResult(scan=scan, dirty_set=dirty, run=run, delta=delta, revision=revision, summary=summary)
 
     def _checkpoint_store_if_needed(self, profile: PerformanceLogger | None) -> dict[str, Any]:

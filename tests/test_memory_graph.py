@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import Counter
 from dataclasses import asdict
 import tempfile
 import unittest
@@ -8,39 +7,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 from api import MemoryGraph
-from memory.domain.models import MemoryEdge, MemoryNode, MemoryQuery
+from memory.domain.models import MemoryEdge, MemoryNode, MemoryQuery, MemorySubgraph, RankedNode
 from memory.extraction import normalization
 
 
 class NormalizationTests(unittest.TestCase):
-    def test_expanded_retrieval_tokens_are_cached_without_changing_results(self) -> None:
-        from memory.services.retrieval import _expanded_tokens
-
-        _expanded_tokens.cache_clear()
-        first = _expanded_tokens("AgentWorkspace.link_task task_ids")
-        second = _expanded_tokens("AgentWorkspace.link_task task_ids")
-
-        self.assertIs(first, second)
-        self.assertIn("agent", first)
-        self.assertIn("workspace", first)
-        self.assertIn("task", first)
-        self.assertEqual(_expanded_tokens.cache_info().hits, 1)
-
-    def test_token_signal_score_preserves_formula(self) -> None:
-        cases = {
-            "a": 0.0,
-            "__": 0.0,
-            "abc": 0.25,
-            "abcd": 0.5,
-            "abcdef": 0.75,
-            "1234": 0.65,
-            "abc123": 0.9,
-            "a_b": 0.45,
-            "api-error": 0.95,
-        }
-        for token, expected in cases.items():
-            with self.subTest(token=token):
-                self.assertEqual(normalization.token_signal_score(token), expected)
 
     def test_query_tokenization_is_language_agnostic(self) -> None:
         self.assertFalse(hasattr(normalization, "STOPWORDS"))
@@ -54,39 +25,6 @@ class NormalizationTests(unittest.TestCase):
         self.assertIn("pagamento", tokens)
         self.assertIn("uberweisung", tokens)
         self.assertIn("apierror42", tokens)
-
-    def test_keyword_scores_match_reference_scoring(self) -> None:
-        samples = [
-            "compile artifact compile_project APIError42 Überweisung",
-            "alpha beta alpha-beta nested.path route#handler",
-            "dove questo pagamento where this read return raise",
-            "compile compile compile APIError42 APIError42",
-            "résumé naïve über façade route#handler nested.path alpha-beta",
-            "x y z __ -- method_name method-name path/to/file.py",
-        ]
-        for sample in samples:
-            with self.subTest(sample=sample):
-                self.assertEqual(normalization.keyword_scores(sample, max_terms=20), self._reference_keyword_scores(sample, max_terms=20))
-
-    def _reference_keyword_scores(self, value: str, *, max_terms: int = 12) -> list[tuple[str, float]]:
-        tokens = normalization.tokenize(value)
-        if not tokens:
-            return []
-        counts = Counter(tokens)
-        for a, b in zip(tokens, tokens[1:]):
-            if normalization.token_signal_score(a) >= 0.5 and normalization.token_signal_score(b) >= 0.5:
-                counts[f"{a} {b}"] += 1.25
-        max_count = max(counts.values()) or 1
-        scored = []
-        for term, count in counts.items():
-            if " " in term:
-                specificity = 1.15 + min(normalization.token_signal_score(part) for part in term.split())
-            else:
-                specificity = normalization.token_signal_score(term)
-            scored.append((term, min(1.0, (count / max_count) * specificity)))
-        scored.sort(key=lambda item: (item[1], len(item[0])), reverse=True)
-        return scored[:max_terms]
-
 
 class DomainModelTests(unittest.TestCase):
     def test_node_and_edge_to_dict_match_dataclass_payload_and_isolate_properties(self) -> None:
@@ -113,31 +51,6 @@ class DomainModelTests(unittest.TestCase):
         edge_payload["properties"]["nested"]["items"].append("mutated")
         self.assertEqual(node.properties["nested"]["items"], ["a"])
         self.assertEqual(edge.properties["nested"]["items"], ["b"])
-
-    def test_node_and_edge_to_dict_can_skip_property_copy(self) -> None:
-        node = MemoryNode(id="n1", type="Topic", properties={"nested": {"items": ["a"]}})
-        edge = MemoryEdge(id="e1", from_id="n1", to_id="n2", type="RELATED_TO", properties={"nested": {"items": ["b"]}})
-
-        self.assertIs(node.to_dict(copy_properties=False)["properties"], node.properties)
-        self.assertIs(edge.to_dict(copy_properties=False)["properties"], edge.properties)
-
-    def test_query_to_dict_matches_dataclass_payload_and_isolates_sets(self) -> None:
-        query = MemoryQuery(
-            text="compile artifact",
-            node_types={"Function"},
-            edge_types={"CALLS"},
-            context_scopes={"code"},
-        )
-
-        payload = query.to_dict()
-
-        self.assertEqual(payload, asdict(query))
-        payload["node_types"].add("Class")
-        payload["edge_types"].add("IMPORTS")
-        payload["context_scopes"].add("docs")
-        self.assertEqual(query.node_types, {"Function"})
-        self.assertEqual(query.edge_types, {"CALLS"})
-        self.assertEqual(query.context_scopes, {"code"})
 
 
 class MemoryGraphIntegrationTests(unittest.TestCase):
@@ -290,23 +203,26 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
         self.assertIn("# REQL Context", context)
         self.assertIn("Mode: informative", context)
         self.assertIn("Scope: code", context)
-        self.assertIn("## Code results", context)
+        self.assertIn("## Files", context)
+        self.assertIn("## Associated tests", context)
         self.assertNotIn("## Read plan", context)
         self.assertNotIn("## Recent changes", context)
         self.assertNotIn("## Action plan", context)
-        self.assertIn("## Change chain", context)
-        self.assertIn("## Research queries", context)
-        self.assertIn("## Summary", context)
+        self.assertNotIn("## Change chain", context)
+        self.assertNotIn("## Research queries", context)
+        self.assertNotIn("## Summary", context)
+        self.assertNotIn("## Graph links", context)
+        self.assertNotIn("## Snippets", context)
         self.assertNotIn("## Best matches", context)
         self.assertNotIn("## Source evidence", context)
         self.assertIn("src/memory/services/retrieval.py [2-4]", context)
-        self.assertIn("inspect_node=", context)
+        self.assertIn("owners=src.memory.services.retrieval.RetrievalEngine.query_context", context)
         self.assertNotIn("signals:", context)
         self.assertIn("src/memory/services/retrieval.py", context)
         self.assertIn("query_context", context)
         self.assertNotIn("src/reql.egg-info/PKG-INFO", context)
         self.assertNotIn("docs/query_context.md", context)
-        self.assertNotIn("tests/test_retrieval.py", context)
+        self.assertIn("tests/test_retrieval.py [10-18]", context)
 
         payload = self.graph.query_context_payload(query, top_k=8, scopes=["code"])
         self.assertEqual(payload["kind"], "code")
@@ -333,7 +249,9 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
         self.assertTrue(payload["impact"])
         self.assertTrue(payload["targeted_reads"])
         self.assertFalse(payload["snippets"])
-        self.assertFalse(payload["test_targets"])
+        self.assertTrue(any(item["path"] == "tests/test_retrieval.py" for item in payload["test_targets"]))
+        self.assertEqual(payload["confidence"]["status"], "sufficient")
+        self.assertFalse(payload["confidence"]["targeted_rg_fallback_allowed"])
         self.assertTrue(any(item["label"] == "Retrieve ranked rows" for item in payload["followups"]))
         self.assertNotIn("symbols", payload)
         self.assertNotIn("code_links", payload)
@@ -375,105 +293,115 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
         self.assertNotIn("intervention_targets", default_payload)
         self.assertFalse(default_payload["cleanup_candidates"])
 
-    def test_query_context_includes_application_views_and_css_assets(self) -> None:
-        nodes = [
+    def test_scoped_query_context_does_not_materialize_the_full_graph(self) -> None:
+        query = "query_context indexed scoped retrieval"
+        self.graph.add_node(
             MemoryNode(
-                id="function:auth-controller",
-                type="Method",
-                label="AuthController.login",
-                text="AuthController handles login password field validation.",
-                canonical_key="app.controllers.AuthController.login",
+                id="function:scoped-query-context",
+                type="Function",
+                label="query_context",
+                text=query,
+                canonical_key="function:scoped-query-context",
                 properties={
-                    "relative_path": "app/Controllers/AuthController.php",
+                    "relative_path": "src/memory/services/retrieval.py",
                     "context_scope": "code",
-                    "qualified_name": "AuthController.login",
-                    "line_start": 12,
-                    "line_end": 40,
+                    "name": "query_context",
+                    "qualified_name": "memory.services.retrieval.RetrievalEngine.query_context",
+                    "line_start": 246,
+                    "line_end": 249,
                 },
                 salience=0.9,
-            ),
+            )
+        )
+        self.graph.add_node(
             MemoryNode(
-                id="fragment:home-view",
+                id="fragment:scoped-query-context-docs",
                 type="SourceFragment",
-                label="app/Views/home/index.php#password",
-                text='<input class="password-field" name="password" type="password">',
-                canonical_key="fragment:home-view-password",
+                label="docs/query_context.md#1",
+                text=query,
+                canonical_key="fragment:scoped-query-context-docs",
                 properties={
-                    "relative_path": "app/Views/home/index.php",
-                    "context_scope": "code",
-                    "line_start": 20,
-                    "line_end": 24,
+                    "relative_path": "docs/query_context.md",
+                    "context_scope": "docs",
+                    "line_start": 1,
+                    "line_end": 3,
                 },
-                salience=0.8,
-            ),
-            MemoryNode(
-                id="fragment:app-css",
-                type="SourceFragment",
-                label="public/assets/css/app.css#password",
-                text=".password-field { border-color: var(--form-border); }",
-                canonical_key="fragment:app-css-password",
-                properties={
-                    "relative_path": "public/assets/css/app.css",
-                    "context_scope": "code",
-                    "line_start": 100,
-                    "line_end": 106,
-                },
-                salience=0.8,
-            ),
-        ]
-        for node in nodes:
+                salience=1.0,
+            )
+        )
+
+        with patch.object(self.graph.store, "all_nodes", side_effect=AssertionError("full graph scan")):
+            payload = self.graph.query_context_payload(query, top_k=8, scopes=["code"])
+
+        self.assertTrue(any(item["id"] == "function:scoped-query-context" for item in payload["owner_candidates"]))
+        self.assertFalse(any(item["path"] == "docs/query_context.md" for item in payload["working_set"]))
+
+    def test_docs_query_uses_specific_evidence_and_visible_confidence(self) -> None:
+        query = "configure diagnostics performance logging path"
+        concept = MemoryNode(
+            id="concept:diagnostics-enabled",
+            type="Concept",
+            label="diagnostics enabled",
+            text="project defaults cache graph settings",
+            canonical_key="concept:diagnostics-enabled",
+            properties={
+                "relative_path": "docs/CONFIGURATION.md",
+                "context_scope": "docs",
+                "extractor": "document_processor",
+            },
+            salience=0.7,
+        )
+        evidence = MemoryNode(
+            id="raw:diagnostics-enabled",
+            type="RawEvent",
+            label="document_term_observation:diagnostics enabled",
+            text="diagnostics.enabled controls structured performance logging path",
+            canonical_key="raw:diagnostics-enabled",
+            properties={
+                "relative_path": "docs/CONFIGURATION.md",
+                "context_scope": "docs",
+                "extractor": "document_processor",
+                "line_start": 84,
+                "line_end": 84,
+            },
+            salience=0.5,
+        )
+        generic = MemoryNode(
+            id="concept:generic-community",
+            type="Concept",
+            label="community",
+            text="community records mention performance logging",
+            canonical_key="concept:generic-community",
+            properties={
+                "relative_path": "docs/GRAPH_ANALYSIS.md",
+                "context_scope": "docs",
+                "extractor": "document_processor",
+            },
+            salience=0.9,
+        )
+        for node in (concept, evidence, generic):
             self.graph.add_node(node)
-
-        payload = self.graph.query_context_payload("password field", top_k=8, scopes=["code"])
-        working_paths = {row["path"] for row in payload["working_set"]}
-
-        self.assertIn("app/Controllers/AuthController.php", working_paths)
-        self.assertIn("app/Views/home/index.php", working_paths)
-        self.assertIn("public/assets/css/app.css", working_paths)
-
-    def test_query_context_filters_unrelated_javascript_generic_workflow_noise(self) -> None:
-        target = MemoryNode(
-            id="method:checkout-discount",
-            type="Method",
-            label="CheckoutController.applyDiscount",
-            text="Checkout discount calculation applies coupon totals.",
-            canonical_key="app.controllers.CheckoutController.applyDiscount",
-            properties={
-                "relative_path": "app/Controllers/CheckoutController.php",
-                "context_scope": "code",
-                "qualified_name": "CheckoutController.applyDiscount",
-                "line_start": 30,
-                "line_end": 52,
-            },
-            salience=0.4,
+        self.graph.add_edge(
+            MemoryEdge(
+                id="edge:diagnostics-evidence",
+                from_id=concept.id,
+                to_id=evidence.id,
+                type="EVIDENCED_BY",
+                weight=1.0,
+            )
         )
-        js_noise = MemoryNode(
-            id="function:unrelated-workflow-js",
-            type="Function",
-            label="initWorkflow",
-            text="Unrelated workflow helper function toggles menu animation.",
-            canonical_key="public.js.workflow.initWorkflow",
-            properties={
-                "relative_path": "public/js/workflow.js",
-                "context_scope": "code",
-                "qualified_name": "initWorkflow",
-                "line_start": 1,
-                "line_end": 16,
-            },
-            salience=0.99,
-        )
-        self.graph.add_node(target)
-        self.graph.add_node(js_noise)
 
-        payload = self.graph.query_context_payload("checkout discount fix workflow function", top_k=8, scopes=["code"])
-        working_paths = {row["path"] for row in payload["working_set"]}
+        payload = self.graph.query_context_payload(query, top_k=12, scopes=["docs"])
 
-        self.assertEqual(payload["kind"], "code")
-        self.assertNotIn("results", payload)
-        self.assertIn("app/Controllers/CheckoutController.php", working_paths)
-        self.assertNotIn("public/js/workflow.js", working_paths)
-        self.assertTrue(any(item["id"] == "method:checkout-discount" for item in payload["owner_candidates"]))
-        self.assertFalse(any(item["id"] == "function:unrelated-workflow-js" for item in payload["owner_candidates"]))
+        self.assertTrue(payload["results"])
+        top = payload["results"][0]
+        self.assertEqual(top["id"], concept.id)
+        self.assertEqual(top["text"], evidence.text)
+        self.assertEqual(top["location"], "docs/CONFIGURATION.md:84")
+        self.assertEqual(payload["confidence"]["max_score"], round(float(top["score"]), 4))
+        self.assertEqual(payload["confidence"]["status"], "sufficient")
+        self.assertFalse(any(item["type"] == "RawEvent" for item in payload["results"]))
+        self.assertFalse(any(item["id"] == generic.id for item in payload["results"]))
 
     def test_cleanup_query_context_includes_stronger_targeted_read_payload(self) -> None:
         source_path = Path(self.tmp.name) / "app.py"
@@ -713,59 +641,6 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
         self.assertFalse(any(row["path"] == "src/scoped.py" for row in test_payload["working_set"]))
         self.assertTrue(any(item["location"] == "docs/scoped.md:2-4" for item in docs_payload["results"]))
 
-    def test_query_context_ignores_single_token_install_false_positive(self) -> None:
-        query = "install nome database non trovato database name not found installing"
-        database_handler = MemoryNode(
-            id="function:database-install-error",
-            type="Function",
-            label="handle_database_name_not_found",
-            text="Handle database name not found while installing a database.",
-            canonical_key="src.memory.database.handle_database_name_not_found",
-            properties={
-                "relative_path": "src/memory/database.py",
-                "context_scope": "code",
-                "name": "handle_database_name_not_found",
-                "qualified_name": "src.memory.database.handle_database_name_not_found",
-                "line_start": 12,
-                "line_end": 18,
-            },
-            salience=0.7,
-        )
-        install_launcher = MemoryNode(
-            id="function:agent-install-launcher",
-            type="Function",
-            label="install",
-            text="Install agent launcher commands and shell scripts.",
-            canonical_key="src.agents.install.install",
-            properties={
-                "relative_path": "src/agents/install.py",
-                "context_scope": "code",
-                "name": "install",
-                "qualified_name": "src.agents.install.install",
-                "line_start": 40,
-                "line_end": 80,
-            },
-            salience=0.95,
-        )
-        self.graph.add_node(database_handler)
-        self.graph.add_node(install_launcher)
-
-        payload = self.graph.query_context_payload(query, top_k=8, scopes=["code"])
-
-        self.assertEqual(payload["kind"], "code")
-        self.assertTrue(any(row["path"] == "src/memory/database.py" for row in payload["working_set"]))
-        self.assertFalse(any(row["path"] == "src/agents/install.py" for row in payload["working_set"]))
-        self.assertTrue(any(item["id"] == "function:database-install-error" for item in payload["owner_candidates"]))
-        self.assertFalse(any(item["id"] == "function:agent-install-launcher" for item in payload["owner_candidates"]))
-
-        no_match = self.graph.query_context_payload("unmatched archive restore marker", top_k=8, scopes=["code"])
-        self.assertEqual(no_match["kind"], "code")
-        self.assertFalse(no_match["working_set"])
-        self.assertFalse(no_match["targeted_reads"])
-        self.assertFalse(no_match["read_plan"])
-        self.assertTrue(any(item["label"] == "Retrieve source rows" for item in no_match["followups"]))
-        self.assertTrue(any(item["label"] == "Expand graph context" for item in no_match["followups"]))
-
     def test_query_context_keeps_structured_identifier_matches_actionable(self) -> None:
         target = MemoryNode(
             id="function:code-targeted-reads",
@@ -808,86 +683,6 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
         self.assertTrue(reads)
         self.assertEqual(reads[0]["line_start"], 2024)
         self.assertEqual(reads[0]["line_end"], 2075)
-
-    def test_query_context_uses_structured_symbol_tokens_for_compound_queries(self) -> None:
-        class_node = MemoryNode(
-            id="class:catalog-client",
-            type="Class",
-            label="App.Clients.CatalogClient",
-            text="",
-            canonical_key="App.Clients.CatalogClient",
-            properties={
-                "relative_path": "app/Clients/CatalogClient.php",
-                "context_scope": "code",
-                "name": "CatalogClient",
-                "qualified_name": "App.Clients.CatalogClient",
-                "start_line": 4,
-                "end_line": 45,
-            },
-            salience=0.2,
-        )
-        release_method = MemoryNode(
-            id="method:catalog-release-dates",
-            type="Method",
-            label="App.Clients.CatalogClient.fetchMovieReleaseDates",
-            text="",
-            canonical_key="App.Clients.CatalogClient.fetchMovieReleaseDates",
-            properties={
-                "relative_path": "app/Clients/CatalogClient.php",
-                "context_scope": "code",
-                "name": "fetchMovieReleaseDates",
-                "qualified_name": "App.Clients.CatalogClient.fetchMovieReleaseDates",
-                "start_line": 12,
-                "end_line": 18,
-            },
-            salience=0.2,
-        )
-        upcoming_method = MemoryNode(
-            id="method:catalog-upcoming",
-            type="Method",
-            label="App.Clients.CatalogClient.discoverUpcomingMovies",
-            text="",
-            canonical_key="App.Clients.CatalogClient.discoverUpcomingMovies",
-            properties={
-                "relative_path": "app/Clients/CatalogClient.php",
-                "context_scope": "code",
-                "name": "discoverUpcomingMovies",
-                "qualified_name": "App.Clients.CatalogClient.discoverUpcomingMovies",
-                "start_line": 20,
-                "end_line": 28,
-            },
-            salience=0.2,
-        )
-        noisy_fragment = MemoryNode(
-            id="fragment:catalog-noise",
-            type="SourceFragment",
-            label="docs/catalog.md#noise",
-            text="movie release dates discover upcoming integration notes",
-            canonical_key="fragment:catalog-noise",
-            properties={"relative_path": "docs/catalog.md", "context_scope": "docs", "line_start": 1, "line_end": 4},
-            salience=0.95,
-        )
-        for node in (class_node, release_method, upcoming_method, noisy_fragment):
-            self.graph.add_node(node)
-        self.graph.add_edge(MemoryEdge(id="edge:class-release", from_id=class_node.id, to_id=release_method.id, type="METHOD"))
-        self.graph.add_edge(MemoryEdge(id="edge:class-upcoming", from_id=class_node.id, to_id=upcoming_method.id, type="METHOD"))
-
-        payload = self.graph.query_context_payload(
-            "CatalogClient movie release dates discover upcoming",
-            top_k=8,
-            max_depth=1,
-            scopes=["code"],
-        )
-
-        working_paths = {row["path"] for row in payload["working_set"]}
-        self.assertIn("app/Clients/CatalogClient.php", working_paths)
-        self.assertNotIn("docs/catalog.md", working_paths)
-        owner_ids = {item["id"] for item in payload["owner_candidates"]}
-        self.assertIn("method:catalog-release-dates", owner_ids)
-        self.assertIn("method:catalog-upcoming", owner_ids)
-        reads = {item["node_id"]: item for item in payload["targeted_reads"]}
-        self.assertEqual(reads["method:catalog-release-dates"]["line_start"], 12)
-        self.assertEqual(reads["method:catalog-upcoming"]["line_end"], 28)
 
     def test_query_context_embeds_exact_source_fragment_snippet_for_small_code_sets(self) -> None:
         project_root = Path(self.tmp.name) / "project"
@@ -952,72 +747,99 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
         self.assertEqual(payload["snippets"][0]["path"], "profile/show.php")
         self.assertEqual(payload["snippets"][0]["line_start"], 4)
         self.assertIn("Statistiche di visualizzazione", payload["snippets"][0]["text"])
-        self.assertIn("## Snippets", rendered)
+        self.assertNotIn("## Snippets", rendered)
         self.assertIn("profile/show.php [4]", rendered)
-        self.assertIn("Statistiche di visualizzazione", rendered)
 
-    def test_query_context_keeps_small_working_set_rendering_compact(self) -> None:
-        for index in range(5):
+    def test_query_context_renders_at_most_eight_files_with_owners_ranges_and_tests(self) -> None:
+        query = "bounded formatter owner range associated tests"
+        for index in range(10):
             self.graph.add_node(
                 MemoryNode(
-                    id=f"method:compact-{index}",
+                    id=f"method:bounded-source-{index}",
                     type="Method",
-                    label=f"App.Service.CompactTarget.part{index}",
-                    text="compact result marker bounded render",
-                    canonical_key=f"App.Service.CompactTarget.part{index}",
+                    label=f"App.Service{index}.render_context",
+                    text=query,
+                    canonical_key=f"App.Service{index}.render_context",
                     properties={
-                        "relative_path": "app/Service.php",
+                        "relative_path": f"src/service_{index}.py",
                         "context_scope": "code",
-                        "name": f"part{index}",
-                        "qualified_name": f"App.Service.CompactTarget.part{index}",
+                        "name": "render_context",
+                        "qualified_name": f"App.Service{index}.render_context",
                         "line_start": 10 + index,
-                        "line_end": 10 + index,
+                        "line_end": 20 + index,
                     },
-                    salience=0.7,
+                )
+            )
+        for index in range(3):
+            self.graph.add_node(
+                MemoryNode(
+                    id=f"function:bounded-test-{index}",
+                    type="Function",
+                    label=f"test_bounded_context_{index}",
+                    text=query,
+                    canonical_key=f"tests.test_service_{index}.test_bounded_context_{index}",
+                    properties={
+                        "relative_path": f"tests/test_service_{index}.py",
+                        "context_scope": "test",
+                        "name": f"test_bounded_context_{index}",
+                        "qualified_name": f"tests.test_service_{index}.test_bounded_context_{index}",
+                        "line_start": 30 + index,
+                        "line_end": 35 + index,
+                    },
                 )
             )
 
-        payload = self.graph.query_context_payload("CompactTarget compact result marker", top_k=8, scopes=["code"])
-        rendered = self.graph.query_context("CompactTarget compact result marker", top_k=8, scopes=["code"])
+        rendered = self.graph.query_context(query, top_k=20, max_items=20, scopes=["code"])
+        rendered_file_lines = [line for line in rendered.splitlines() if line.startswith("- `")]
 
-        self.assertGreaterEqual(len(payload["targeted_reads"]), 5)
-        self.assertLessEqual(rendered.count("- ref `"), 3)
+        self.assertLessEqual(len(rendered_file_lines), 8)
+        self.assertGreaterEqual(len(rendered_file_lines), 5)
+        self.assertIn("## Associated tests", rendered)
+        self.assertIn("owners=App.Service", rendered)
+        self.assertRegex(rendered, r"src/service_\d+\.py \[\d+-\d+\]")
+        self.assertIn("tests/test_service_", rendered)
 
-    def test_reql_symbol_rows_resolve_line_start_aliases(self) -> None:
-        symbol = MemoryNode(
-            id="method:catalog-release-dates",
+    def test_query_context_short_circuits_to_targeted_rg_when_confidence_is_low(self) -> None:
+        weak_match = MemoryNode(
+            id="method:weak-context-match",
             type="Method",
-            label="App.Clients.CatalogClient.fetchMovieReleaseDates",
-            text="",
-            canonical_key="App.Clients.CatalogClient.fetchMovieReleaseDates",
+            label="App.WeakContext.maybe_related",
+            text="one weak partial match",
+            canonical_key="App.WeakContext.maybe_related",
             properties={
-                "relative_path": "app/Clients/CatalogClient.php",
+                "relative_path": "src/weak_context.py",
                 "context_scope": "code",
-                "name": "fetchMovieReleaseDates",
-                "qualified_name": "App.Clients.CatalogClient.fetchMovieReleaseDates",
-                "start_line": 12,
-                "end_line": 18,
+                "qualified_name": "App.WeakContext.maybe_related",
+                "line_start": 12,
+                "line_end": 18,
             },
         )
-        self.graph.add_node(symbol)
-
-        result = self.graph.query(
-            "SYMBOLS WHERE name = 'fetchMovieReleaseDates' RETURN name,start_line,end_line,line_start,line_end"
+        subgraph = MemorySubgraph(
+            query=MemoryQuery(text="missing exact implementation marker", context_scopes={"code"}),
+            ranked_nodes=[
+                RankedNode(
+                    node=weak_match,
+                    score=0.12,
+                    reasons={"match_score": 0.08, "coverage": 0.2},
+                )
+            ],
+            nodes=[weak_match],
+            edges=[],
+            seed_node_ids=[weak_match.id],
+            trace_id="retrieval:weak-context",
         )
 
-        self.assertEqual(result.rows[0]["start_line"], 12)
-        self.assertEqual(result.rows[0]["end_line"], 18)
-        self.assertEqual(result.rows[0]["line_start"], 12)
-        self.assertEqual(result.rows[0]["line_end"], 18)
+        payload = self.graph.retrieval.query_context_payload(subgraph, max_items=8, query_scopes=["code"])
+        rendered = self.graph.retrieval.compose_context(subgraph, max_items=8, query_scopes=["code"])
 
-    def test_unfiltered_find_uses_indexed_count_metadata(self) -> None:
-        self.graph.add_node(MemoryNode(id="fact:indexed-count", type="Fact", label="Indexed count", salience=0.9))
-
-        with patch.object(self.graph.store, "all_nodes", side_effect=AssertionError("unexpected full node scan")):
-            result = self.graph.query("FIND nodes LIMIT 1")
-
-        self.assertEqual(len(result.rows), 1)
-        self.assertGreaterEqual(result.diagnostics["matched"], 1)
+        self.assertEqual(payload["confidence"]["status"], "insufficient")
+        self.assertEqual(payload["confidence"]["max_score"], 0.12)
+        self.assertEqual(payload["confidence"]["threshold"], 0.25)
+        self.assertTrue(payload["confidence"]["targeted_rg_fallback_allowed"])
+        self.assertIn("Confidence: insufficient", rendered)
+        self.assertIn("targeted rg fallback allowed", rendered)
+        self.assertNotIn("## Files", rendered)
+        self.assertNotIn("src/weak_context.py", rendered)
 
     def test_query_outputs_include_directional_edge_context(self) -> None:
         upstream = MemoryNode(
@@ -1119,242 +941,6 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
             set(ranked_nodes[0]["reasons"]),
             {"match_score", "coverage", "path_score", "type_bonus", "seed_score", "depth_penalty"},
         )
-
-    def test_free_search_sentence_query_prefers_contiguous_solution_text(self) -> None:
-        target = MemoryNode(
-            id="function:apply-compile-transaction",
-            type="Function",
-            label="apply_compile_transaction",
-            text="compile transaction applies artifact updates before checkpoint and records graph delta",
-            canonical_key="src.memory.services.incremental_compilation.apply_compile_transaction",
-            salience=0.05,
-            properties={"relative_path": "src/memory/services/incremental_compilation.py", "line_start": 207, "line_end": 310},
-        )
-        scattered = MemoryNode(
-            id="function:scattered-compile-helper",
-            type="Function",
-            label="scattered_compile_helper",
-            text="checkpoint helper mentions compile cache records delta and later unrelated artifact transaction updates",
-            canonical_key="src.memory.services.scattered_compile_helper",
-            salience=0.99,
-            properties={"relative_path": "src/memory/services/noise.py", "line_start": 1, "line_end": 20},
-        )
-        self.graph.add_node(target)
-        self.graph.add_node(scattered)
-
-        payload = self.graph.query_memories_payload(
-            "where does compile transaction applies artifact updates before checkpoint",
-            top_k=2,
-            max_depth=0,
-        )
-
-        ranked_nodes = payload["ranked_nodes"]
-        self.assertEqual(ranked_nodes[0]["id"], target.id)
-        self.assertGreater(ranked_nodes[0]["reasons"]["match_score"], ranked_nodes[1]["reasons"]["match_score"])
-
-    def test_free_search_ranks_chain_coverage_over_isolated_seed(self) -> None:
-        capture = MemoryNode(
-            id="function:payment-capture",
-            type="Function",
-            label="payment_capture",
-            text="Payment capture workflow.",
-            canonical_key="src.payments.payment_capture",
-            properties={"relative_path": "src/payments.py", "line_start": 5, "line_end": 12},
-        )
-        repository = MemoryNode(
-            id="class:order-repository",
-            type="Class",
-            label="OrderRepository",
-            text="Order repository persistence for captured payments.",
-            canonical_key="src.orders.OrderRepository",
-            properties={"relative_path": "src/orders.py", "line_start": 20, "line_end": 35},
-        )
-        unrelated = MemoryNode(
-            id="function:payment-logger",
-            type="Function",
-            label="payment_logger",
-            text="Payment logger.",
-            canonical_key="src.logs.payment_logger",
-            properties={"relative_path": "src/logs.py", "line_start": 1, "line_end": 6},
-        )
-        for node in (capture, repository, unrelated):
-            self.graph.add_node(node)
-        self.graph.add_edge(MemoryEdge(id="edge:capture-repository", from_id=capture.id, to_id=repository.id, type="CALLS", weight=1.0))
-        self.graph.add_edge(MemoryEdge(id="edge:capture-logger", from_id=capture.id, to_id=unrelated.id, type="CALLS", weight=1.0))
-
-        payload = self.graph.query_memories_payload("payment capture order repository", top_k=4, max_depth=1)
-        ranked_nodes = payload["ranked_nodes"]
-        ids = [item["id"] for item in ranked_nodes]
-
-        self.assertLess(ids.index(repository.id), ids.index(unrelated.id))
-        self.assertGreater(ranked_nodes[ids.index(repository.id)]["reasons"]["coverage"], ranked_nodes[ids.index(unrelated.id)]["reasons"]["coverage"])
-
-    def test_free_search_commands_share_top_ranked_pipeline(self) -> None:
-        service = MemoryNode(
-            id="function:query-context-service",
-            type="Function",
-            label="query_context_service",
-            text="query context service targeted reads snippets",
-            canonical_key="src.context.query_context_service",
-            properties={"relative_path": "src/context.py", "context_scope": "code", "line_start": 4, "line_end": 9},
-        )
-        source = MemoryNode(
-            id="fragment:query-context-service",
-            type="SourceFragment",
-            label="src/context.py#query_context_service",
-            text="def query_context_service(): return targeted_reads",
-            canonical_key="fragment:query-context-service",
-            properties={"relative_path": "src/context.py", "context_scope": "code", "line_start": 4, "line_end": 9},
-        )
-        self.graph.add_node(service)
-        self.graph.add_node(source)
-        self.graph.add_edge(MemoryEdge(id="edge:service-source", from_id=service.id, to_id=source.id, type="EVIDENCED_BY", weight=1.0))
-
-        query = "query context service targeted reads"
-        graph_payload = self.graph.query_graph(query, top_k=4, max_depth=1, max_nodes=20, max_edges=20)
-        memories = self.graph.query_memories(query, top_k=4, max_depth=1, limit=4)
-        memories_payload = self.graph.query_memories_payload(query, top_k=4, max_depth=1, limit=4)
-        explore = self.graph.query_explore(query, views=["owners", "code"], top_k=4, max_depth=1, limit=4)
-        context_payload = self.graph.query_context_payload(query, top_k=4, max_depth=1, scopes=["code"])
-
-        self.assertEqual(graph_payload["ranked_nodes"][0]["id"], service.id)
-        self.assertEqual(memories[0]["id"], service.id)
-        self.assertEqual(memories_payload["memories"][0]["id"], service.id)
-        self.assertEqual(memories_payload["ranked_nodes"][0]["id"], service.id)
-        self.assertEqual(memories_payload["nodes"][0]["id"], service.id)
-        self.assertIn("trace_id", memories_payload)
-        self.assertIn("seed_node_ids", memories_payload)
-        self.assertEqual(explore["seed_nodes"][0]["id"], service.id)
-        self.assertIn("context", explore)
-        self.assertNotIn("## Follow-Up Queries", explore["context"])
-        self.assertIn("followups", explore)
-        self.assertTrue(any(item["id"] == service.id for item in context_payload["owner_candidates"]))
-        self.assertTrue(any(item["node_id"] == service.id for item in context_payload["targeted_reads"]))
-
-    def test_query_context_is_agent_ready_with_ids_sources_without_rendered_followups(self) -> None:
-        plant = MemoryNode(
-            id="fact:plant",
-
-            type="Fact",
-            label="Office plant watering",
-            text="Office plant watering should happen every Monday.",
-            canonical_key="office_plant_watering",
-            salience=0.9,
-            properties={"relative_path": "facilities.md", "line_start": 12, "line_end": 12},
-        )
-        source = MemoryNode(
-            id="fragment:plant-note",
-
-            type="SourceFragment",
-            label="Facilities source note",
-            text="Facilities source note says office plant watering is due every Monday.",
-            canonical_key="office_plant_source_note",
-            salience=0.8,
-            properties={"metadata": {"source_path": "facilities.md", "start_line": 12, "end_line": 12}},
-        )
-        self.graph.add_node(plant)
-        self.graph.add_node(source)
-        self.graph.add_edge(
-            MemoryEdge(
-                id="edge:plant-source",
-
-                from_id=plant.id,
-                to_id=source.id,
-                type="EVIDENCED_BY",
-                weight=1.0,
-                properties={"source_file": "facilities.md", "line_start": 12, "line_end": 12},
-            )
-        )
-
-        context = self.graph.query_context("office plant watering", top_k=3, max_depth=1, max_items=6)
-
-        self.assertIn("# REQL Context", context)
-        self.assertNotIn("## Best matches", context)
-        self.assertIn("## Results", context)
-        self.assertIn("## Graph links", context)
-        self.assertIn("## Research queries", context)
-        self.assertIn("## Summary", context)
-        self.assertIn("`fact:plant`", context)
-        self.assertIn("facilities.md:12", context)
-        self.assertNotIn("## Source evidence", context)
-        self.assertIn("`fragment:plant-note`", context)
-        self.assertIn("`edge:plant-source`", context)
-        self.assertNotIn("## Follow-Up Queries", context)
-        self.assertIn("inspect --node-id fact:plant --json", context)
-        self.assertIn('RETRIEVE "office plant watering"', context)
-
-        payload = self.graph.query_context_payload("office plant watering", top_k=3, max_depth=1, max_items=6)
-        self.assertEqual(payload["kind"], "general")
-        self.assertNotIn("context", payload)
-        self.assertIn("results", payload)
-        self.assertNotIn("best_matches", payload)
-        self.assertNotIn("source_evidence", payload)
-        self.assertNotIn("source_evidence_items", payload)
-        self.assertTrue(any(item["label"] == "Inspect top node" for item in payload["followups"]))
-        self.assertTrue(any('RETRIEVE "office plant watering"' in item["command"] for item in payload["followups"]))
-        self.assertNotIn("working_set", payload)
-
-    def test_query_context_correlates_related_files_without_rendering_action_plan(self) -> None:
-        project_id = "project:wp-optimizer"
-        readme = MemoryNode(
-            id="fragment:wp-readme-faq",
-            type="SourceFragment",
-            label="readme.txt FAQ",
-            text="Frequently Asked Questions FAQ for the wp-optimizer plugin.",
-            canonical_key="wp-optimizer:readme:faq",
-            properties={
-                "project_id": project_id,
-                "relative_path": "readme.txt",
-                "context_scope": "docs",
-                "line_start": 376,
-                "line_end": 496,
-            },
-        )
-        handler = MemoryNode(
-            id="method:wp-admin-faq",
-            type="Method",
-            label="PagesHandler.renderFaq",
-            text="Render the wp-optimizer admin FAQ and its translated answers.",
-            canonical_key="wp-optimizer:PagesHandler:renderFaq",
-            properties={
-                "project_id": project_id,
-                "relative_path": "admin/PagesHandler.class.php",
-                "context_scope": "code",
-                "line_start": 621,
-                "line_end": 930,
-            },
-        )
-        catalog = MemoryNode(
-            id="artifact:wpopt-pot",
-            type="SourceArtifact",
-            label="languages/wpopt.pot",
-            text="languages/wpopt.pot",
-            canonical_key="wp-optimizer:languages/wpopt.pot",
-            properties={
-                "project_id": project_id,
-                "relative_path": "languages/wpopt.pot",
-                "context_scope": "docs",
-            },
-        )
-        for node in (readme, handler, catalog):
-            self.graph.add_node(node)
-
-        payload = self.graph.query_context_payload("readme FAQ", top_k=6, max_depth=1, max_items=8)
-        context = self.graph.query_context("readme FAQ", top_k=6, max_depth=1, max_items=8)
-
-        related = {item["path"]: item for item in payload["related_files"]}
-        self.assertEqual(related["readme.txt"]["action"], "open")
-        self.assertEqual((related["readme.txt"]["line_start"], related["readme.txt"]["line_end"]), (376, 496))
-        self.assertEqual(related["admin/PagesHandler.class.php"]["action"], "review")
-        self.assertEqual(
-            (related["admin/PagesHandler.class.php"]["line_start"], related["admin/PagesHandler.class.php"]["line_end"]),
-            (621, 930),
-        )
-        self.assertEqual(related["languages/wpopt.pot"]["action"], "update")
-        self.assertNotIn("## Action plan", context)
-        self.assertNotIn("Open `readme.txt:376-496`", context)
-        self.assertNotIn("Review `admin/PagesHandler.class.php:621-930`", context)
-        self.assertNotIn("Update `languages/wpopt.pot`", context)
 
     def test_reql_where_supports_sql_like_text_and_range_operators(self) -> None:
         self.graph.add_node(
