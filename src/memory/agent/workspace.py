@@ -22,6 +22,7 @@ AGENT_STORAGE_FILE = "agent.reql"
 AGENT_BUS_STORAGE_FILE = "agent-bus.reql"
 AGENT_SCOPE_DIR = "agents"
 DEFAULT_AGENT_ID = "master"
+DEFAULT_ACTIVITY_SCOPE = "__default__"
 BUS_NODE_ID = "agent:bus"
 WORKSPACE_NODE_ID = "agent:workspace"
 AGENT_LOCK_TIMEOUT_SECONDS = 2.0
@@ -164,19 +165,7 @@ class AgentWorkspace:
                 else synced_at
             )
             workspace_props = dict(workspace.properties) if workspace is not None else {}
-            if self.activity_id:
-                current_by_activity = dict(workspace_props.get("current_session_ids") or {})
-                legacy_session_id = str(workspace_props.get("current_session_id") or "").strip()
-                if self.activity_id not in current_by_activity and legacy_session_id:
-                    legacy_session = agent.get_node(legacy_session_id)
-                    legacy_activity = (
-                        str(legacy_session.properties.get("activity_id") or "").strip()
-                        if legacy_session is not None
-                        else ""
-                    )
-                    if not legacy_activity or legacy_activity == self.activity_id:
-                        current_by_activity[self.activity_id] = legacy_session_id
-                workspace_props["current_session_ids"] = current_by_activity
+            workspace_props.setdefault("current_session_ids", {})
             workspace_props.update(
                 {
                     "format": "reql-agent-workspace-v1",
@@ -337,16 +326,8 @@ class AgentWorkspace:
                 "current_session_is_idle": True,
             }
         session = next((node for node in nodes if node.id == session_id and node.type == "session"), None)
-        session_title = (
-            session.properties.get("title")
-            if session is not None
-            else workspace.properties.get("current_session_title")
-        )
-        started_at = (
-            session.properties.get("started_at")
-            if session is not None
-            else workspace.properties.get("current_session_started_at")
-        )
+        session_title = session.properties.get("title") if session is not None else None
+        started_at = session.properties.get("started_at") if session is not None else None
         open_tasks = [
             node
             for node in nodes
@@ -411,17 +392,9 @@ class AgentWorkspace:
                     confidence=1.0,
                 )
                 stored, created = graph.add_node(session)
-                workspace_props.update(
-                    {
-                        "current_session_id": stored.id,
-                        "current_session_title": title,
-                        "current_session_started_at": now,
-                    }
-                )
-                if self.activity_id:
-                    current_by_activity = dict(workspace_props.get("current_session_ids") or {})
-                    current_by_activity[self.activity_id] = stored.id
-                    workspace_props["current_session_ids"] = current_by_activity
+                current_by_activity = dict(workspace_props.get("current_session_ids") or {})
+                current_by_activity[self._session_scope_key()] = stored.id
+                workspace_props["current_session_ids"] = current_by_activity
                 graph.store.update_node_fields(workspace.id, properties=workspace_props)
             return {"created": created, "session": self._node_payload(stored)}
         finally:
@@ -1165,6 +1138,7 @@ class AgentWorkspace:
                     "agent_storage": str(self.paths.agent_storage),
                     "bus_storage": str(self.paths.bus_storage),
                     "initialized_at": initialized_at,
+                    "current_session_ids": {},
                     "derived_node_count": len(derived_nodes),
                     "derived_relation_count": len(derived_edges),
                 },
@@ -1615,11 +1589,13 @@ class AgentWorkspace:
     def _current_session_id(self, workspace: MemoryNode | None) -> str:
         if workspace is None:
             return ""
-        if self.activity_id:
-            current_by_activity = workspace.properties.get("current_session_ids")
-            if isinstance(current_by_activity, dict):
-                return str(current_by_activity.get(self.activity_id) or "").strip()
-        return str(workspace.properties.get("current_session_id") or "").strip()
+        current_by_activity = workspace.properties.get("current_session_ids")
+        if not isinstance(current_by_activity, dict):
+            return ""
+        return str(current_by_activity.get(self._session_scope_key()) or "").strip()
+
+    def _session_scope_key(self) -> str:
+        return self.activity_id or DEFAULT_ACTIVITY_SCOPE
 
     def _resolve_session_selector(self, graph: MemoryGraph, selector: str) -> str:
         value = selector.strip()

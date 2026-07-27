@@ -3,6 +3,15 @@ from __future__ import annotations
 
 from memory.config import ConfigError, REQLConfig, load_config
 from memory.domain.models import MemoryEdge, MemoryNode, MemoryQuery, MemorySubgraph
+from memory.domain.query_context import (
+    Confidence,
+    ContextPayload,
+    ContextResult,
+    ContextScope,
+    QueryContextRequest,
+    QueryMode,
+    RetrievalBudget,
+)
 from memory.storage import BlockGraphStore
 from memory.query import QueryResult, REQLError, REQLEvaluationError, REQLSyntaxError
 from memory.services.project_watch import ProjectWatchEvent
@@ -15,6 +24,13 @@ __all__ = [
     "MemoryEdge",
     "MemoryQuery",
     "MemorySubgraph",
+    "Confidence",
+    "ContextPayload",
+    "ContextResult",
+    "ContextScope",
+    "QueryContextRequest",
+    "QueryMode",
+    "RetrievalBudget",
     "ProjectWatchEvent",
     "BlockGraphStore",
     "QueryResult",

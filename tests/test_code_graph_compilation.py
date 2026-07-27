@@ -11,7 +11,7 @@ from memory.code_analysis import TreeSitterCodeParser
 from memory.code_analysis.languages.generic import GenericProfileTreeSitterExtractor
 from tests.config_helpers import open_graph_with_documents as _open_graph_with_documents
 from memory.code_analysis.factory import EXTRACTOR_BY_LANGUAGE
-from memory.code_analysis.catalog import CODE_LANGUAGE_CATALOG
+from memory.code_analysis.catalog import CODE_LANGUAGE_CATALOG, load_tree_sitter_language
 from memory.artifacts.fingerprint import project_id
 
 
@@ -282,7 +282,7 @@ class CodeGraphCompilationTests(unittest.TestCase):
                     "re-export initializer",
                     scopes=["code"],
                     top_k=10,
-                )
+                )["payload"]
                 self.assertIn("pkg/__init__.py", {row["path"] for row in initializer_context["working_set"]})
 
                 (package / "__init__.py").write_text("# no public exports\n", encoding="utf-8")
@@ -467,7 +467,11 @@ class CodeGraphCompilationTests(unittest.TestCase):
                 self.assertNotIn(("unused_css_class", ".js-only"), finding_names)
                 self.assertIn(("always_overridden_css_declaration", ".duplicate color"), finding_names)
 
-                payload = graph.query_context_payload("AuthController password field", top_k=12, scopes=["code"])
+                payload = graph.query_context_payload(
+                    "AuthController password field",
+                    top_k=12,
+                    scopes=["code"],
+                )["payload"]
                 working_paths = {row["path"] for row in payload["working_set"]}
                 self.assertIn("app/Controllers/AuthController.php", working_paths)
                 self.assertIn("app/Views/home/index.php", working_paths)
@@ -729,6 +733,10 @@ class CodeGraphCompilationTests(unittest.TestCase):
         self.assertIn("Unsupported Tree-sitter language: sql", result.module.metadata.get("parser_warning", ""))
 
     def test_solidity_tree_sitter_builds_contract_graph_imports_and_calls(self) -> None:
+        try:
+            load_tree_sitter_language(__import__("tree_sitter"), "solidity")
+        except (ModuleNotFoundError, ValueError) as exc:
+            self.skipTest(str(exc))
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "project"
             contracts = root / "contracts"

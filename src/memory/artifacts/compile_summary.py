@@ -265,8 +265,8 @@ def _node_matches_terms(node: MemoryNode, terms: list[str]) -> bool:
         (
             _relative_path(node),
             _symbol_name(node),
-            node.label,
-            node.text,
+            str(node.label or ""),
+            str(node.text or ""),
         )
     ).casefold()
     return any(term.casefold() in haystack for term in terms)

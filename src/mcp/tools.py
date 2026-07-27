@@ -14,6 +14,18 @@ from typing import Any, Callable, Iterator
 
 from memory.config import ConfigError, REQLConfig, load_effective_config
 from memory.domain.models import MemoryQuery
+from memory.domain.query_context import (
+    DEFAULT_MAX_DEPTH as DEFAULT_CONTEXT_MAX_DEPTH,
+    DEFAULT_MAX_ITEMS as DEFAULT_CONTEXT_MAX_ITEMS,
+    DEFAULT_TOP_K as DEFAULT_CONTEXT_TOP_K,
+    MAX_DEPTH as MAX_CONTEXT_DEPTH,
+    MAX_ITEMS as MAX_QUERY_CONTEXT_ITEMS,
+    MAX_TOP_K as MAX_QUERY_CONTEXT_TOP_K,
+    MIN_DEPTH as MIN_CONTEXT_DEPTH,
+    MIN_ITEMS as MIN_QUERY_CONTEXT_ITEMS,
+    MIN_TOP_K as MIN_QUERY_CONTEXT_TOP_K,
+    QueryContextRequest,
+)
 from memory.domain.exceptions import REQLError
 from memory.security import SecurityError, sanitize_agent_text, validate_mcp_path
 from api.memory_graph import MemoryGraph
@@ -99,47 +111,35 @@ def query_context(
     code: bool = False,
     docs: bool = False,
     test: bool = False,
-    top_k: int = 12,
-    max_depth: int = 3,
-    max_items: int = 12,
-    include_risky: bool = False,
+    top_k: int = DEFAULT_CONTEXT_TOP_K,
+    max_depth: int = DEFAULT_CONTEXT_MAX_DEPTH,
+    max_items: int = DEFAULT_CONTEXT_MAX_ITEMS,
+    include_archived: bool = False,
     config_path: str | None = None,
     config_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return a bounded deterministic context block for a task/query."""
     config = _load_tool_config(config_path, config_overrides)
-    top_k = _bounded_int(top_k, "top_k", minimum=1, maximum=MAX_TOP_K)
-    max_depth = _bounded_int(max_depth, "max_depth", minimum=0, maximum=MAX_DEPTH)
-    max_items = _bounded_int(max_items, "max_items", minimum=1, maximum=MAX_ITEMS)
     query = _required_text(query, "query")
-    selected_scopes = list(scopes or [])
+    selected_scopes = list(_optional_string_list(scopes, "scopes") or [])
     for enabled, scope in ((code, "code"), (docs, "docs"), (test, "test")):
         if enabled and scope not in selected_scopes:
             selected_scopes.append(scope)
-    with _open_graph(storage_path, config, read_only=True) as graph:
-        subgraph = graph.retrieval.retrieve(
-            MemoryQuery(
-                text=query,
-                top_k=top_k,
-                max_depth=max_depth,
-                context_scopes=set(selected_scopes) if selected_scopes else None,
-            )
-        )
-        payload = graph.retrieval.query_context_payload(
-            subgraph,
+    try:
+        request = QueryContextRequest.from_raw(
+            text=query,
+            mode=mode,
+            scopes=selected_scopes,
+            top_k=top_k,
+            max_depth=max_depth,
             max_items=max_items,
-            query_mode=mode,
-            query_scopes=selected_scopes,
-            include_risky=bool(include_risky),
+            include_archived=include_archived,
         )
-        payload.update(
-            {
-                "trace_id": subgraph.trace_id,
-                "ranked_nodes": len(subgraph.ranked_nodes),
-                "seed_node_ids": list(subgraph.seed_node_ids),
-            }
-        )
-        return payload
+    except (TypeError, ValueError) as exc:
+        raise MCPToolError(str(exc)) from exc
+    with _open_graph(storage_path, config, read_only=True) as graph:
+        result = graph.query_context_result(request)
+        return result.to_dict()
 
 
 def query_explore(
@@ -479,9 +479,35 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
             "properties": {
                 "storage_path": {"type": "string"},
                 "query": {"type": "string"},
-                "top_k": {"type": "integer", "default": 12, "maximum": MAX_TOP_K},
-                "max_depth": {"type": "integer", "default": 3, "maximum": MAX_DEPTH},
-                "max_items": {"type": "integer", "default": 12, "maximum": MAX_ITEMS},
+                "mode": {"type": "string", "enum": ["informative", "cleanup"], "default": "informative"},
+                "scopes": {
+                    "type": ["array", "null"],
+                    "items": {"type": "string", "enum": ["code", "docs", "test"]},
+                    "uniqueItems": True,
+                    "default": None,
+                },
+                "code": {"type": "boolean", "default": False},
+                "docs": {"type": "boolean", "default": False},
+                "test": {"type": "boolean", "default": False},
+                "top_k": {
+                    "type": "integer",
+                    "default": DEFAULT_CONTEXT_TOP_K,
+                    "minimum": MIN_QUERY_CONTEXT_TOP_K,
+                    "maximum": MAX_QUERY_CONTEXT_TOP_K,
+                },
+                "max_depth": {
+                    "type": "integer",
+                    "default": DEFAULT_CONTEXT_MAX_DEPTH,
+                    "minimum": MIN_CONTEXT_DEPTH,
+                    "maximum": MAX_CONTEXT_DEPTH,
+                },
+                "max_items": {
+                    "type": "integer",
+                    "default": DEFAULT_CONTEXT_MAX_ITEMS,
+                    "minimum": MIN_QUERY_CONTEXT_ITEMS,
+                    "maximum": MAX_QUERY_CONTEXT_ITEMS,
+                },
+                "include_archived": {"type": "boolean", "default": False},
                 "config_path": {"type": ["string", "null"], "default": None},
                 "config_overrides": {"type": ["object", "null"], "default": None},
             },

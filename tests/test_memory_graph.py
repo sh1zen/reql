@@ -81,6 +81,23 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
         self.assertIn("function:retrieve-api", {node.id for node in subgraph.nodes})
         self.assertIsNotNone(subgraph.trace_id)
 
+    def test_locate_uses_the_normalized_path_index(self) -> None:
+        indexed = MemoryNode(
+            id="artifact:indexed",
+            type="SourceArtifact",
+            label="src/Indexed.py",
+            properties={
+                "relative_path": "src/Indexed.py",
+                "relative_path_key": "src/indexed.py",
+            },
+        )
+        self.graph.add_node(indexed)
+
+        self.assertEqual(
+            [item["id"] for item in self.graph.locate("SRC/INDEXED.py")["matches"]],
+            [indexed.id],
+        )
+
     def test_query_context_prioritizes_code_working_set_for_coding_agent_queries(self) -> None:
         query = "query_context coding agent minimal files context retrieval noise guide edits"
         project_root = Path(self.tmp.name) / "project"
@@ -224,7 +241,8 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
         self.assertNotIn("docs/query_context.md", context)
         self.assertIn("tests/test_retrieval.py [10-18]", context)
 
-        payload = self.graph.query_context_payload(query, top_k=8, scopes=["code"])
+        envelope = self.graph.query_context_payload(query, top_k=8, scopes=["code"])
+        payload = envelope["payload"]
         self.assertEqual(payload["kind"], "code")
         self.assertEqual(payload["query_mode"], "informative")
         self.assertEqual(payload["scopes"], ["code"])
@@ -250,13 +268,16 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
         self.assertTrue(payload["targeted_reads"])
         self.assertFalse(payload["snippets"])
         self.assertTrue(any(item["path"] == "tests/test_retrieval.py" for item in payload["test_targets"]))
-        self.assertEqual(payload["confidence"]["status"], "sufficient")
-        self.assertFalse(payload["confidence"]["targeted_rg_fallback_allowed"])
+        self.assertEqual(envelope["confidence"]["status"], "sufficient")
+        self.assertFalse(envelope["confidence"]["targeted_rg_fallback_allowed"])
         self.assertTrue(any(item["label"] == "Retrieve ranked rows" for item in payload["followups"]))
         self.assertNotIn("symbols", payload)
         self.assertNotIn("code_links", payload)
 
-        informative_payload = self.graph.query_context_payload("query_context project structure context retrieval", top_k=8)
+        informative_payload = self.graph.query_context_payload(
+            "query_context project structure context retrieval",
+            top_k=8,
+        )["payload"]
         self.assertEqual(informative_payload["kind"], "code")
         self.assertEqual(informative_payload["query_mode"], "informative")
         self.assertNotIn("context", informative_payload)
@@ -268,7 +289,11 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
         self.assertFalse(informative_payload["edit_plan"])
         self.assertTrue(all(row["role"] == "read" for row in informative_payload["working_set"]))
 
-        cleanup_payload = self.graph.query_context_payload("unused variable cleanup query_context noise", top_k=8, mode="cleanup")
+        cleanup_payload = self.graph.query_context_payload(
+            "unused variable cleanup query_context noise",
+            top_k=8,
+            mode="cleanup",
+        )["payload"]
         self.assertEqual(cleanup_payload["kind"], "code")
         self.assertEqual(cleanup_payload["query_mode"], "cleanup")
         self.assertNotIn("context", cleanup_payload)
@@ -288,7 +313,10 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
         self.assertIn("## Research queries", cleanup_context)
         self.assertIn("## Summary", cleanup_context)
 
-        default_payload = self.graph.query_context_payload("modifica unused cleanup query_context noise", top_k=8)
+        default_payload = self.graph.query_context_payload(
+            "modifica unused cleanup query_context noise",
+            top_k=8,
+        )["payload"]
         self.assertEqual(default_payload["query_mode"], "informative")
         self.assertNotIn("intervention_targets", default_payload)
         self.assertFalse(default_payload["cleanup_candidates"])
@@ -331,7 +359,7 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
         )
 
         with patch.object(self.graph.store, "all_nodes", side_effect=AssertionError("full graph scan")):
-            payload = self.graph.query_context_payload(query, top_k=8, scopes=["code"])
+            payload = self.graph.query_context_payload(query, top_k=8, scopes=["code"])["payload"]
 
         self.assertTrue(any(item["id"] == "function:scoped-query-context" for item in payload["owner_candidates"]))
         self.assertFalse(any(item["path"] == "docs/query_context.md" for item in payload["working_set"]))
@@ -391,15 +419,16 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
             )
         )
 
-        payload = self.graph.query_context_payload(query, top_k=12, scopes=["docs"])
+        envelope = self.graph.query_context_payload(query, top_k=12, scopes=["docs"])
+        payload = envelope["payload"]
 
         self.assertTrue(payload["results"])
         top = payload["results"][0]
         self.assertEqual(top["id"], concept.id)
         self.assertEqual(top["text"], evidence.text)
         self.assertEqual(top["location"], "docs/CONFIGURATION.md:84")
-        self.assertEqual(payload["confidence"]["max_score"], round(float(top["score"]), 4))
-        self.assertEqual(payload["confidence"]["status"], "sufficient")
+        self.assertEqual(envelope["confidence"]["max_score"], round(float(top["score"]), 4))
+        self.assertEqual(envelope["confidence"]["status"], "sufficient")
         self.assertFalse(any(item["type"] == "RawEvent" for item in payload["results"]))
         self.assertFalse(any(item["id"] == generic.id for item in payload["results"]))
 
@@ -514,7 +543,12 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
         self.graph.add_edge(MemoryEdge(id="edge:test-import", from_id=test_node.id, to_id=import_node.id, type="TESTS", properties={"relative_path": "tests/test_app.py", "line_start": 7, "line_end": 9}))
         self.graph.add_edge(MemoryEdge(id="edge:import-finding", from_id=import_node.id, to_id=finding.id, type="HAS_FINDING", properties={"relative_path": "app.py", "line_start": 2, "line_end": 2}))
 
-        payload = self.graph.query_context_payload("unused import sys cleanup", top_k=8, max_depth=1, mode="cleanup")
+        payload = self.graph.query_context_payload(
+            "unused import sys cleanup",
+            top_k=8,
+            max_depth=1,
+            mode="cleanup",
+        )["payload"]
         reads = payload["targeted_reads"]
         kinds = {item.get("read_kind") for item in reads}
 
@@ -583,7 +617,11 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
         self.graph.add_node(safe)
         self.graph.add_node(risky)
 
-        default_payload = self.graph.query_context_payload("cleanup candidate", top_k=8, mode="cleanup")
+        default_payload = self.graph.query_context_payload(
+            "cleanup candidate",
+            top_k=8,
+            mode="cleanup",
+        )["payload"]
         default_ids = {item["id"] for item in default_payload["cleanup_candidates"]}
         self.assertIn(safe.id, default_ids)
         self.assertNotIn(risky.id, default_ids)
@@ -591,12 +629,6 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
         self.assertEqual(default_payload["cleanup_filter"]["excluded_risky_candidates"], 1)
         self.assertFalse(any(item.get("finding_id") == risky.id for item in default_payload["targeted_reads"]))
         self.assertFalse(any(item.get("node_id") == risky.id for item in default_payload["snippets"]))
-
-        risky_payload = self.graph.query_context_payload("cleanup candidate", top_k=8, mode="cleanup", include_risky=True)
-        risky_ids = {item["id"] for item in risky_payload["cleanup_candidates"]}
-        self.assertIn(safe.id, risky_ids)
-        self.assertIn(risky.id, risky_ids)
-        self.assertEqual(risky_payload["cleanup_filter"]["mode"], "include_risky")
 
     def test_query_context_scopes_retrieve_inside_requested_section_before_top_k_cutoff(self) -> None:
         query = "shared scoped query_context target"
@@ -631,9 +663,9 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
         self.graph.add_node(test_node)
         self.graph.add_node(docs_node)
 
-        code_payload = self.graph.query_context_payload(query, top_k=1, scopes=["code"])
-        test_payload = self.graph.query_context_payload(query, top_k=1, scopes=["test"])
-        docs_payload = self.graph.query_context_payload(query, top_k=1, scopes=["docs"])
+        code_payload = self.graph.query_context_payload(query, top_k=1, scopes=["code"])["payload"]
+        test_payload = self.graph.query_context_payload(query, top_k=1, scopes=["test"])["payload"]
+        docs_payload = self.graph.query_context_payload(query, top_k=1, scopes=["docs"])["payload"]
 
         self.assertTrue(any(row["path"] == "src/scoped.py" for row in code_payload["working_set"]))
         self.assertFalse(any(row["path"] == "tests/test_scoped.py" for row in code_payload["working_set"]))
@@ -674,7 +706,7 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
             "RetrievalEngine _code_targeted_reads SourceFragment owner symbol targeted reads",
             top_k=8,
             scopes=["code"],
-        )
+        )["payload"]
 
         self.assertTrue(any(row["path"] == "src/memory/services/retrieval.py" for row in payload["working_set"]))
         self.assertFalse(any(row["path"] == "src/memory/artifacts/compiler.py" for row in payload["working_set"]))
@@ -736,7 +768,7 @@ class MemoryGraphIntegrationTests(unittest.TestCase):
             "profile show php Statistiche di visualizzazione",
             top_k=6,
             scopes=["code"],
-        )
+        )["payload"]
         rendered = self.graph.query_context(
             "profile show php Statistiche di visualizzazione",
             top_k=6,

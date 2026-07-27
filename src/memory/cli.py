@@ -6,13 +6,15 @@ import json
 import os
 import sys
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .agent.progress import ProgressingAgentWorkspace
 from .config import PROJECT_CONFIG_FILENAME, ConfigError, REQLConfig, load_effective_config, load_project_config_data, parse_config_override_assignments, write_sample_config
 from .diagnostics import PerformanceLogger
 from .domain.exceptions import StorageError
+from .domain.query_context import DEFAULT_MAX_DEPTH, DEFAULT_MAX_ITEMS, DEFAULT_TOP_K, QueryContextRequest
 from .storage import BlockGraphStore, inspect_store_locks
 from .reporting.html_graph import write_graph_html
 from api.memory_graph import MemoryGraph
@@ -34,6 +36,46 @@ class _AgentCommandResolution:
     project: bool
     project_dir: Path
     home_dir: Path | None
+
+
+class AccessMode(str, Enum):
+    """Storage access required by a CLI command."""
+
+    READ_ONLY = "read_only"
+    MUTATING = "mutating"
+
+
+@dataclass(frozen=True)
+class CommandContext:
+    """Runtime dependencies passed to declarative command handlers."""
+
+    args: argparse.Namespace
+    config: REQLConfig
+    graph: MemoryGraph
+    profile_logger: PerformanceLogger | None = None
+
+
+@dataclass(frozen=True)
+class CommandSpec:
+    """Single source of truth for a leaf CLI command."""
+
+    path: tuple[str, ...]
+    access: AccessMode | Callable[[argparse.Namespace], AccessMode]
+    snapshot: bool
+    help: str
+    configure_parser: Callable[[argparse.ArgumentParser], None]
+    handler: Callable[[CommandContext], int]
+
+    def __post_init__(self) -> None:
+        if not self.path or any(not part for part in self.path):
+            raise ValueError("CommandSpec.path must contain non-empty command names")
+        if self.snapshot and isinstance(self.access, AccessMode) and self.access is not AccessMode.READ_ONLY:
+            raise ValueError("Only read-only commands may support snapshots")
+
+    def access_mode(self, args: argparse.Namespace) -> AccessMode:
+        if isinstance(self.access, AccessMode):
+            return self.access
+        return self.access(args)
 
 
 class _SortedSubparserChoices(dict[str, argparse.ArgumentParser]):
@@ -563,27 +605,475 @@ def _agent_batch_operations_from_args(args: argparse.Namespace) -> list[dict[str
     return operations
 
 
-_READ_ONLY_COMMANDS = {"locate", "query_context", "query_explore", "query_graph", "query_memories", "query", "stats", "inspect"}
+def _configure_project_explain_parser(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("path", nargs="?", default=".", help="Registered project path; defaults to the current working directory")
+    parser.add_argument("--focus", default=None, help="Feature, behavior, or business concept used to rank change guidance")
+    parser.add_argument("--max-capabilities", type=int, default=12, help="Maximum business capabilities to return")
+    parser.add_argument("--max-workflows", type=int, default=8, help="Maximum inferred workflows to return")
+    parser.add_argument("--json", action="store_true", help="Print structured JSON result")
+
+
+def _handle_project_explain(context: CommandContext) -> int:
+    args = context.args
+    try:
+        explanation = context.graph.explain_project(
+            args.path,
+            focus=args.focus,
+            max_capabilities=args.max_capabilities,
+            max_workflows=args.max_workflows,
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if args.json:
+        _print_json(explanation.to_dict())
+    else:
+        print(explanation.to_markdown())
+    return 0
+
+
+def _configure_project_compile_parser(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("path", nargs="?", default=".", help="Project path to compile; defaults to the current working directory")
+    parser.add_argument("--max-file-size-mb", type=float, default=None)
+    parser.add_argument("--watch", action="store_true", help="Monitor the project filesystem and compile dirty artifacts automatically")
+    parser.add_argument("--watch-interval", type=float, default=0.5, help="Maximum seconds to wait between bounded watchdog checks")
+    parser.add_argument("--watch-debounce", type=float, default=0.1, help="Seconds to wait before compiling detected changes")
+    parser.add_argument("--watch-iterations", type=int, default=None, help="Stop after this many watch checks; default is until interrupted")
+
+
+def _configure_project_update_parser(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("path", nargs="?", default=".", help="Project path to update; defaults to the current working directory")
+    parser.add_argument("--max-file-size-mb", type=float, default=None)
+
+
+def _configure_project_status_parser(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("path")
+    parser.add_argument("--json", action="store_true", help="Print structured JSON result")
+
+
+def _configure_project_history_parser(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("path", nargs="?", default=".", help="Registered project path; defaults to the current working directory")
+    parser.add_argument("--limit", type=int, default=20, help="Maximum revisions to show")
+    parser.add_argument("--json", action="store_true", help="Print structured JSON result")
+
+
+def _configure_project_diff_parser(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("path", nargs="?", default=".", help="Registered project path; defaults to the current working directory")
+    parser.add_argument("--revision", default=None, help="Revision id; defaults to the latest project revision")
+    parser.add_argument("--json", action="store_true", help="Print structured JSON result")
+
+
+def _configure_project_report_parser(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("path")
+    parser.add_argument("--output", default=None, help="Output directory for GRAPH_REPORT.md, GRAPH_DELTAS.md, and CACHE_REPORT.md")
+    parser.add_argument("--json", action="store_true", help="Print structured JSON result")
+
+
+def _configure_cache_status_parser(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("path", nargs="?", default=".", help="Project path; defaults to the current working directory")
+    parser.add_argument("--max-file-size-mb", type=float, default=None)
+    parser.add_argument("--json", action="store_true", help="Print structured JSON result")
+
+
+def _configure_cache_clear_parser(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("path", nargs="?", default=".", help="Project path; defaults to the current working directory")
+    parser.add_argument("--json", action="store_true", help="Print structured JSON result")
+
+
+def _configure_locate_parser(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("path", help="Exact relative path; known document extensions may be omitted")
+    parser.add_argument("--include-archived", action="store_true", help="Include archived or deleted artifacts")
+    parser.add_argument("--json", action="store_true", help="Print structured JSON result")
+
+
+def _configure_stats_parser(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--json", action="store_true")
+
+
+def _configure_export_parser(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--out", default=None, help="Optional output file or directory")
+    parser.add_argument("--html", action="store_true", help="Write an interactive standalone graph.html visualization")
+    parser.add_argument("--json", action="store_true", help="Write graph JSON to a file")
+
+
+def _configure_inspect_parser(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--node-id", required=True)
+    parser.add_argument("--limit", type=int, default=30)
+    parser.add_argument("--json", action="store_true", help="Print structured JSON result")
+
+
+def _handle_project_compile(context: CommandContext) -> int:
+    args = context.args
+    config = context.config
+    graph = context.graph
+    max_file_size = _max_file_size_bytes(args, config)
+    compile_kwargs = {
+        "max_file_size_bytes": max_file_size,
+        "include_patterns": config.scan.include,
+        "exclude_patterns": config.scan.exclude,
+        "cache_enabled": config.cache.enabled,
+        "parsing_options": _parsing_options(config),
+    }
+    if args.project_command == "compile" and args.watch:
+        print(f"Monitor mode: {Path(args.path).expanduser().resolve(strict=False)}")
+        exit_code = 0
+        try:
+            for event in graph.watch_project(
+                args.path,
+                interval_seconds=args.watch_interval,
+                debounce_seconds=args.watch_debounce,
+                max_iterations=args.watch_iterations,
+                **compile_kwargs,
+            ):
+                print(
+                    f"Watch poll {event.iteration}: "
+                    f"dirty={event.dirty_artifacts} deleted={event.deleted_artifacts} total={event.total_artifacts}"
+                )
+                if event.result is None:
+                    print("No changes detected")
+                    continue
+                _print_compile_result(event.result)
+                if event.errors:
+                    exit_code = 1
+        except KeyboardInterrupt:
+            print("Watch stopped")
+            return 130
+        return exit_code
+    if args.project_command == "update":
+        result = graph.update_project(args.path, **compile_kwargs)
+    else:
+        result = graph.compile_project(args.path, **compile_kwargs)
+    _print_compile_result(result)
+    return 0 if not result.run.errors else 1
+
+
+def _handle_project_status(context: CommandContext) -> int:
+    args = context.args
+    status = context.graph.project_status(args.path)
+    if status is None:
+        print("Project not found", file=sys.stderr)
+        return 1
+    if args.json:
+        _print_json(status)
+    else:
+        project_node = status["project"]
+        print(f"Project: {project_node['label']}")
+        print(f"Root: {project_node['properties'].get('root_path')}")
+        print(f"Status: {project_node['status']}")
+        print(f"Artifacts: {status['artifacts']}")
+        for artifact_type, count in sorted(status["counts_by_type"].items()):
+            print(f"  {artifact_type}: {count}")
+        if status["status_counts"]:
+            print("Statuses:")
+            for item_status, count in sorted(status["status_counts"].items()):
+                print(f"  {item_status}: {count}")
+    return 0
+
+
+def _handle_project_history(context: CommandContext) -> int:
+    args = context.args
+    graph = context.graph
+    if graph.project_status(args.path) is None:
+        print("Project not found", file=sys.stderr)
+        return 1
+    revisions = graph.project_history(args.path, limit=max(0, args.limit))
+    if args.json:
+        _print_json([revision.to_dict(include_manifest=False) for revision in revisions])
+    elif not revisions:
+        print("No project revisions")
+    else:
+        for revision in revisions:
+            print(
+                f"{revision.id}\t{revision.created_at}\t"
+                f"files={len(revision.changes)}\tparent={revision.parent_id or '-'}"
+            )
+    return 0
+
+
+def _handle_project_diff(context: CommandContext) -> int:
+    args = context.args
+    graph = context.graph
+    status = graph.project_status(args.path)
+    if status is None:
+        print("Project not found", file=sys.stderr)
+        return 1
+    if args.revision:
+        revision = graph.project_revision(args.revision)
+    else:
+        history = graph.project_history(args.path, limit=1)
+        revision = history[0] if history else None
+    project_id = str(status["project"]["id"])
+    if revision is None or revision.project_id != project_id:
+        print("Revision not found", file=sys.stderr)
+        return 1
+    if args.json:
+        _print_json(revision.to_dict(include_manifest=False))
+    else:
+        print(f"Revision: {revision.id}")
+        print(f"Parent: {revision.parent_id or '-'}")
+        print(f"Tree: {revision.tree_hash}")
+        for change in revision.changes:
+            before = (change.old_sha256 or "-")[:12]
+            after = (change.new_sha256 or "-")[:12]
+            print(f"{change.status[0].upper()}\t{change.path}\t{before} -> {after}")
+    return 0
+
+
+def _handle_project_report(context: CommandContext) -> int:
+    args = context.args
+    files = context.graph.project_report(args.path, output_dir=args.output or context.config.reporting.output_dir)
+    if args.json:
+        _print_json(files.to_dict())
+    else:
+        print(f"Graph report: {files.graph_report}")
+        print(f"Delta report: {files.graph_deltas}")
+        print(f"Cache report: {files.cache_report}")
+    return 0
+
+
+def _handle_cache_status(context: CommandContext) -> int:
+    args = context.args
+    config = context.config
+    status = context.graph.cache_status(
+        args.path,
+        max_file_size_bytes=_max_file_size_bytes(args, config),
+        include_patterns=config.scan.include,
+        exclude_patterns=config.scan.exclude,
+        cache_enabled=config.cache.enabled,
+        parsing_options=_parsing_options(config),
+    )
+    if args.json:
+        _print_json(status)
+    else:
+        print(f"Project: {status['project']['name']}")
+        print(f"Total artifacts: {status['total_artifacts']}")
+        print(f"Cached artifacts: {status['cached_artifacts']}")
+        print(f"Dirty artifacts: {status['dirty_artifacts']}")
+        print(f"Deleted artifacts: {status['deleted_artifacts']}")
+    return 0
+
+
+def _handle_cache_clear(context: CommandContext) -> int:
+    args = context.args
+    result = context.graph.clear_cache(args.path)
+    if args.json:
+        _print_json(result)
+    else:
+        print(f"Project: {result['project_id']}")
+        print(f"Cleared cache entries: {result['cleared_entries']}")
+    return 0
+
+
+def _handle_query_context(context: CommandContext) -> int:
+    args = context.args
+    try:
+        request = QueryContextRequest.from_raw(
+            text=args.query,
+            top_k=args.top_k,
+            max_depth=args.max_depth,
+            max_items=args.max_items,
+            mode=_query_context_mode_from_args(args),
+            scopes=_query_context_scopes_from_args(args),
+            include_archived=args.include_archived,
+        )
+        result = context.graph.query_context_result(request)
+    except (TypeError, ValueError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if args.json:
+        _print_json(result.to_dict())
+    else:
+        print(context.graph.query_context_service.render(result))
+    return 0
+
+
+def _handle_query_explore(context: CommandContext) -> int:
+    args = context.args
+    try:
+        result = context.graph.query_explore(
+            args.query,
+            views=_query_explore_views_from_args(args),
+            top_k=args.top_k,
+            max_depth=args.max_depth,
+            limit=args.limit,
+            max_items=args.max_items,
+            include_archived=args.include_archived,
+        )
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    if args.json:
+        _print_json(result)
+    else:
+        print(result["context"])
+    return 0
+
+
+def _handle_query_graph(context: CommandContext) -> int:
+    args = context.args
+    result = context.graph.query_graph(
+        args.query,
+        top_k=args.top_k,
+        max_depth=args.max_depth,
+        max_nodes=args.max_nodes,
+        max_edges=args.max_edges,
+        max_sources=args.max_sources,
+        max_items=args.max_items,
+        filter_generic=not args.no_filter_generic,
+        include_archived=args.include_archived,
+    )
+    if args.json:
+        _print_json(result)
+    else:
+        print(result["context"])
+    return 0
+
+
+def _handle_query_memories(context: CommandContext) -> int:
+    args = context.args
+    payload = context.graph.query_memories_payload(
+        args.query,
+        top_k=args.top_k,
+        max_depth=args.max_depth,
+        limit=args.limit,
+        include_sources=not args.no_sources,
+        filter_generic=not args.no_filter_generic,
+        max_text_chars=args.max_text_chars,
+        include_archived=args.include_archived,
+    )
+    if args.json:
+        _print_json(payload)
+    else:
+        for item in payload["memories"]:
+            print(f"{float(item['score']):.3f}\t{item['type']}\t{item['id']}\t{item['text']}")
+    return 0
+
+
 _MUTATING_REQL_COMMANDS = {"COMMUNITIES", "HUBS"}
 
 
-def _query_requires_write(args: argparse.Namespace) -> bool:
-    if str(getattr(args, "command", "")) != "query":
-        return False
+def _query_access_mode(args: argparse.Namespace) -> AccessMode:
     statement = _normalize_reql_statement_arg(getattr(args, "statement", None))
     first = statement.split(None, 1)[0].rstrip(";").upper() if statement else ""
-    return first in _MUTATING_REQL_COMMANDS
+    if first in _MUTATING_REQL_COMMANDS:
+        return AccessMode.MUTATING
+    return AccessMode.READ_ONLY
 
 
-def _is_read_only_command(args: argparse.Namespace) -> bool:
-    command = str(getattr(args, "command", ""))
-    if command == "project":
-        return str(getattr(args, "project_command", "")) in {"status", "watch-status", "history", "diff", "explain"}
-    return command in _READ_ONLY_COMMANDS and not _query_requires_write(args)
+def _handle_query(context: CommandContext) -> int:
+    args = context.args
+    statement = _normalize_reql_statement_arg(args.statement)
+    if not statement:
+        print("REQL statement required as positional argument", file=sys.stderr)
+        return 2
+    result = context.graph.query(statement)
+    if args.json:
+        _print_json(result.to_dict())
+    else:
+        print(result.to_table())
+    return 0
+
+
+def _handle_locate(context: CommandContext) -> int:
+    args = context.args
+    payload = context.graph.locate(args.path, include_archived=args.include_archived)
+    if args.json:
+        _print_json(payload)
+    else:
+        for match in payload["matches"]:
+            print(f"{match['relative_path']}\t{match['artifact_type']}\t{match['id']}")
+    if not payload["matches"]:
+        if not args.json:
+            print(f"Path not found: {args.path}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def _handle_stats(context: CommandContext) -> int:
+    graph = context.graph
+    by_type = graph.store.node_type_counts()
+    payload = {
+        "nodes": graph.store.count_nodes(),
+        "edges": graph.store.count_edges(),
+        "node_types": by_type,
+    }
+    if context.args.json:
+        _print_json(payload)
+    else:
+        print(f"Nodes: {payload['nodes']}")
+        print(f"Edges: {payload['edges']}")
+        for key, value in sorted(by_type.items()):
+            print(f"  {key}: {value}")
+    return 0
+
+
+def _handle_export(context: CommandContext) -> int:
+    args = context.args
+    payload = context.graph.export_json()
+    if args.html:
+        html_path = write_graph_html(payload, _graph_html_path(args.out))
+        print(html_path)
+        if args.json:
+            json_path = html_path.with_name("graph.json")
+            json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(json_path)
+    else:
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+        if args.json:
+            json_path = _graph_json_path(args.out)
+            json_path.parent.mkdir(parents=True, exist_ok=True)
+            json_path.write_text(text, encoding="utf-8")
+            print(json_path)
+        elif args.out:
+            Path(args.out).write_text(text, encoding="utf-8")
+            print(args.out)
+        else:
+            print(text)
+    return 0
+
+
+def _handle_inspect(context: CommandContext) -> int:
+    args = context.args
+    result = context.graph.inspect_node(args.node_id, limit=args.limit)
+    if not result["found"]:
+        print("Node not found", file=sys.stderr)
+        return 2
+    _print_json(result)
+    return 0
+
+
+
+def _configure_declared_commands(
+    subparsers_by_parent: dict[tuple[str, ...], argparse._SubParsersAction],
+) -> None:
+    for spec in COMMAND_SPECS:
+        parent_path = spec.path[:-1]
+        try:
+            subparsers = subparsers_by_parent[parent_path]
+        except KeyError as exc:
+            rendered = " ".join(parent_path) or "<root>"
+            raise ValueError(f"No parser group registered for declarative command parent: {rendered}") from exc
+        command_parser = subparsers.add_parser(spec.path[-1], help=spec.help)
+        spec.configure_parser(command_parser)
+        command_parser.set_defaults(_command_spec_path=spec.path)
+
+
+def _selected_command_spec(args: argparse.Namespace) -> CommandSpec | None:
+    raw_path = getattr(args, "_command_spec_path", None)
+    if raw_path is None:
+        return None
+    return _COMMAND_SPECS_BY_PATH.get(tuple(raw_path))
+
+
+def _command_access_mode(args: argparse.Namespace) -> AccessMode:
+    spec = _selected_command_spec(args)
+    if spec is None:
+        raise ValueError("Graph-backed command is missing a CommandSpec")
+    return spec.access_mode(args)
 
 
 def _open(args: argparse.Namespace, config: REQLConfig, profile_logger: PerformanceLogger | None = None) -> MemoryGraph:
-    read_only_command = _is_read_only_command(args)
+    read_only_command = _command_access_mode(args) is AccessMode.READ_ONLY
     snapshot = bool(getattr(args, "snapshot", False))
     defer_lexical_index = (
         str(getattr(args, "command", "")) == "project"
@@ -702,12 +1192,11 @@ def _add_query_memories_arguments(parser: argparse.ArgumentParser) -> None:
 
 def _add_query_context_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--query", required=True)
-    parser.add_argument("--top-k", type=int, default=20)
-    parser.add_argument("--max-depth", type=int, default=3)
-    parser.add_argument("--max-items", type=int, default=20, help="Maximum rendered context items")
+    parser.add_argument("--top-k", type=int, default=DEFAULT_TOP_K)
+    parser.add_argument("--max-depth", type=int, default=DEFAULT_MAX_DEPTH)
+    parser.add_argument("--max-items", type=int, default=DEFAULT_MAX_ITEMS, help="Maximum rendered context items")
     parser.add_argument("--include-archived", action="store_true", help="Include archived graph records")
     parser.add_argument("--cleanup", action="store_true", help="Return only cleanup findings matching the query")
-    parser.add_argument("--include-risky", action="store_true", help="In cleanup mode, include validate/risky and low-confidence findings")
     parser.add_argument("--code", action="store_true", help="Limit context to code symbols and source files")
     parser.add_argument("--docs", action="store_true", help="Limit context to documentation and imported document content")
     parser.add_argument("--test", action="store_true", help="Limit context to tests")
@@ -827,6 +1316,158 @@ def _normalize_subparser_help(action: argparse._SubParsersAction) -> None:
     action._choices_actions.sort(key=lambda choice: choice.dest)
     action.metavar = "{" + ",".join(choice.dest for choice in action._choices_actions) + "}"
     action.choices = _SortedSubparserChoices(action.choices)
+
+
+COMMAND_SPECS: tuple[CommandSpec, ...] = (
+    CommandSpec(
+        path=("project", "compile"),
+        access=AccessMode.MUTATING,
+        snapshot=False,
+        help="Scan and incrementally compile dirty artifacts",
+        configure_parser=_configure_project_compile_parser,
+        handler=_handle_project_compile,
+    ),
+    CommandSpec(
+        path=("project", "update"),
+        access=AccessMode.MUTATING,
+        snapshot=False,
+        help="Incrementally update a previously compiled project",
+        configure_parser=_configure_project_update_parser,
+        handler=_handle_project_compile,
+    ),
+    CommandSpec(
+        path=("project", "status"),
+        access=AccessMode.READ_ONLY,
+        snapshot=True,
+        help="Show registered project artifact status",
+        configure_parser=_configure_project_status_parser,
+        handler=_handle_project_status,
+    ),
+    CommandSpec(
+        path=("project", "explain"),
+        access=AccessMode.READ_ONLY,
+        snapshot=True,
+        help="Explain repository capabilities, architecture, workflows, and change starting points",
+        configure_parser=_configure_project_explain_parser,
+        handler=_handle_project_explain,
+    ),
+    CommandSpec(
+        path=("project", "history"),
+        access=AccessMode.READ_ONLY,
+        snapshot=True,
+        help="Show newest-first content-addressed project revisions",
+        configure_parser=_configure_project_history_parser,
+        handler=_handle_project_history,
+    ),
+    CommandSpec(
+        path=("project", "diff"),
+        access=AccessMode.READ_ONLY,
+        snapshot=True,
+        help="Show file changes in a revision; defaults to the latest revision",
+        configure_parser=_configure_project_diff_parser,
+        handler=_handle_project_diff,
+    ),
+    CommandSpec(
+        path=("project", "report"),
+        access=AccessMode.MUTATING,
+        snapshot=False,
+        help="Write project Markdown reports",
+        configure_parser=_configure_project_report_parser,
+        handler=_handle_project_report,
+    ),
+    CommandSpec(
+        path=("cache", "status"),
+        access=AccessMode.MUTATING,
+        snapshot=False,
+        help="Show incremental cache status for a project path",
+        configure_parser=_configure_cache_status_parser,
+        handler=_handle_cache_status,
+    ),
+    CommandSpec(
+        path=("cache", "clear"),
+        access=AccessMode.MUTATING,
+        snapshot=False,
+        help="Archive cache metadata for a project path",
+        configure_parser=_configure_cache_clear_parser,
+        handler=_handle_cache_clear,
+    ),
+    CommandSpec(
+        path=("query_context",),
+        access=AccessMode.READ_ONLY,
+        snapshot=True,
+        help="Compose a deterministic context block for a query",
+        configure_parser=_add_query_context_arguments,
+        handler=_handle_query_context,
+    ),
+    CommandSpec(
+        path=("query_explore",),
+        access=AccessMode.READ_ONLY,
+        snapshot=True,
+        help="Explore owners, callers, public surface, serialization paths, docs, and code",
+        configure_parser=_add_query_explore_arguments,
+        handler=_handle_query_explore,
+    ),
+    CommandSpec(
+        path=("query_graph",),
+        access=AccessMode.READ_ONLY,
+        snapshot=True,
+        help="Retrieve a structured query-centered subgraph",
+        configure_parser=_add_query_graph_arguments,
+        handler=_handle_query_graph,
+    ),
+    CommandSpec(
+        path=("query_memories",),
+        access=AccessMode.READ_ONLY,
+        snapshot=True,
+        help="Retrieve relevant memory texts for a query",
+        configure_parser=_add_query_memories_arguments,
+        handler=_handle_query_memories,
+    ),
+    CommandSpec(
+        path=("query",),
+        access=_query_access_mode,
+        snapshot=True,
+        help="Execute a REQL statement",
+        configure_parser=_add_reql_statement_arguments,
+        handler=_handle_query,
+    ),
+    CommandSpec(
+        path=("locate",),
+        access=AccessMode.READ_ONLY,
+        snapshot=True,
+        help="Resolve a known project-relative path without semantic ranking",
+        configure_parser=_configure_locate_parser,
+        handler=_handle_locate,
+    ),
+    CommandSpec(
+        path=("stats",),
+        access=AccessMode.READ_ONLY,
+        snapshot=True,
+        help="Print graph statistics",
+        configure_parser=_configure_stats_parser,
+        handler=_handle_stats,
+    ),
+    CommandSpec(
+        path=("export",),
+        access=AccessMode.MUTATING,
+        snapshot=False,
+        help="Export nodes and edges as JSON or standalone HTML",
+        configure_parser=_configure_export_parser,
+        handler=_handle_export,
+    ),
+    CommandSpec(
+        path=("inspect",),
+        access=AccessMode.READ_ONLY,
+        snapshot=True,
+        help="Inspect a node and adjacent edges",
+        configure_parser=_configure_inspect_parser,
+        handler=_handle_inspect,
+    ),
+)
+_COMMAND_SPECS_BY_PATH = {spec.path: spec for spec in COMMAND_SPECS}
+if len(_COMMAND_SPECS_BY_PATH) != len(COMMAND_SPECS):
+    raise ValueError("Duplicate declarative CLI command path")
+
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -997,50 +1638,12 @@ def build_parser() -> argparse.ArgumentParser:
     config_init = config_sub.add_parser("init", help="Create a sample reql.conf if absent")
     config_init.add_argument("--path", default=PROJECT_CONFIG_FILENAME, help="Target project config file path")
 
-    project = sub.add_parser("project", help="Project commands: compile, update, status, explain, watch-status, history, diff, report, exclude")
+    project = sub.add_parser("project", help="Compile, inspect, explain, and report on projects")
     project_sub = project.add_subparsers(dest="project_command", required=True)
-
-    project_compile = project_sub.add_parser("compile", help="Scan and incrementally compile dirty artifacts")
-    project_compile.add_argument("path", nargs="?", default=".", help="Project path to compile; defaults to the current working directory")
-    project_compile.add_argument("--max-file-size-mb", type=float, default=None)
-    project_compile.add_argument("--watch", action="store_true", help="Monitor the project filesystem and compile dirty artifacts automatically")
-    project_compile.add_argument("--watch-interval", type=float, default=0.5, help="Maximum seconds to wait between bounded watchdog checks")
-    project_compile.add_argument("--watch-debounce", type=float, default=0.1, help="Seconds to wait before compiling detected changes")
-    project_compile.add_argument("--watch-iterations", type=int, default=None, help="Stop after this many watch checks; default is until interrupted")
-
-    project_update = project_sub.add_parser("update", help="Incrementally update a previously compiled project")
-    project_update.add_argument("path", nargs="?", default=".", help="Project path to update; defaults to the current working directory")
-    project_update.add_argument("--max-file-size-mb", type=float, default=None)
-
-    project_status = project_sub.add_parser("status", help="Show registered project artifact status")
-    project_status.add_argument("path")
-    project_status.add_argument("--json", action="store_true", help="Print structured JSON result")
-
-    project_explain = project_sub.add_parser("explain", help="Explain repository capabilities, architecture, workflows, and change starting points")
-    project_explain.add_argument("path", nargs="?", default=".", help="Registered project path; defaults to the current working directory")
-    project_explain.add_argument("--focus", default=None, help="Feature, behavior, or business concept used to rank change guidance")
-    project_explain.add_argument("--max-capabilities", type=int, default=12, help="Maximum business capabilities to return")
-    project_explain.add_argument("--max-workflows", type=int, default=8, help="Maximum inferred workflows to return")
-    project_explain.add_argument("--json", action="store_true", help="Print structured JSON result")
 
     project_watch_status = project_sub.add_parser("watch-status", help="Check watcher liveness without opening the graph")
     project_watch_status.add_argument("path", nargs="?", default=".", help="Project path; defaults to the current working directory")
     project_watch_status.add_argument("--json", action="store_true", help="Print structured JSON result")
-
-    project_history = project_sub.add_parser("history", help="Show newest-first content-addressed project revisions")
-    project_history.add_argument("path", nargs="?", default=".", help="Registered project path; defaults to the current working directory")
-    project_history.add_argument("--limit", type=int, default=20, help="Maximum revisions to show")
-    project_history.add_argument("--json", action="store_true", help="Print structured JSON result")
-
-    project_diff = project_sub.add_parser("diff", help="Show file changes in a revision; defaults to the latest revision")
-    project_diff.add_argument("path", nargs="?", default=".", help="Registered project path; defaults to the current working directory")
-    project_diff.add_argument("--revision", default=None, help="Revision id; defaults to the latest project revision")
-    project_diff.add_argument("--json", action="store_true", help="Print structured JSON result")
-
-    project_report = project_sub.add_parser("report", help="Write project Markdown reports")
-    project_report.add_argument("path")
-    project_report.add_argument("--output", default=None, help="Output directory for GRAPH_REPORT.md, GRAPH_DELTAS.md, and CACHE_REPORT.md")
-    project_report.add_argument("--json", action="store_true", help="Print structured JSON result")
 
     project_exclude = project_sub.add_parser("exclude", help="Add scan.exclude patterns to a project config")
     project_exclude.add_argument("patterns", nargs="+", help="One or more scan.exclude patterns to add")
@@ -1049,35 +1652,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     cache = sub.add_parser("cache", help="Cache commands: status, clear")
     cache_sub = cache.add_subparsers(dest="cache_command", required=True)
-    cache_status = cache_sub.add_parser("status", help="Show incremental cache status for a project path")
-    cache_status.add_argument("path", nargs="?", default=".", help="Project path; defaults to the current working directory")
-    cache_status.add_argument("--max-file-size-mb", type=float, default=None)
-    cache_status.add_argument("--json", action="store_true", help="Print structured JSON result")
-    cache_clear = cache_sub.add_parser("clear", help="Archive cache metadata for a project path")
-    cache_clear.add_argument("path", nargs="?", default=".", help="Project path; defaults to the current working directory")
-    cache_clear.add_argument("--json", action="store_true", help="Print structured JSON result")
-
-    query_context = sub.add_parser("query_context", help="Compose a deterministic context block for a query")
-    _add_query_context_arguments(query_context)
-
-    query_explore = sub.add_parser("query_explore", help="Explore owners, callers, public surface, serialization paths, docs, and code")
-    _add_query_explore_arguments(query_explore)
-
-    query_graph = sub.add_parser("query_graph", help="Retrieve a structured query-centered subgraph")
-    _add_query_graph_arguments(query_graph)
-    query_memories = sub.add_parser("query_memories", help="Retrieve relevant memory texts for a query")
-    _add_query_memories_arguments(query_memories)
-
-    query = sub.add_parser("query", help="Execute a REQL statement")
-    _add_reql_statement_arguments(query)
-
-    locate = sub.add_parser("locate", help="Resolve a known project-relative path without semantic ranking")
-    locate.add_argument("path", help="Exact relative path; known document extensions may be omitted")
-    locate.add_argument("--include-archived", action="store_true", help="Include archived or deleted artifacts")
-    locate.add_argument("--json", action="store_true", help="Print structured JSON result")
-
-    stats = sub.add_parser("stats", help="Print graph statistics")
-    stats.add_argument("--json", action="store_true")
 
     storage = sub.add_parser("storage", help="Storage commands: inspect, locks, compact")
     storage_sub = storage.add_subparsers(dest="storage_command", required=True)
@@ -1089,15 +1663,20 @@ def build_parser() -> argparse.ArgumentParser:
     storage_locks.add_argument("--recover-stale", action="store_true", help="Remove only locks proven stale; incomplete local locks require a safety grace period")
     storage_locks.add_argument("--json", action="store_true", help="Print structured JSON result")
 
-    export = sub.add_parser("export", help="Export nodes and edges as JSON or standalone HTML")
-    export.add_argument("--out", default=None, help="Optional output file or directory")
-    export.add_argument("--html", action="store_true", help="Write an interactive standalone graph.html visualization")
-    export.add_argument("--json", action="store_true", help="Write graph JSON to a file")
-
-    inspect = sub.add_parser("inspect", help="Inspect a node and adjacent edges")
-    inspect.add_argument("--node-id", required=True)
-    inspect.add_argument("--limit", type=int, default=30)
-    inspect.add_argument("--json", action="store_true", help="Print structured JSON result")
+    _configure_declared_commands(
+        {
+            (): sub,
+            ("agent",): agent_sub,
+            ("agent", "decision"): agent_decision_sub,
+            ("agent", "finding"): agent_finding_sub,
+            ("agent", "session"): agent_session_sub,
+            ("agent", "task"): agent_task_sub,
+            ("cache",): cache_sub,
+            ("config",): config_sub,
+            ("project",): project_sub,
+            ("storage",): storage_sub,
+        }
+    )
 
     _normalize_subparser_help(sub)
     _normalize_subparser_help(config_sub)
@@ -1276,8 +1855,15 @@ def _main(argv: list[str] | None = None) -> int:
         raise
     profile_logger: PerformanceLogger | None = None
 
-    snapshot_allowed = _is_read_only_command(args) or (
-        args.command == "storage" and args.storage_command in {"inspect", "locks"}
+    command_spec = _selected_command_spec(args)
+    snapshot_allowed = (
+        command_spec.snapshot and command_spec.access_mode(args) is AccessMode.READ_ONLY
+        if command_spec is not None
+        else (
+            args.command == "project" and args.project_command == "watch-status"
+        ) or (
+            args.command == "storage" and args.storage_command in {"inspect", "locks"}
+        )
     )
     if args.snapshot and not snapshot_allowed:
         print("--snapshot is only valid for read-only commands and storage inspection", file=sys.stderr)
@@ -1642,331 +2228,20 @@ def _main(argv: list[str] | None = None) -> int:
             else:
                 store.close()
 
-    graph = _open(args, config, profile_logger=profile_logger)
-    try:
-        if args.command == "project":
-            if args.project_command in {"compile", "update"}:
-                max_file_size = _max_file_size_bytes(args, config)
-                compile_kwargs = {
-                    "max_file_size_bytes": max_file_size,
-                    "include_patterns": config.scan.include,
-                    "exclude_patterns": config.scan.exclude,
-                    "cache_enabled": config.cache.enabled,
-                    "parsing_options": _parsing_options(config),
-                }
-                if args.project_command == "compile" and args.watch:
-                    print(f"Monitor mode: {Path(args.path).expanduser().resolve(strict=False)}")
-                    exit_code = 0
-                    try:
-                        for event in graph.watch_project(
-                            args.path,
-                            interval_seconds=args.watch_interval,
-                            debounce_seconds=args.watch_debounce,
-                            max_iterations=args.watch_iterations,
-                            **compile_kwargs,
-                        ):
-                            print(
-                                f"Watch poll {event.iteration}: "
-                                f"dirty={event.dirty_artifacts} deleted={event.deleted_artifacts} total={event.total_artifacts}"
-                            )
-                            if event.result is None:
-                                print("No changes detected")
-                                continue
-                            _print_compile_result(event.result)
-                            if event.errors:
-                                exit_code = 1
-                    except KeyboardInterrupt:
-                        print("Watch stopped")
-                        return 130
-                    return exit_code
-                if args.project_command == "update":
-                    result = graph.update_project(args.path, **compile_kwargs)
-                else:
-                    result = graph.compile_project(args.path, **compile_kwargs)
-                _print_compile_result(result)
-                return 0 if not result.run.errors else 1
-            if args.project_command == "status":
-                status = graph.project_status(args.path)
-                if status is None:
-                    print("Project not found", file=sys.stderr)
-                    return 1
-                if args.json:
-                    _print_json(status)
-                else:
-                    project_node = status["project"]
-                    print(f"Project: {project_node['label']}")
-                    print(f"Root: {project_node['properties'].get('root_path')}")
-                    print(f"Status: {project_node['status']}")
-                    print(f"Artifacts: {status['artifacts']}")
-                    for artifact_type, count in sorted(status["counts_by_type"].items()):
-                        print(f"  {artifact_type}: {count}")
-                    if status["status_counts"]:
-                        print("Statuses:")
-                        for item_status, count in sorted(status["status_counts"].items()):
-                            print(f"  {item_status}: {count}")
-                return 0
-            if args.project_command == "history":
-                if graph.project_status(args.path) is None:
-                    print("Project not found", file=sys.stderr)
-                    return 1
-                revisions = graph.project_history(args.path, limit=max(0, args.limit))
-                if args.json:
-                    _print_json([revision.to_dict(include_manifest=False) for revision in revisions])
-                elif not revisions:
-                    print("No project revisions")
-                else:
-                    for revision in revisions:
-                        print(
-                            f"{revision.id}\t{revision.created_at}\t"
-                            f"files={len(revision.changes)}\tparent={revision.parent_id or '-'}"
-                        )
-                return 0
-            if args.project_command == "explain":
-                try:
-                    explanation = graph.explain_project(
-                        args.path,
-                        focus=args.focus,
-                        max_capabilities=args.max_capabilities,
-                        max_workflows=args.max_workflows,
-                    )
-                except ValueError as exc:
-                    print(str(exc), file=sys.stderr)
-                    return 2
-                if args.json:
-                    _print_json(explanation.to_dict())
-                else:
-                    print(explanation.to_markdown())
-                return 0
-            if args.project_command == "diff":
-                status = graph.project_status(args.path)
-                if status is None:
-                    print("Project not found", file=sys.stderr)
-                    return 1
-                if args.revision:
-                    revision = graph.project_revision(args.revision)
-                else:
-                    history = graph.project_history(args.path, limit=1)
-                    revision = history[0] if history else None
-                project_id = str(status["project"]["id"])
-                if revision is None or revision.project_id != project_id:
-                    print("Revision not found", file=sys.stderr)
-                    return 1
-                if args.json:
-                    _print_json(revision.to_dict(include_manifest=False))
-                else:
-                    print(f"Revision: {revision.id}")
-                    print(f"Parent: {revision.parent_id or '-'}")
-                    print(f"Tree: {revision.tree_hash}")
-                    for change in revision.changes:
-                        before = (change.old_sha256 or "-")[:12]
-                        after = (change.new_sha256 or "-")[:12]
-                        print(f"{change.status[0].upper()}\t{change.path}\t{before} -> {after}")
-                return 0
-            if args.project_command == "report":
-                files = graph.project_report(args.path, output_dir=args.output or config.reporting.output_dir)
-                if args.json:
-                    _print_json(files.to_dict())
-                else:
-                    print(f"Graph report: {files.graph_report}")
-                    print(f"Delta report: {files.graph_deltas}")
-                    print(f"Cache report: {files.cache_report}")
-                return 0
-
-        if args.command == "cache":
-            if args.cache_command == "status":
-                max_file_size = _max_file_size_bytes(args, config)
-                status = graph.cache_status(
-                    args.path,
-
-                    max_file_size_bytes=max_file_size,
-                    include_patterns=config.scan.include,
-                    exclude_patterns=config.scan.exclude,
-                    cache_enabled=config.cache.enabled,
-                    parsing_options=_parsing_options(config),
-                )
-                if args.json:
-                    _print_json(status)
-                else:
-                    print(f"Project: {status['project']['name']}")
-                    print(f"Total artifacts: {status['total_artifacts']}")
-                    print(f"Cached artifacts: {status['cached_artifacts']}")
-                    print(f"Dirty artifacts: {status['dirty_artifacts']}")
-                    print(f"Deleted artifacts: {status['deleted_artifacts']}")
-                return 0
-            if args.cache_command == "clear":
-                result = graph.clear_cache(args.path)
-                if args.json:
-                    _print_json(result)
-                else:
-                    print(f"Project: {result['project_id']}")
-                    print(f"Cleared cache entries: {result['cleared_entries']}")
-                return 0
-
-        if args.command == "query_context":
-            if args.json:
-                _print_json(
-                    graph.query_context_payload(
-                        args.query,
-
-                        top_k=args.top_k,
-                        max_depth=args.max_depth,
-                        max_items=args.max_items,
-                        mode=_query_context_mode_from_args(args),
-                        scopes=_query_context_scopes_from_args(args),
-                        include_archived=args.include_archived,
-                        include_risky=args.include_risky,
-                    )
-                )
-            else:
-                print(
-                    graph.query_context(
-                        args.query,
-
-                        top_k=args.top_k,
-                        max_depth=args.max_depth,
-                        max_items=args.max_items,
-                        mode=_query_context_mode_from_args(args),
-                        scopes=_query_context_scopes_from_args(args),
-                        include_archived=args.include_archived,
-                        include_risky=args.include_risky,
-                    )
-                )
-            return 0
-
-        if args.command == "query_explore":
-            try:
-                result = graph.query_explore(
-                    args.query,
-
-                    views=_query_explore_views_from_args(args),
-                    top_k=args.top_k,
-                    max_depth=args.max_depth,
-                    limit=args.limit,
-                    max_items=args.max_items,
-                    include_archived=args.include_archived,
-                )
-            except ValueError as exc:
-                print(str(exc), file=sys.stderr)
-                return 2
-            if args.json:
-                _print_json(result)
-            else:
-                print(result["context"])
-            return 0
-
-        if args.command == "query_graph":
-            result = graph.query_graph(
-                args.query,
-
-                top_k=args.top_k,
-                max_depth=args.max_depth,
-                max_nodes=args.max_nodes,
-                max_edges=args.max_edges,
-                max_sources=args.max_sources,
-                max_items=args.max_items,
-                filter_generic=not args.no_filter_generic,
-                include_archived=args.include_archived,
-            )
-            if args.json:
-                _print_json(result)
-            else:
-                print(result["context"])
-            return 0
-
-        if args.command == "query_memories":
-            payload = graph.query_memories_payload(
-                args.query,
-
-                top_k=args.top_k,
-                max_depth=args.max_depth,
-                limit=args.limit,
-                include_sources=not args.no_sources,
-                filter_generic=not args.no_filter_generic,
-                max_text_chars=args.max_text_chars,
-                include_archived=args.include_archived,
-            )
-            memories = payload["memories"]
-            if args.json:
-                _print_json(payload)
-            else:
-                for item in memories:
-                    print(f"{float(item['score']):.3f}\t{item['type']}\t{item['id']}\t{item['text']}")
-            return 0
-
-        if args.command == "query":
-            statement = _normalize_reql_statement_arg(args.statement)
-            if not statement:
-                print("REQL statement required as positional argument", file=sys.stderr)
-                return 2
-            result = graph.query(statement)
-            if args.json:
-                _print_json(result.to_dict())
-            else:
-                print(result.to_table())
-            return 0
-
-        if args.command == "locate":
-            payload = graph.locate(args.path, include_archived=args.include_archived)
-            if args.json:
-                _print_json(payload)
-            else:
-                for match in payload["matches"]:
-                    print(f"{match['relative_path']}\t{match['artifact_type']}\t{match['id']}")
-            if not payload["matches"]:
-                if not args.json:
-                    print(f"Path not found: {args.path}", file=sys.stderr)
-                return 1
-            return 0
-
-        if args.command == "stats":
-            by_type = graph.store.node_type_counts()
-            payload = {
-                "nodes": graph.store.count_nodes(),
-                "edges": graph.store.count_edges(),
-                "node_types": by_type,
-            }
-            if args.json:
-                _print_json(payload)
-            else:
-                print(f"Nodes: {payload['nodes']}")
-                print(f"Edges: {payload['edges']}")
-                for k, v in sorted(by_type.items()):
-                    print(f"  {k}: {v}")
-            return 0
-
-        if args.command == "export":
-            payload = graph.export_json()
-            if args.html:
-                html_path = write_graph_html(payload, _graph_html_path(args.out))
-                print(html_path)
-                if args.json:
-                    json_path = html_path.with_name("graph.json")
-                    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-                    print(json_path)
-            else:
-                text = json.dumps(payload, ensure_ascii=False, indent=2)
-                if args.json:
-                    json_path = _graph_json_path(args.out)
-                    json_path.parent.mkdir(parents=True, exist_ok=True)
-                    json_path.write_text(text, encoding="utf-8")
-                    print(json_path)
-                elif args.out:
-                    Path(args.out).write_text(text, encoding="utf-8")
-                    print(args.out)
-                else:
-                    print(text)
-            return 0
-
-        if args.command == "inspect":
-            result = graph.inspect_node(args.node_id, limit=args.limit)
-            if not result["found"]:
-                print("Node not found", file=sys.stderr)
-                return 2
-            _print_json(result)
-            return 0
-
+    if command_spec is None:
         parser.error(f"Unknown command: {args.command}")
         return 2
+
+    graph = _open(args, config, profile_logger=profile_logger)
+    try:
+        return command_spec.handler(
+            CommandContext(
+                args=args,
+                config=config,
+                graph=graph,
+                profile_logger=profile_logger,
+            )
+        )
     finally:
         graph.close()
 

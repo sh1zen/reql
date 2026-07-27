@@ -125,28 +125,23 @@ class MarkdownIngestionTests(unittest.TestCase):
             finally:
                 graph.close()
 
-    def test_compile_ingests_documents_by_default_and_ignores_noncanonical_alias(self) -> None:
-        scenarios = (
-            ("default", None),
-            ("noncanonical_alias", {"ingest_documents": False}),
-        )
-        for name, parsing_options in scenarios:
-            with self.subTest(name=name), tempfile.TemporaryDirectory() as td:
-                root = Path(td) / "project"
-                root.mkdir()
-                (root / "README.md").write_text(
-                    "# README\n\nProject documentation should become source context.\n",
-                    encoding="utf-8",
-                )
-                graph = _open_graph_with_documents(Path(td) / "memory.reql")
-                try:
-                    result = graph.compile_project(root, parsing_options=parsing_options)
-                    node_types = {node.type for node in graph.store.all_nodes()}
+    def test_compile_ingests_documents_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "project"
+            root.mkdir()
+            (root / "README.md").write_text(
+                "# README\n\nProject documentation should become source context.\n",
+                encoding="utf-8",
+            )
+            graph = _open_graph_with_documents(Path(td) / "memory.reql")
+            try:
+                result = graph.compile_project(root)
+                node_types = {node.type for node in graph.store.all_nodes()}
 
-                    self.assertFalse(result.run.errors)
-                    self.assertIn("SourceFragment", node_types)
-                finally:
-                    graph.close()
+                self.assertFalse(result.run.errors)
+                self.assertIn("SourceFragment", node_types)
+            finally:
+                graph.close()
 
     def test_compile_document_policy_can_skip_specific_document_type(self) -> None:
         with tempfile.TemporaryDirectory() as td:

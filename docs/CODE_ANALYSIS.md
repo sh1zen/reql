@@ -174,10 +174,10 @@ also treated as real usage. Local variables that are read only inside their
 owner are summarized instead of persisted as standalone graph nodes; unused
 local variables remain persisted so cleanup queries can target them.
 
-`query_context --cleanup` is conservative by default: it shows only safe-remove
-findings. Add `--include-risky` to include API, entrypoint, framework lifecycle,
-test-local, low-confidence, and dynamic-reference candidates marked for
-validation instead of direct removal.
+`query_context --cleanup` is always conservative: it shows only safe-remove
+findings. API, entrypoint, framework lifecycle, test-local, low-confidence, and
+dynamic-reference candidates marked for validation remain accessible through
+explicit `FINDINGS` queries instead of the removal-oriented context builder.
 
 Package `__init__.py` imports are marked on `Import` nodes with
 `is_re_export=true`. A project-wide post-parse pass resolves them to real public

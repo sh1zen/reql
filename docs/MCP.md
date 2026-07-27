@@ -74,7 +74,8 @@ return bounded JSON payloads and never return the full graph.
 - `query_context`: retrieves compact structured working-set context with owner
   targets, targeted reads, bounded `read_plan` entries, snippets,
   graph-derived `change_chain` steps, impact, tests, and structured next-step
-  commands for JSON clients.
+  commands for JSON clients. It returns the canonical `ContextResult` envelope;
+  projected context is nested under `payload`.
 - `query_explore`: retrieves dependency-oriented slices for coding agents:
   owners, callers, public surface, serialization paths, docs mentions, explicit
   structural template duplicates, and code working-set records.
@@ -215,9 +216,9 @@ monitor is responsible for updates.
   "arguments": {
     "storage_path": ".reql/memory.reql",
     "query": "how does incremental compilation handle deleted files?",
-    "top_k": 12,
+    "top_k": 20,
     "max_depth": 3,
-    "max_items": 12,
+    "max_items": 20,
     "config_path": "reql.conf"
   }
 }
@@ -247,7 +248,11 @@ When retrieval returns relevant code nodes, `query_context` is informative by
 default. Pass `"scopes": ["code"]`, or booleans such as `"code": true`,
 `"docs": true`, or `"test": true`, to limit results to code,
 documentation/imported documents, or tests. Pass `"mode": "cleanup"` to return
-only cleanup candidates matching the query for dead-code or unused-symbol work.
+only safe-remove cleanup candidates matching the query for dead-code or
+unused-symbol work. Set `"include_archived": true` when archived graph records
+must participate. MCP uses the same typed request, canonical `20/3/20` budget,
+confidence calculation, and deterministic `graph_revision` as Python and CLI;
+it never calls the retrieval engine directly.
 
 Use `query_explore` when an agent needs dependency slices before reading source
 files or editing. Pass `views` to reduce output to one or more of `owners`,

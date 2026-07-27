@@ -29,6 +29,57 @@ class _InterruptingInput(io.StringIO):
 
 class CLITests(unittest.TestCase):
 
+    def test_project_explain_command_spec_controls_parser_access_and_snapshot(self) -> None:
+        from memory import cli as cli_mod
+
+        args = cli_mod.build_parser().parse_args(
+            ["--snapshot", "project", "explain", "repo", "--focus", "checkout", "--json"]
+        )
+        spec = cli_mod._selected_command_spec(args)
+
+        self.assertIsNotNone(spec)
+        assert spec is not None
+        self.assertEqual(spec.path, ("project", "explain"))
+        self.assertIs(spec.access, cli_mod.AccessMode.READ_ONLY)
+        self.assertTrue(spec.snapshot)
+        self.assertIs(cli_mod._command_access_mode(args), cli_mod.AccessMode.READ_ONLY)
+        self.assertEqual(args.path, "repo")
+        self.assertEqual(args.focus, "checkout")
+        self.assertTrue(args.json)
+
+    def test_command_spec_rejects_snapshot_for_mutating_command(self) -> None:
+        from memory import cli as cli_mod
+
+        with self.assertRaisesRegex(ValueError, "Only read-only commands"):
+            cli_mod.CommandSpec(
+                path=("example",),
+                access=cli_mod.AccessMode.MUTATING,
+                snapshot=True,
+                help="Example",
+                configure_parser=lambda parser: None,
+                handler=lambda context: 0,
+            )
+
+    def test_query_command_spec_resolves_access_from_statement(self) -> None:
+        from memory import cli as cli_mod
+
+        parser = cli_mod.build_parser()
+        read_args = parser.parse_args(["query", "MATCH (n) RETURN n"])
+        write_args = parser.parse_args(["query", "HUBS LIMIT 5"])
+
+        self.assertIs(cli_mod._command_access_mode(read_args), cli_mod.AccessMode.READ_ONLY)
+        self.assertIs(cli_mod._command_access_mode(write_args), cli_mod.AccessMode.MUTATING)
+
+    def test_snapshot_is_rejected_when_dynamic_query_access_is_mutating(self) -> None:
+        from memory import cli as cli_mod
+
+        stderr = io.StringIO()
+        with patch.object(cli_mod.sys, "stderr", stderr):
+            result = cli_mod.main(["--snapshot", "query", "HUBS LIMIT 5"])
+
+        self.assertEqual(result, 2)
+        self.assertIn("--snapshot is only valid", stderr.getvalue())
+
     def test_compile_summary_labels_semantic_symbol_changes(self) -> None:
         from memory import cli as cli_mod
 
@@ -331,7 +382,7 @@ class CLITests(unittest.TestCase):
                 held_reader.close()
 
             self.assertIn("Function", result.stdout)
-            self.assertEqual(json.loads(context_result.stdout)["query"], "read_query")
+            self.assertEqual(json.loads(context_result.stdout)["payload"]["query"], "read_query")
             lines = log.read_text(encoding="utf-8").splitlines()
             self.assertFalse(any('"name":"storage.open.read_only_fallback"' in line for line in lines))
             self.assertTrue(any('"read_only":true' in line and '"name":"storage.open"' in line for line in lines))
@@ -1086,18 +1137,21 @@ class CLITests(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
-            query_context_payload = json.loads(query_context_json.stdout)
+            query_context_envelope = json.loads(query_context_json.stdout)
+            query_context_payload = query_context_envelope["payload"]
             self.assertNotIn("context", query_context_payload)
             self.assertIn(query_context_payload["kind"], {"code", "general"})
             self.assertEqual(query_context_payload["query_mode"], "informative")
             self.assertIn("followups", query_context_payload)
+            self.assertEqual(query_context_envelope["schema_version"], 1)
+            self.assertEqual(len(query_context_envelope["graph_revision"]), 64)
             query_context_code_json = subprocess.run(
                 base + ["query_context", "--query", "water_office_plant", "--top-k", "5", "--code", "--json"],
                 check=True,
                 capture_output=True,
                 text=True,
             )
-            query_context_code_payload = json.loads(query_context_code_json.stdout)
+            query_context_code_payload = json.loads(query_context_code_json.stdout)["payload"]
             self.assertEqual(query_context_code_payload["query_mode"], "informative")
             self.assertEqual(query_context_code_payload["scopes"], ["code"])
             query_context_edit_json = subprocess.run(
@@ -1113,7 +1167,10 @@ class CLITests(unittest.TestCase):
                 capture_output=True,
                 text=True,
             )
-            self.assertEqual(json.loads(query_context_cleanup_json.stdout)["query_mode"], "cleanup")
+            self.assertEqual(
+                json.loads(query_context_cleanup_json.stdout)["payload"]["query_mode"],
+                "cleanup",
+            )
             query_graph = subprocess.run(
                 base + ["query_graph", "--query", "water_office_plant", "--top-k", "5", "--max-depth", "2", "--json"],
                 check=True,

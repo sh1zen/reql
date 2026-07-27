@@ -316,7 +316,7 @@ REQL is not an LLM. It uses tokenization, lexical matching, graph links, and act
 
 - Informative: use no mode flag for project knowledge, structure, documents, architecture, existence checks, and "is there anything like X" questions. Prefer `{command_name} query_context --query "<terms from user request>"`, `{command_name} query_memories --query "<terms from user request>"`, or `{command_name} query_graph --query "<terms from user request>" --max-depth 2`. Code-scoped `query_context` renders at most eight paths with owner symbols, bounded line ranges, and associated tests; use `--json` when graph links or planning fields are needed.
 - Scope filters: use `--code`, `--docs`, and `--test` with informative or cleanup queries when the user asks for a precise section. They restrict results to code symbols/source, documentation/imported documents, or tests.
-- Cleanup: use `--cleanup` for safe-remove dead code, unused imports, unused variables, and removal candidates. Start with `{command_name} query_context --query "<terms from user request>" --cleanup` or the `FINDINGS` query below, then remove only confirmed candidates. Add `--include-risky` only when you intentionally want public API, low-confidence, test-local, or validation-required candidates.
+- Cleanup: use `--cleanup` for safe-remove dead code, unused imports, unused variables, and removal candidates. Start with `{command_name} query_context --query "<terms from user request>" --cleanup`, then remove only confirmed candidates. Use the explicit `FINDINGS` query below when reviewing public API, low-confidence, test-local, or validation-required candidates.
 
 ## Dependency Exploration
 

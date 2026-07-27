@@ -112,6 +112,20 @@ reql project --help
 reql query_context --help
 ```
 
+### Declarative command registration
+
+New leaf commands should be described by a `CommandSpec` in
+`src/memory/cli.py`. The spec supplies the command path, access mode, snapshot
+support, parser configurator, help text, and handler. `build_parser()` installs
+registered specs into their parent parser group, while execution uses the same
+selected spec to choose read-only versus mutating storage access, validate
+`--snapshot`, and invoke the handler.
+
+All commands that open `MemoryGraph` are registered this way. Commands with a
+different lifecycle, such as installation, configuration bootstrap, agent
+workspaces, watcher status, and direct block-storage inspection, keep their
+dedicated execution paths without duplicating graph access classification.
+
 ## Agent Workspace
 
 `reql agent` is the working-memory layer used by REQL-aware coding-agent
@@ -333,7 +347,6 @@ reql query_context --query "payment service" --code --json
 reql query_context --query "readme FAQ"
 reql query_context --query "unused imports" --cleanup
 reql query "FINDINGS WHERE finding_type = 'possibly_orphan_directory' RETURN relative_path,file_count,files,cleanup_priority"
-reql query_context --query "unused public API" --cleanup --include-risky
 ```
 
 It is informative by default and returns matching nodes, file/line references,
@@ -344,12 +357,18 @@ nodes can be rendered as snippets so agents can use precise source spans before
 opening full files. In rendered code context, read-plan spans and inspection
 commands are folded into `Code results`; the structured JSON retains the full
 `read_plan`. Use `--cleanup` for dead-code and unused-symbol cleanup. Cleanup output
-is conservative by default and shows safe-remove findings plus medium-priority
+is always conservative and shows safe-remove findings plus medium-priority
 directory aggregate findings. `possibly_orphan_directory` groups multiple
 isolated code files under one containing directory with `file_count` and
-`files`, so cleanup review does not start from one suggestion per file. Add
-`--include-risky` to include public API, low-confidence, test-local, and
-validate/risky `StaticAnalysisFinding` candidates.
+`files`, so cleanup review does not start from one suggestion per file.
+Validation-required findings remain available through explicit `FINDINGS`
+REQL statements rather than the removal-oriented context builder.
+
+CLI, Python, and MCP use the same `QueryContextRequest` contract and canonical
+budget defaults (`top_k=20`, `max_depth=3`, `max_items=20`). JSON output is the
+canonical `ContextResult` envelope: `schema_version`, `graph_revision`, and
+`confidence` are top-level fields, while trace metadata and projected context
+are nested under `payload`.
 
 For an unscoped informative query, REQL also detects cross-layer file
 relationships when documentation and implementation files in the same project

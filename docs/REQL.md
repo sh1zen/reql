@@ -124,14 +124,15 @@ renders one compact block with file/line references plus raw-query references
 for extended research. Add `--code`, `--docs`, or `--test` to restrict the
 same query to code, documentation/imported documents, or tests. Pass
 `--cleanup` for dead-code and unused-symbol cleanup; cleanup output shows only
-safe-remove `StaticAnalysisFinding` candidates before removals. Add
-`--include-risky` to include public API, low-confidence, test-local, and
-validate/risky candidates. Generic memory candidates, generated package docs,
+safe-remove `StaticAnalysisFinding` candidates before removals. Review
+validation-required findings through explicit `FINDINGS` statements instead
+of the removal-oriented context builder. Generic memory candidates, generated package docs,
 and secondary test/docs paths are suppressed when a production owner is
 available. Use `reql query_context --code --json` or `reql query_context
---cleanup --json` when another tool should consume the compact payload directly;
-payloads include `query_mode`, `scopes`, `cleanup_filter`, `owner_candidates`,
-`cleanup_candidates`, `working_set`, and `targeted_reads`.
+--cleanup --json` when another tool should consume the canonical result envelope.
+The envelope contains `schema_version`, `graph_revision`, and `confidence`;
+its nested `payload` contains `query_mode`, `scopes`, `cleanup_filter`,
+`owner_candidates`, `cleanup_candidates`, `working_set`, and `targeted_reads`.
 For `--docs`, document concepts are ranked against their strongest bounded
 evidence excerpt. Raw ingestion events remain hidden, repeated broad excerpts
 are deduplicated, weak results from unrelated documents are dropped relative to

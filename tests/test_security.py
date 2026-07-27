@@ -122,18 +122,34 @@ class SecurityBoundaryTests(unittest.TestCase):
 
             result = call_tool("query_context", {"storage_path": str(db), "query": "query_context structured payload", "top_k": 3})
 
-        self.assertNotIn("context", result)
-        self.assertIn("trace_id", result)
-        self.assertIn("ranked_nodes", result)
-        self.assertIn("seed_node_ids", result)
-        self.assertIn(result["kind"], {"code", "general"})
-        self.assertIn("followups", result)
-        if result["kind"] == "code":
-            self.assertIn("working_set", result)
-            self.assertIn("contracts", result)
-            self.assertIn("read_plan", result)
-            self.assertIn("change_chain", result)
-            self.assertIn("targeted_reads", result)
+        payload = result["payload"]
+        self.assertNotIn("context", payload)
+        self.assertIn("trace_id", payload)
+        self.assertIn("ranked_nodes", payload)
+        self.assertIn("seed_node_ids", payload)
+        self.assertEqual(result["schema_version"], 1)
+        self.assertEqual(len(result["graph_revision"]), 64)
+        self.assertIn(payload["kind"], {"code", "general"})
+        self.assertIn("followups", payload)
+        if payload["kind"] == "code":
+            self.assertIn("working_set", payload)
+            self.assertIn("contracts", payload)
+            self.assertIn("read_plan", payload)
+            self.assertIn("change_chain", payload)
+            self.assertIn("targeted_reads", payload)
+
+    def test_mcp_query_context_schema_uses_the_shared_contract(self) -> None:
+        schema = next(item for item in list_tools() if item["name"] == "query_context")
+        properties = schema["inputSchema"]["properties"]
+
+        self.assertEqual(properties["top_k"]["default"], 20)
+        self.assertEqual(properties["max_depth"]["default"], 3)
+        self.assertEqual(properties["max_items"]["default"], 20)
+        self.assertEqual(properties["mode"]["enum"], ["informative", "cleanup"])
+        self.assertEqual(properties["scopes"]["items"]["enum"], ["code", "docs", "test"])
+        for name in ("code", "docs", "test", "include_archived"):
+            self.assertIn(name, properties)
+        self.assertNotIn("include_risky", properties)
 
     def test_mcp_query_explore_is_read_only_and_structured(self) -> None:
         tmp_root = Path.cwd() / ".tmp"

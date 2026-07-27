@@ -7,7 +7,7 @@ from memory.config import default_config, merge_config
 
 
 def open_graph_with_documents(path: str | Path) -> MemoryGraph:
-    """Open a graph with all document formats enabled for legacy ingestion tests."""
+    """Open a graph with every supported document format enabled."""
 
     config = default_config()
     config = merge_config(

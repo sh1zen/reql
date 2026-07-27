@@ -15,6 +15,13 @@ from memory.domain.models import (
     MemoryQuery,
     MemorySubgraph,
 )
+from memory.domain.query_context import (
+    DEFAULT_MAX_DEPTH,
+    DEFAULT_MAX_ITEMS,
+    DEFAULT_TOP_K,
+    ContextResult,
+    QueryContextRequest,
+)
 from memory.engines.activation import ActivationEngine
 from memory.engines.salience import SalienceEngine
 from memory.extraction.deterministic import DeterministicExtractor
@@ -29,6 +36,7 @@ from memory.artifacts.compiler import ArtifactCompiler
 from memory.artifacts.fingerprint import normalize_relative_lookup_path
 from memory.services.incremental_compilation import CompileProjectResult, IncrementalCompilationService
 from memory.services.project_watch import ProjectWatchEvent, ProjectWatchService
+from memory.services.query_context import QueryContextService
 from memory.services.retrieval import RetrievalEngine
 from memory.explanation import RepositoryExplanation, RepositoryExplanationService
 
@@ -70,6 +78,7 @@ class MemoryGraph:
         self.extractor = extractor or DeterministicExtractor()
         self.activation = ActivationEngine(store)
         self.retrieval = RetrievalEngine(store, extractor or DeterministicExtractor(), profile_logger=profile_logger)
+        self.query_context_service = QueryContextService(self.retrieval)
         self.salience = SalienceEngine(store)
         self.project_reporter = ProjectReportGenerator(store)
         self.projects = ProjectRegistry(store)
@@ -233,62 +242,58 @@ class MemoryGraph:
         text: str,
         *,
 
-        top_k: int = 20,
-        max_depth: int = 3,
-        max_items: int = 20,
+        top_k: int = DEFAULT_TOP_K,
+        max_depth: int = DEFAULT_MAX_DEPTH,
+        max_items: int = DEFAULT_MAX_ITEMS,
         mode: str = "informative",
         scopes: list[str] | set[str] | tuple[str, ...] | None = None,
         include_archived: bool = False,
-        include_risky: bool = False,
     ) -> str:
         """Return the compact deterministic context block for a query."""
-        subgraph = self.retrieval.retrieve(
-            MemoryQuery(
+        result = self.query_context_result(
+            QueryContextRequest.from_raw(
                 text=text,
+                mode=mode,
+                scopes=scopes,
                 top_k=top_k,
                 max_depth=max_depth,
+                max_items=max_items,
                 include_archived=include_archived,
-                context_scopes=set(scopes) if scopes else None,
             )
         )
-        return self.retrieval.compose_context(
-            subgraph,
-            max_items=max_items,
-            query_mode=mode,
-            query_scopes=scopes,
-            include_risky=include_risky,
-        )
+        return self.query_context_service.render(result)
+
+    def query_context_result(self, request: QueryContextRequest) -> ContextResult:
+        """Execute the canonical typed query-context request."""
+        if not isinstance(request, QueryContextRequest):
+            raise TypeError("request must be a QueryContextRequest")
+        return self.query_context_service.execute(request)
 
     def query_context_payload(
         self,
         text: str,
         *,
 
-        top_k: int = 20,
-        max_depth: int = 3,
-        max_items: int = 20,
+        top_k: int = DEFAULT_TOP_K,
+        max_depth: int = DEFAULT_MAX_DEPTH,
+        max_items: int = DEFAULT_MAX_ITEMS,
         mode: str = "informative",
         scopes: list[str] | set[str] | tuple[str, ...] | None = None,
         include_archived: bool = False,
-        include_risky: bool = False,
     ) -> dict[str, Any]:
-        """Return compact structured query context."""
-        subgraph = self.retrieval.retrieve(
-            MemoryQuery(
+        """Return the versioned structured query-context envelope."""
+        result = self.query_context_result(
+            QueryContextRequest.from_raw(
                 text=text,
+                mode=mode,
+                scopes=scopes,
                 top_k=top_k,
                 max_depth=max_depth,
+                max_items=max_items,
                 include_archived=include_archived,
-                context_scopes=set(scopes) if scopes else None,
             )
         )
-        return self.retrieval.query_context_payload(
-            subgraph,
-            max_items=max_items,
-            query_mode=mode,
-            query_scopes=scopes,
-            include_risky=include_risky,
-        )
+        return result.to_dict()
 
     def query_memories(
         self,
@@ -589,19 +594,17 @@ class MemoryGraph:
         normalized = relative_path.casefold()
         suffixes = (".md", ".markdown", ".txt", ".rst") if not Path(relative_path).suffix else ()
         key_candidates = [normalized, *(f"{normalized}{suffix}" for suffix in suffixes)]
-        legacy_candidates = [relative_path, *(f"{relative_path}{suffix}" for suffix in suffixes)]
         matches: dict[str, MemoryNode] = {}
-        for property_name, candidates in (("relative_path_key", key_candidates), ("relative_path", legacy_candidates)):
-            for candidate in candidates:
-                for node in self.store.find_nodes_by_property(
-                    property_name,
-                    candidate,
-                    type_="SourceArtifact",
-                    limit=100,
-                    clone=False,
-                ):
-                    if include_archived or node.status not in {"archived", "deleted"}:
-                        matches[node.id] = node
+        for candidate in key_candidates:
+            for node in self.store.find_nodes_by_property(
+                "relative_path_key",
+                candidate,
+                type_="SourceArtifact",
+                limit=100,
+                clone=False,
+            ):
+                if include_archived or node.status not in {"archived", "deleted"}:
+                    matches[node.id] = node
         rows = []
         for node in sorted(matches.values(), key=lambda item: str(item.properties.get("relative_path") or "").casefold()):
             properties = node.properties

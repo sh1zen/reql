@@ -8,7 +8,6 @@ from .models import (
     CodeEvidence,
     RepositoryExplanation,
     WorkflowParticipant,
-    WorkflowStep,
 )
 from .service import RepositoryExplanationService
 
@@ -21,5 +20,4 @@ __all__ = [
     "RepositoryExplanation",
     "RepositoryExplanationService",
     "WorkflowParticipant",
-    "WorkflowStep",
 ]

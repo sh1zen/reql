@@ -32,6 +32,9 @@ before and during edits:
 - retrieval commands such as `query_context`, `query_explore`, `query_graph`,
   and `query_memories` find lexical seed nodes, expand a bounded graph
   neighborhood, rank the result, and return compact source-backed context;
+- Python, CLI, and MCP `query_context` calls share one typed request/result
+  service, so scopes, budgets, confidence, and revision metadata have identical
+  semantics at every provider boundary;
 - every result can point back to paths, line ranges, relationships, evidence,
   and graph provenance instead of relying on broad source dumps;
 - `reql agent` maintains per-agent working memory for plans, findings,
@@ -89,8 +92,10 @@ reql query_explore --query "profile template" --structural-duplicates-only
 For coding-agent tasks, the normal `query_context --code` output shows at most
 eight paths: five to eight source files when available, reduced as needed to
 reserve room for up to three associated tests. Each source row includes its
-owner symbols and best bounded line range. Detailed graph metadata and planning
-fields remain available from `query_context --json` for programmatic consumers.
+  owner symbols and best bounded line range. Detailed graph metadata and planning
+  fields remain available from `query_context --json` for programmatic consumers;
+  structured results include contract `schema_version`, a deterministic
+  `graph_revision`, and typed confidence metadata.
 When the highest ranked score is below `0.25`, `query_context` short-circuits
 with `Confidence: insufficient` and explicitly allows one targeted `rg`
 fallback using the user's exact symbol, path, or error terms.
@@ -406,7 +411,7 @@ src/memory/
 |   |-- activation.py       # Spreading activation
 |   `-- salience.py         # Salience scoring
 |-- services/               # Application orchestration
-|   |-- retrieval.py
+|   |-- retrieval/          # Search, expansion, context projections, renderers
 |   |-- incremental_compilation.py
 |   `-- project_watch.py
 |-- query/                  # REQL lexer, parser, AST, and evaluator
@@ -432,6 +437,7 @@ Main operations:
 - `retrieve(query)`
 - `compose_context(query)`
 - `query_context(query)`
+- `query_context_result(QueryContextRequest(...))`
 - `query_context_payload(query)`
 - `query_explore(query)`
 - `query_graph(query)`
@@ -454,6 +460,21 @@ Main operations:
 - `show_delta(delta_id)`
 - `detect_communities(project_id=...)`
 - `analyze_hubs(project_id=..., limit=...)`
+
+The typed query-context API is available from the canonical package:
+
+```python
+from reql import MemoryGraph, QueryContextRequest, QueryMode, RetrievalBudget
+
+request = QueryContextRequest(
+    text="payment service",
+    mode=QueryMode.INFORMATIVE,
+    scopes=frozenset({"code"}),
+    budget=RetrievalBudget(top_k=20, max_depth=3, max_items=20),
+)
+result = graph.query_context_result(request)
+payload = result.to_dict()
+```
 
 ## Extending the Project
 

@@ -2,11 +2,9 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Literal
 
+from ..domain.query_context import ContextScope
 from .models import SourceArtifact
-
-ContextScope = Literal["code", "docs", "test"]
 
 
 def artifact_context_scope(artifact: SourceArtifact) -> ContextScope:

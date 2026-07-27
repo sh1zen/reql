@@ -1,3 +1,4 @@
 from .retrieval import RetrievalEngine
+from .query_context import QueryContextService
 
-__all__ = ["RetrievalEngine"]
+__all__ = ["QueryContextService", "RetrievalEngine"]

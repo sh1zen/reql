@@ -83,12 +83,38 @@ edge properties, including source file, line range, extractor, evidence,
 
 ```text
 query
+  -> QueryContextRequest
+  -> QueryContextService
   -> deterministic query extraction
   -> lexical seed discovery
   -> bounded graph expansion
   -> graph-aware ranking
-  -> subgraph/context output
+  -> code/general/cleanup projection
+  -> Markdown or structured context output
 ```
+
+`memory.services.retrieval.RetrievalEngine` remains the stable facade, but its
+implementation is assembled from focused pipeline components:
+
+- `retrieval/search.py` owns lexical matching and ranking primitives;
+- `retrieval/expansion.py` owns bounded graph traversal;
+- `retrieval/context/service.py` coordinates context construction;
+- `retrieval/context/projections/` selects code, general, and cleanup payloads;
+- `retrieval/context/renderers/` turns payloads into Markdown or structured
+  dictionaries;
+- `retrieval/context/models.py` defines the internal models and component
+  protocols shared by the pipeline.
+
+`memory.services.query_context.QueryContextService` is the application boundary
+above that pipeline. Python API, CLI, and MCP adapters all submit the same
+immutable `QueryContextRequest` and receive a versioned `ContextResult`.
+The service owns request-to-`MemoryQuery` conversion, projection, confidence,
+trace metadata, deterministic graph revision fingerprinting, and canonical
+envelope serialization. Providers do not call retrieval components directly.
+
+`query_context_result` exposes the typed result. Python structured output, CLI
+JSON, and MCP all serialize it as the same envelope with `schema_version`,
+`graph_revision`, `confidence`, and a nested `payload`.
 
 Agent context is built with `reql query_context --query ...`, dependency slices
 from `reql query_explore --query ...`, or the structured

@@ -277,6 +277,29 @@ class AgentWorkspaceTests(unittest.TestCase):
             self.assertEqual([item["id"] for item in first["files"]], ["artifact:app"])
             self.assertEqual(by_id[first_session["id"]]["status"], "closed")
             self.assertEqual(by_id[second_session["id"]]["status"], "active")
+            metadata = workspace.status()["metadata"]
+            self.assertEqual(list(metadata["current_session_ids"].values()), [second_session["id"]])
+
+    def test_current_sessions_are_isolated_by_activity(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = self._standard_graph(Path(td))
+            first = AgentWorkspace(storage, activity_id="thread:first")
+            second = AgentWorkspace(storage, activity_id="thread:second")
+            first.init()
+
+            first_session = first.start_session("First activity")["session"]
+            second_session = second.start_session("Second activity")["session"]
+
+            self.assertEqual(first.status()["current_session_id"], first_session["id"])
+            self.assertEqual(second.status()["current_session_id"], second_session["id"])
+            metadata = first.status()["metadata"]
+            self.assertEqual(
+                metadata["current_session_ids"],
+                {
+                    "thread:first": first_session["id"],
+                    "thread:second": second_session["id"],
+                },
+            )
 
     def test_multiple_agents_keep_private_memory_and_share_bus_handoffs(self) -> None:
         with tempfile.TemporaryDirectory() as td:

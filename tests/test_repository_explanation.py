@@ -141,7 +141,6 @@ class RepositoryExplanationTests(unittest.TestCase):
                     )
                 )
                 for workflow in explanation.workflows:
-                    self.assertEqual(workflow.steps, [])
                     for participant in workflow.participants:
                         self.assertNotEqual(participant.target.node_type, "Module")
                         self.assertFalse(participant.target.path.startswith("tests/"))

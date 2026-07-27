@@ -76,27 +76,6 @@ class ArchitectureLayer:
 
 
 @dataclass(slots=True)
-class WorkflowStep:
-    """Legacy path step retained for API compatibility.
-
-    Semantic workflows no longer expose ordered graph paths.
-    """
-
-    order: int
-    relation: str
-    action: str
-    evidence: CodeEvidence
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "order": self.order,
-            "relation": self.relation,
-            "action": self.action,
-            "evidence": self.evidence.to_dict(),
-        }
-
-
-@dataclass(slots=True)
 class WorkflowParticipant:
     """One explicit relation from a semantic workflow to implementing code."""
 
@@ -125,12 +104,6 @@ class BusinessWorkflow:
     invariants: list[str] = field(default_factory=list)
     participants: list[WorkflowParticipant] = field(default_factory=list)
     evidence: list[CodeEvidence] = field(default_factory=list)
-
-    @property
-    def steps(self) -> list[WorkflowStep]:
-        """Return no path steps; retained so older attribute access degrades safely."""
-
-        return []
 
     def to_dict(self) -> dict[str, Any]:
         return {

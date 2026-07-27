@@ -7,6 +7,15 @@ from .models import (
     MemorySubgraph,
     RankedNode,
 )
+from .query_context import (
+    Confidence,
+    ContextPayload,
+    ContextResult,
+    ContextScope,
+    QueryContextRequest,
+    QueryMode,
+    RetrievalBudget,
+)
 
 __all__ = [
     "MemoryNode",
@@ -16,4 +25,11 @@ __all__ = [
     "RankedNode",
     "ActivationOptions",
     "ActivationResult",
+    "Confidence",
+    "ContextPayload",
+    "ContextResult",
+    "ContextScope",
+    "QueryContextRequest",
+    "QueryMode",
+    "RetrievalBudget",
 ]

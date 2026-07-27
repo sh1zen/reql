@@ -7,8 +7,10 @@ from pathlib import Path
 
 from tests.config_helpers import open_graph_with_documents as _open_graph_with_documents
 from memory.artifacts.cache import artifact_cache_path
+from memory.artifacts.compile_summary import _node_matches_terms
 from memory.artifacts.compiler import ArtifactCompiler
 from memory.artifacts.models import SourceArtifact
+from memory.domain.models import MemoryNode
 from memory.services.incremental_compilation import IncrementalCompilationService
 
 
@@ -48,6 +50,16 @@ class IncrementalCompilationTests(unittest.TestCase):
         self.assertGreaterEqual(len(self._nodes("SourceFragment")), 2)
         self.assertEqual(payload["format"], "reql-artifact-cache-v1")
         self.assertEqual(set(project_cache["entries"]), {artifact.id for artifact in result.scan.artifacts})
+
+    def test_compile_summary_handles_nodes_without_optional_text(self) -> None:
+        node = MemoryNode(
+            type="Function",
+            label="test_null_text",
+            text=None,
+            properties={"relative_path": "tests/test_null_text.py"},
+        )
+
+        self.assertTrue(_node_matches_terms(node, ["null_text"]))
 
     def test_compile_records_content_addressed_revision_chain_and_file_changes(self) -> None:
         first = self.graph.compile_project(self.root)
