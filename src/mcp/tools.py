@@ -12,8 +12,8 @@ from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from memory.config import ConfigError, REQLConfig, load_effective_config
-from memory.domain.models import MemoryQuery
+from memory.config import ConfigError, REQLConfig, load_effective_config, resolve_config_path
+from memory.artifacts.options import CompilationOptions
 from memory.domain.query_context import (
     DEFAULT_MAX_DEPTH as DEFAULT_CONTEXT_MAX_DEPTH,
     DEFAULT_MAX_ITEMS as DEFAULT_CONTEXT_MAX_ITEMS,
@@ -336,8 +336,9 @@ def reql_compile_project(
             max_file_size_bytes=config.scan.max_file_size_bytes,
             include_patterns=config.scan.include,
             exclude_patterns=config.scan.exclude,
+            config_path=resolve_config_path(config_path, start_dir=path),
             cache_enabled=config.cache.enabled if cache_enabled is None else bool(cache_enabled),
-            parsing_options=_parsing_options(config),
+            parsing_options=CompilationOptions.from_config(config),
         )
         run = result.run
         return {
@@ -386,8 +387,9 @@ def reql_watch_project(
                 max_file_size_bytes=config.scan.max_file_size_bytes,
                 include_patterns=config.scan.include,
                 exclude_patterns=config.scan.exclude,
+                config_path=resolve_config_path(config_path, start_dir=path),
                 cache_enabled=config.cache.enabled if cache_enabled is None else bool(cache_enabled),
-                parsing_options=_parsing_options(config),
+                parsing_options=CompilationOptions.from_config(config),
                 interval_seconds=interval,
                 debounce_seconds=debounce,
                 max_iterations=iterations,
@@ -681,16 +683,6 @@ def call_tool(name: str, arguments: dict[str, Any] | None = None) -> dict[str, A
         raise MCPToolError(f"Invalid arguments for {name}: {exc}") from exc
     except SecurityError as exc:
         raise MCPToolError(str(exc)) from exc
-
-
-def _parsing_options(config: REQLConfig) -> dict[str, object]:
-    return {
-        "compile": config.compile.to_dict(),
-        "scan": {
-            "use_gitignore": config.scan.use_gitignore,
-            "ignore_defaults": config.scan.ignore_defaults,
-        },
-    }
 
 
 def _load_tool_config(

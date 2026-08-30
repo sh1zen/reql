@@ -15,6 +15,8 @@ reql cache status .
 reql project history . --limit 5
 reql project diff .
 reql project explain . --focus "payment workflow"
+reql project pipeline .
+reql project pipeline . --code --out docs/architecture
 
 # Retrieve context
 reql query_context --query "payment service"
@@ -82,6 +84,42 @@ graph facts and does not create capability nodes or require model calls. Use
 `--json` for the versioned structured payload or omit it for Markdown. Focus
 ranks workflow candidates but does not create triggers. If the project is
 missing, run `reql project compile .` first.
+
+## Project Pipeline Export
+
+```bash
+reql project pipeline .
+reql project pipeline . --html
+reql project pipeline . --code
+reql project pipeline . --html --out reports/pipeline.html
+reql project pipeline . --code --out reports/
+```
+
+`project pipeline` reads an already compiled project and writes a deterministic
+high-level flow view. It admits explicit routes, handlers, commands, public API
+boundaries, and conventional process entrypoints; if none exist, public roots
+of the call graph are marked as inferred triggers. Calls, route handling,
+instantiation, wrappers, resolved imports, writes, returns, emissions, and
+raises provide the evidence. Test-local symbols are excluded, while private
+symbols needed to connect an observed flow remain available in component
+details.
+
+The default format is interactive HTML and the default destination is
+`pipeline.html` in the registered project root. `--code` selects Mermaid and
+writes `pipeline.mmd`; `--html` is the explicit HTML selector and cannot be
+combined with `--code`. An `--out` directory receives the default filename, or
+you may pass a matching `.html`/`.htm` or `.mmd`/`.mermaid` file. Relative
+explicit output paths are resolved from the current directory. Existing files
+are replaced atomically and the command prints only the absolute output path.
+
+The HTML view embeds the projection data and uses the same pinned
+`vis-network` CDN runtime as the generic graph export. It supports pan/zoom,
+fit/reset, search, workflow and architectural-layer filters, and source-symbol
+inspection. Mermaid output is a `flowchart LR` with shared components, observed
+outcomes, source-location comments, and dashed feedback edges. Runtime-only or
+dynamic paths are never invented; an observed terminal means only that static
+evidence ends there. The command does not compile missing projects or open a
+browser automatically.
 
 ## Entry Points
 
@@ -447,6 +485,8 @@ reql storage inspect --json
 reql storage locks
 reql storage locks --recover-stale
 reql storage compact
+reql storage clear [PATH]
+reql storage clear [PATH] --json
 reql export --out graph.json
 reql export --json --out reql-json
 reql export --html --out graph.html
@@ -458,11 +498,22 @@ counts, compression ratio, dense-node count, manifest fields, WAL status, and
 logical index sizes. `storage compact` rewrites the current logical graph into a
 new compact storage generation.
 
+`storage clear [PATH]` performs a clean build of the current project in a
+temporary store, then atomically replaces the selected `memory.reql` only after
+compilation succeeds. It regenerates `artifact-cache.json` and discards graph
+history, archived/deleted records, the old WAL, and the query-usage journal. A
+failed clean build preserves both the existing store and cache. `PATH` defaults
+to the current directory and controls the default
+`<PATH>/.reql/memory.reql`; an explicit `--storage` path is replaced in full, so
+do not target a store shared by unrelated projects.
+
 `export --html` writes a standalone browser view of the graph. If `--out`
 points to a directory or to a path without an `.html` suffix, the command writes
 `graph.html` inside that path. Add `--json` to also write `graph.json` next to
-the HTML file. Use `export --json` without `--html` to write JSON graph data to
-disk instead of stdout.
+the HTML file. The browser view starts from detected entry points and expands
+or collapses one connected depth per node click; test-local nodes are omitted
+from this visual projection. Use `export --json` without `--html` to write the
+complete JSON graph data to disk instead of stdout.
 
 ## Assistant Installs
 
@@ -559,7 +610,7 @@ reql --set scan.max_file_size_mb=2 --set cache.enabled=false project compile .
 reql project compile . --watch
 ```
 
-`reql.conf` can configure scan limits, include/exclude globs, cache behavior,
+`reql.conf` can configure scan limits, include globs, strict scoped exclusions, cache behavior,
 compile document ingestion, graph analysis toggles, and the default report
 output directory. Set `scan.use_gitignore: true` to apply the project root
 `.gitignore` together with the joined `scan.exclude` rules.
@@ -605,12 +656,13 @@ ranges, or scores.
 ```bash
 reql project compile .
 reql project compile . --max-file-size-mb 5
-reql project exclude ".tmp/" "generated/*.json"
-reql project exclude "vendor/" --path PATH
+reql project exclude .tmp/ generated/*.json
+reql project exclude vendor/ --path PATH
 reql project status . --json
 reql project history . --limit 10
 reql project diff .
 reql project report . --output reports/
+reql project pipeline .
 ```
 
 `project compile` scans read-only first, registers files as graph artifacts,
@@ -647,14 +699,21 @@ observation nodes, `MENTIONS`, `EVIDENCED_BY`, `DERIVED_FROM`, and
 code symbols when a fragment explicitly names a symbol. This path runs inside
 `project compile` and does not require model, agent, or coding-agent calls.
 
+Nested subdirectories may define their own `reql.conf`; during a parent scan,
+their `scan.exclude` rules apply only to that subdirectory tree.
+
 `project exclude PATTERN [PATTERN ...]` creates or updates the selected
 project's `reql.conf` and appends patterns to `scan.exclude`. Use it only for
 explicit exclusions or obvious dependency/cache/build-output directories. It
 defaults to the current working directory, accepts `--path PATH` when the
 runtime project path is elsewhere, preserves existing config values, and skips
-rules that are already present. Pass all patterns in one command, do not use
-workspace-wide patterns such as `*`, `**`, or `**/*`, and do not exclude
-source/framework roots needed for the task.
+rules that are already present. Generated YAML uses unquoted plain values when
+they are unambiguous. `./` is significant: it anchors a rule to that config's
+directory; without it, the rule matches at every depth. A trailing `/` is only
+presentation and does not affect duplicate detection. The only wildcard form
+is `*suffix` in the final segment (`*.json`, `generated/*.json`, or their
+`./`-anchored equivalents). Unsupported glob forms, absolute paths, `..`, empty
+segments, and backslashes are rejected.
 
 `project report` writes `GRAPH_REPORT.md`, `GRAPH_DELTAS.md`, and
 `CACHE_REPORT.md` to the selected output directory. The reports summarize
@@ -723,6 +782,10 @@ Every compile invocation persists a `CompilationRun` node and a compilation
 `cache clear` archives cache metadata in the project `.reql` directory and the
 graph cache entries for the project path. It does not delete or archive graph
 data, artifacts, or fragments.
+
+Use `storage clear [PATH]` when the desired result is instead equivalent to
+deleting the project-local REQL store and compiling the current checkout from
+scratch.
 
 ## Graph analysis
 

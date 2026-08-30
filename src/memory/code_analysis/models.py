@@ -111,14 +111,23 @@ class CodeParseResult:
     imports: list[CodeImport]
     calls: list[CodeCall]
     references: list[CodeReference]
-    classes: list[CodeSymbol]
-    functions: list[CodeSymbol]
-    methods: list[CodeSymbol]
     comments: list[CodeText]
     docstrings: list[CodeText]
     errors: list[str]
     parser_name: str
     parser_version: str
+
+    @property
+    def classes(self) -> list[CodeSymbol]:
+        return [symbol for symbol in self.symbols if symbol.kind == "class"]
+
+    @property
+    def functions(self) -> list[CodeSymbol]:
+        return [symbol for symbol in self.symbols if symbol.kind in {"function", "async_function"}]
+
+    @property
+    def methods(self) -> list[CodeSymbol]:
+        return [symbol for symbol in self.symbols if symbol.kind in {"method", "async_method"}]
 
     def to_dict(self) -> dict[str, Any]:
         return {

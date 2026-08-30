@@ -1,7 +1,23 @@
 """Structured dictionary projections used by JSON-facing retrieval APIs."""
 from __future__ import annotations
 
-from ...common import *
+from collections import OrderedDict
+from pathlib import Path
+import re
+from typing import Any, Sequence
+
+from .....domain.constants import INACTIVE_STATUSES
+from .....domain.models import MemoryEdge, MemoryNode, MemoryQuery, MemorySubgraph, RankedNode
+from ...common import (
+    CALLER_EDGE_TYPES,
+    OWNER_EDGE_TYPES,
+    PUBLIC_SURFACE_EDGE_TYPES,
+    QUERY_EXPLORE_ALL_VIEWS,
+    QUERY_EXPLORE_DEFAULT_VIEWS,
+    QUERY_EXPLORE_VIEWS,
+    SERIALIZATION_EDGE_TYPES,
+    SOURCE_NODE_TYPES,
+)
 
 
 class JsonContextRendererMixin:

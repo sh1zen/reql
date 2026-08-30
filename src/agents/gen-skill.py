@@ -241,10 +241,10 @@ Do not add exclusions before the first bootstrap compile unless the user asked f
 Use one command with all patterns:
 
 ```bash
-{command_name} project exclude "path/or/glob" "another/path/"
+{command_name} project exclude "path/or/*.suffix" "another/path/"
 ```
 
-Never use workspace-wide patterns such as `*`, `**`, or `**/*`. Never exclude source/framework roots needed for the task just to make indexing smaller.
+Use `./` only for rules anchored to the config directory; omit it to match at any depth. The only wildcard form is `*suffix` in the final segment. Never use workspace-wide patterns such as `*`, `**`, or `**/*`. Never exclude source/framework roots needed for the task just to make indexing smaller.
 
 ## Configuration
 

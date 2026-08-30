@@ -15,6 +15,7 @@ from memory.domain.query_context import (
 from memory.storage import BlockGraphStore
 from memory.query import QueryResult, REQLError, REQLEvaluationError, REQLSyntaxError
 from memory.services.project_watch import ProjectWatchEvent
+from memory.pipeline import ProjectPipeline
 
 from .memory_graph import MemoryGraph
 
@@ -32,6 +33,7 @@ __all__ = [
     "QueryMode",
     "RetrievalBudget",
     "ProjectWatchEvent",
+    "ProjectPipeline",
     "BlockGraphStore",
     "QueryResult",
     "REQLError",

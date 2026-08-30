@@ -7,12 +7,11 @@ from unittest.mock import patch
 
 from api import MemoryGraph
 from memory.artifacts.models import SourceArtifact
+from memory.artifacts.structural_links import refresh_project_structural_links
 from memory.code_analysis import TreeSitterCodeParser
 from memory.code_analysis.languages.generic import GenericProfileTreeSitterExtractor
-from tests.config_helpers import open_graph_with_documents as _open_graph_with_documents
 from memory.code_analysis.factory import EXTRACTOR_BY_LANGUAGE
 from memory.code_analysis.catalog import CODE_LANGUAGE_CATALOG, load_tree_sitter_language
-from memory.artifacts.fingerprint import project_id
 
 
 class CodeGraphCompilationTests(unittest.TestCase):
@@ -284,6 +283,13 @@ class CodeGraphCompilationTests(unittest.TestCase):
                     top_k=10,
                 )["payload"]
                 self.assertIn("pkg/__init__.py", {row["path"] for row in initializer_context["working_set"]})
+
+                unchanged_links = refresh_project_structural_links(graph.store, result.scan.project.id)
+                self.assertFalse(unchanged_links.added_nodes)
+                self.assertFalse(unchanged_links.updated_nodes)
+                self.assertFalse(unchanged_links.added_edges)
+                self.assertFalse(unchanged_links.updated_edges)
+                self.assertFalse(unchanged_links.archived_edges)
 
                 (package / "__init__.py").write_text("# no public exports\n", encoding="utf-8")
                 (package / "derived.py").write_text(

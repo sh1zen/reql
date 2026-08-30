@@ -224,7 +224,7 @@ def _handle_request(
             request_id,
             {
                 "protocolVersion": PROTOCOL_VERSION,
-                "serverInfo": {"name": SERVER_NAME, "version": "0.1.0"},
+                "serverInfo": {"name": SERVER_NAME, "version": "0.1.2"},
                 "capabilities": {"tools": {"listChanged": False}},
             },
         )

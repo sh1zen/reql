@@ -33,7 +33,14 @@ from ...domain.constants import ACTIVE_STATUSES
 from ...domain.exceptions import StorageError
 from ...domain.models import MemoryEdge, MemoryNode, copy_memory_payload
 from ...domain.timeutils import utcnow_iso
-from ...extraction.normalization import keyword_scores, token_signal_score, tokenize
+from ...extraction.normalization import (
+    expanded_tokens,
+    identifier_expanded_text,
+    keyword_scores,
+    token_signal_score,
+    tokenize,
+    token_variants,
+)
 
 SCHEMA_VERSION = 2
 DEFAULT_BLOCK_SIZE = 64 * 1024
@@ -390,6 +397,21 @@ def inspect_store_locks(target_path: str | Path, *, recover_stale: bool = False)
         "snapshot_available": snapshot_available,
         "snapshot_hint": f'reql --storage "{target}" --snapshot <read-command>' if snapshot_available else None,
     }
+
+
+@contextmanager
+def exclusive_store_lock(
+    target_path: str | Path,
+    *,
+    timeout_seconds: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
+) -> Iterator[None]:
+    """Hold the store writer lock without opening or rewriting the graph."""
+    lock = _StoreReadWriteLock(Path(target_path), timeout_seconds=timeout_seconds)
+    lock.acquire_write()
+    try:
+        yield
+    finally:
+        lock.release()
 
 
 class _StoreLock:
@@ -980,6 +1002,7 @@ class BlockGraphStore:
         self._lexical_index_loaded = True
         self._lexical_index_location: _Location | None = None
         self._deferred_lexical_changes: dict[str, tuple[MemoryNode | None, MemoryNode | None]] = {}
+        self._last_lexical_finalize_ms = 0.0
         self._node_type_index: dict[tuple[str], set[str]] = defaultdict(set)
         self._node_status_index: dict[tuple[str], set[str]] = defaultdict(set)
         self._edge_type_index: dict[tuple[str], set[str]] = defaultdict(set)
@@ -1013,6 +1036,11 @@ class BlockGraphStore:
                 self._rebuild_indexes()
             elif create and not self.read_only:
                 self.initialize()
+                if self.defer_lexical_index:
+                    self._lexical_index_loaded = False
+                    self._node_terms = defaultdict(dict)
+                    self._node_term_index = {}
+                    self._node_lexical_fingerprints = {}
             self._load_usage_journal()
         except Exception:
             self._release_lock()
@@ -1132,6 +1160,7 @@ class BlockGraphStore:
                 "threshold": int(wal_bytes_threshold),
                 "base_missing": base_missing,
                 "pending_wal_records": pending,
+                "lexical_finalize_ms": 0.0,
             }
         before_generation = self._generation_id
         self._flush(force=True)
@@ -1146,6 +1175,7 @@ class BlockGraphStore:
             "generation_id_before": before_generation,
             "generation_id_after": self._generation_id,
             "pending_wal_records": pending,
+            "lexical_finalize_ms": self._last_lexical_finalize_ms,
         }
 
     def inspect_storage(self) -> dict[str, Any]:
@@ -1976,8 +2006,12 @@ class BlockGraphStore:
         if not force and not self._dirty:
             return
         self._materialize_all_records()
+        lexical_started = time.perf_counter()
         if not self._lexical_index_loaded:
             self._ensure_lexical_index_loaded()
+            self._last_lexical_finalize_ms = round((time.perf_counter() - lexical_started) * 1000.0, 3)
+        else:
+            self._last_lexical_finalize_ms = 0.0
         self._meta.update(
             {
                 "schema_version": SCHEMA_VERSION,
@@ -2437,14 +2471,15 @@ class BlockGraphStore:
         node_id = (old or new).id if old is not None or new is not None else ""
         if not node_id:
             return
-        original = self._deferred_lexical_changes.get(node_id, (old, None))[0]
+        existing = self._deferred_lexical_changes.get(node_id)
+        original = existing[0] if existing is not None else (self._clone_node(old) if old is not None else None)
         if original is None and new is None:
             self._deferred_lexical_changes.pop(node_id, None)
             return
-        self._deferred_lexical_changes[node_id] = (
-            self._clone_node(original) if original is not None else None,
-            self._clone_node(new) if new is not None else None,
-        )
+        # ``new`` is already store-owned because every upsert clones its input.
+        # Retaining the latest store value avoids copying large payloads for
+        # repeated updates to the same node inside one compilation transaction.
+        self._deferred_lexical_changes[node_id] = (original, new)
 
     def _remove_node_structural_indexes(self, node: MemoryNode) -> None:
         if node.canonical_key:
@@ -2621,6 +2656,19 @@ class BlockGraphStore:
         select = heapq.nlargest if descending else heapq.nsmallest
         selected = select(limit, nodes, key=lambda item: getattr(item, order_by))
         return [self._clone_node(node) for node in selected] if clone else selected
+
+    def find_nodes_by_types(self, node_types: Sequence[str], *, clone: bool = True) -> list[MemoryNode]:
+        """Load a deterministic union of indexed node types in one pass."""
+        candidate_ids: set[str] = set()
+        for node_type in set(node_types):
+            candidate_ids.update(self._node_type_index.get((node_type,), set()))
+        nodes = [
+            node
+            for node_id in candidate_ids
+            if (node := self._load_node_from_location(node_id)) is not None
+        ]
+        nodes.sort(key=lambda node: (node.created_at, node.id))
+        return [self._clone_node(node) for node in nodes] if clone else nodes
 
     def find_nodes_by_property(
         self,
@@ -3012,20 +3060,46 @@ class BlockGraphStore:
         top_k: int | None = 20,
         node_types: set[str] | None = None,
         include_archived: bool = False,
+        clone: bool = True,
     ) -> list[tuple[MemoryNode, float]]:
         self._ensure_lexical_index_loaded()
-        tokens = tokenize(text)
-        if not tokens:
+        if top_k is not None and top_k <= 0:
+            return []
+        raw_tokens = tokenize(text)
+        tokens = list(expanded_tokens(text))
+        if not raw_tokens or not tokens:
             return []
         unique_terms = set(tokens)
         query_terms: dict[str, float] = {term: 1.0 for term in unique_terms}
-        for a, b in zip(tokens, tokens[1:]):
+        expanded_query_tokens = [
+            variant
+            for token in tokenize(identifier_expanded_text(text))
+            for variant in token_variants(token)
+        ]
+        phrase_tokens = list(dict.fromkeys(expanded_query_tokens or tokens))
+        for a, b in zip(phrase_tokens, phrase_tokens[1:]):
             if token_signal_score(a) >= 0.5 and token_signal_score(b) >= 0.5:
                 query_terms[f"{a} {b}"] = 1.35
+        compound_terms = {
+            token
+            for token in raw_tokens
+            if len(tokenize(identifier_expanded_text(token))) > 1
+        }
         raw_by_node: dict[str, float] = defaultdict(float)
         matched_terms: dict[str, int] = defaultdict(int)
+        matched_compound_ids: set[str] = set()
         node_count = max(1, len(self._nodes) + len(self._node_locations))
         max_idf = math.log1p(node_count)
+        eligible_ids: set[str] | None = None
+        if node_types:
+            eligible_ids = set()
+            for node_type in node_types:
+                eligible_ids.update(self._node_type_index.get((node_type,), set()))
+        if not include_archived:
+            active_ids: set[str] = set()
+            for status in ACTIVE_STATUSES:
+                active_ids.update(self._node_status_index.get((status,), set()))
+            eligible_ids = active_ids if eligible_ids is None else eligible_ids & active_ids
         for term, query_weight in query_terms.items():
             postings = self._node_terms.get(term, {})
             if not postings:
@@ -3033,10 +3107,37 @@ class BlockGraphStore:
             inverse_frequency = math.log1p(node_count / max(1, len(postings))) / max_idf
             term_weight = 0.20 + 0.80 * min(1.0, inverse_frequency)
             for node_id, weight in postings.items():
+                if eligible_ids is not None and node_id not in eligible_ids:
+                    continue
                 raw_by_node[node_id] += weight * term_weight * query_weight
                 matched_terms[node_id] += 1
+                if term in compound_terms:
+                    matched_compound_ids.add(node_id)
+
+        if compound_terms and len(phrase_tokens) >= 2:
+            minimum_components = max(2, math.ceil(len(set(phrase_tokens)) * 0.75))
+            component_terms = set(phrase_tokens)
+            weak_ids = {
+                node_id
+                for node_id in raw_by_node
+                if node_id not in matched_compound_ids
+                and sum(node_id in self._node_terms.get(term, {}) for term in component_terms) < minimum_components
+            }
+            for node_id in weak_ids:
+                raw_by_node.pop(node_id, None)
+                matched_terms.pop(node_id, None)
+        def lexical_score(node_id: str) -> float:
+            raw_score = raw_by_node[node_id]
+            normalized = min(1.0, math.log1p(raw_score) / math.log1p(len(unique_terms) + 2))
+            return min(1.0, 0.85 * normalized + 0.02 * matched_terms[node_id])
+
+        candidate_ids: Iterable[str] = raw_by_node
+        if top_k is not None:
+            candidate_limit = max(top_k * 4, top_k + 24)
+            candidate_ids = heapq.nlargest(candidate_limit, raw_by_node, key=lexical_score)
+
         scored: list[tuple[MemoryNode, float]] = []
-        for node_id, raw_score in raw_by_node.items():
+        for node_id in candidate_ids:
             node = self._load_node_from_location(node_id)
             if node is None:
                 continue
@@ -3044,11 +3145,11 @@ class BlockGraphStore:
                 continue
             if not include_archived and node.status not in ACTIVE_STATUSES:
                 continue
-            normalized = min(1.0, math.log1p(raw_score) / math.log1p(len(unique_terms) + 2))
-            score = min(1.0, 0.85 * normalized + 0.15 * node.salience + 0.02 * matched_terms[node_id])
-            scored.append((self._clone_node(node), score))
+            score = min(1.0, lexical_score(node_id) + 0.15 * node.salience)
+            scored.append((node, score))
         scored.sort(key=lambda item: item[1], reverse=True)
-        return scored if top_k is None else scored[:max(0, top_k)]
+        selected = scored if top_k is None else scored[:top_k]
+        return [(self._clone_node(node) if clone else node, score) for node, score in selected]
 
     def degree(self, node_id: str, *, edge_types: set[str] | None = None) -> int:
         count = 0

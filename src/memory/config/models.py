@@ -4,6 +4,25 @@ from __future__ import annotations
 from dataclasses import dataclass, fields
 from typing import Any, Mapping, get_args, get_origin, get_type_hints
 
+from .path_rules import normalize_scan_exclude_pattern, resolve_scan_exclude_pattern
+
+
+def normalize_scan_path_pattern(pattern: str) -> str:
+    """Return the legacy canonical matching key for a scan include pattern.
+
+    Exclusions use :func:`resolve_scan_exclude_pattern` so their ``./`` anchor
+    remains significant.
+    """
+
+    normalized = pattern.strip().replace("\\", "/")
+    previous = None
+    while normalized != previous:
+        previous = normalized
+        normalized = normalized.lstrip("/")
+        if normalized.startswith("./"):
+            normalized = normalized[2:]
+    return normalized.rstrip("/")
+
 
 @dataclass(frozen=True, slots=True)
 class ProjectConfig:
@@ -163,11 +182,12 @@ def merge_config(config: REQLConfig, overrides: Mapping[str, Any]) -> REQLConfig
                 merged_mapping.update(_coerce_document_formats(value))
                 current[section][option] = merged_mapping
             elif isinstance(current_value, list) and isinstance(value, list):
-                current[section][option] = (
-                    list(value)
-                    if section == "scan" and option in {"include", "exclude"} and scan_ignore_defaults
-                    else _join_config_lists(current_value, value)
-                )
+                if section == "scan" and option in {"include", "exclude"} and scan_ignore_defaults:
+                    current[section][option] = list(value)
+                elif section == "scan" and option == "exclude":
+                    current[section][option] = _join_scan_exclude_lists(current_value, value)
+                else:
+                    current[section][option] = _join_config_lists(current_value, value)
             else:
                 current[section][option] = value
     return config_from_mapping(current)
@@ -178,6 +198,17 @@ def _join_config_lists(current: list[Any], additions: list[Any]) -> list[Any]:
     for item in additions:
         if item not in joined:
             joined.append(item)
+    return joined
+
+
+def _join_scan_exclude_lists(current: list[Any], additions: list[Any]) -> list[Any]:
+    joined: list[Any] = []
+    seen: set[str] = set()
+    for item in [*current, *additions]:
+        key = normalize_scan_exclude_pattern(item)
+        if key not in seen:
+            joined.append(item)
+            seen.add(key)
     return joined
 
 
@@ -316,6 +347,8 @@ def _validate(config: REQLConfig) -> None:
         raise ValueError("Config option project.id must not be empty")
     if config.scan.max_file_size_mb <= 0:
         raise ValueError("Config option scan.max_file_size_mb must be greater than zero")
+    for pattern in config.scan.exclude:
+        resolve_scan_exclude_pattern(pattern)
     if config.cache.fingerprint_strategy != "sha256":
         raise ValueError("Only cache.fingerprint_strategy = \"sha256\" is currently supported")
     unknown_document_formats = set(config.compile.documents) - set(config.compile.document_formats)

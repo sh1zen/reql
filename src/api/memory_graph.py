@@ -32,13 +32,14 @@ from memory.analysis.communities import CommunityResult
 from memory.analysis.hubs import HubReport
 from memory.artifacts.project import ProjectRegistry
 from memory.artifacts.revision import ProjectRevision, RevisionRepository
-from memory.artifacts.compiler import ArtifactCompiler
 from memory.artifacts.fingerprint import normalize_relative_lookup_path
+from memory.artifacts.options import CompilationOptions, RawCompilationOptions
 from memory.services.incremental_compilation import CompileProjectResult, IncrementalCompilationService
 from memory.services.project_watch import ProjectWatchEvent, ProjectWatchService
 from memory.services.query_context import QueryContextService
 from memory.services.retrieval import RetrievalEngine
 from memory.explanation import RepositoryExplanation, RepositoryExplanationService
+from memory.pipeline import ProjectPipeline, ProjectPipelineService
 
 
 MemoryGraphT = TypeVar("MemoryGraphT", bound="MemoryGraph")
@@ -77,16 +78,17 @@ class MemoryGraph:
         self.profile_logger = profile_logger
         self.extractor = extractor or DeterministicExtractor()
         self.activation = ActivationEngine(store)
-        self.retrieval = RetrievalEngine(store, extractor or DeterministicExtractor(), profile_logger=profile_logger)
+        self.retrieval = RetrievalEngine(store, self.extractor, profile_logger=profile_logger)
         self.query_context_service = QueryContextService(self.retrieval)
         self.salience = SalienceEngine(store)
         self.project_reporter = ProjectReportGenerator(store)
         self.projects = ProjectRegistry(store)
         self.revisions = RevisionRepository(store)
         self.repository_explainer = RepositoryExplanationService(store)
+        self.project_pipeline_service = ProjectPipelineService(store)
         self.incremental = IncrementalCompilationService(
             store,
-            compiler=ArtifactCompiler(),
+            compile_options=CompilationOptions.from_config(self.config),
             profile_logger=profile_logger,
         )
         self.project_watcher = ProjectWatchService(self.incremental)
@@ -410,6 +412,17 @@ class MemoryGraph:
             max_workflows=max_workflows,
         )
 
+    def project_pipeline(self, path: str | Path) -> ProjectPipeline:
+        """Return a deterministic high-level flow projection for a project."""
+
+        status = self.projects.project_status(path)
+        if status is None:
+            raise ValueError(f"Project not found: {path}")
+        project = self.store.get_node(str(status["project"]["id"]), clone=False)
+        if project is None:
+            raise ValueError(f"Project not found: {path}")
+        return self.project_pipeline_service.build(project)
+
     def project_history(self, path: str | Path, *, limit: int = 20) -> list[ProjectRevision]:
         """Return newest-first immutable revisions for a registered project."""
         status = self.projects.project_status(path)
@@ -430,17 +443,17 @@ class MemoryGraph:
         max_file_size_bytes: int = 10 * 1024 * 1024,
         include_patterns: list[str] | None = None,
         exclude_patterns: list[str] | None = None,
+        config_path: str | Path | None = None,
         cache_enabled: bool = True,
-        parsing_options: dict[str, object] | None = None,
+        parsing_options: RawCompilationOptions = None,
     ) -> CompileProjectResult:
-        if parsing_options is None:
-            parsing_options = self._compile_parsing_options()
         return self.incremental.compile_path(
             path,
 
             max_file_size_bytes=max_file_size_bytes,
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
+            config_path=config_path,
             cache_enabled=cache_enabled,
             parsing_options=parsing_options,
         )
@@ -453,8 +466,9 @@ class MemoryGraph:
         max_file_size_bytes: int = 10 * 1024 * 1024,
         include_patterns: list[str] | None = None,
         exclude_patterns: list[str] | None = None,
+        config_path: str | Path | None = None,
         cache_enabled: bool = True,
-        parsing_options: dict[str, object] | None = None,
+        parsing_options: RawCompilationOptions = None,
     ) -> CompileProjectResult:
         """Incrementally update a project through the compile pipeline."""
         return self.compile_project(
@@ -463,6 +477,7 @@ class MemoryGraph:
             max_file_size_bytes=max_file_size_bytes,
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
+            config_path=config_path,
             cache_enabled=cache_enabled,
             parsing_options=parsing_options,
         )
@@ -475,21 +490,21 @@ class MemoryGraph:
         max_file_size_bytes: int = 10 * 1024 * 1024,
         include_patterns: list[str] | None = None,
         exclude_patterns: list[str] | None = None,
+        config_path: str | Path | None = None,
         cache_enabled: bool = True,
-        parsing_options: dict[str, object] | None = None,
+        parsing_options: RawCompilationOptions = None,
         interval_seconds: float = 0.5,
         debounce_seconds: float = 0.1,
         max_iterations: int | None = None,
     ) -> Iterator[ProjectWatchEvent]:
         """Yield project watch events and compile dirty files automatically."""
-        if parsing_options is None:
-            parsing_options = self._compile_parsing_options()
         return self.project_watcher.watch_path(
             path,
 
             max_file_size_bytes=max_file_size_bytes,
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
+            config_path=config_path,
             cache_enabled=cache_enabled,
             parsing_options=parsing_options,
             interval_seconds=interval_seconds,
@@ -505,18 +520,18 @@ class MemoryGraph:
         max_file_size_bytes: int = 10 * 1024 * 1024,
         include_patterns: list[str] | None = None,
         exclude_patterns: list[str] | None = None,
+        config_path: str | Path | None = None,
         cache_enabled: bool = True,
-        parsing_options: dict[str, object] | None = None,
+        parsing_options: RawCompilationOptions = None,
     ) -> ProjectWatchEvent:
         """Poll once and compile dirty project artifacts when needed."""
-        if parsing_options is None:
-            parsing_options = self._compile_parsing_options()
         return self.project_watcher.poll_once(
             path,
 
             max_file_size_bytes=max_file_size_bytes,
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
+            config_path=config_path,
             cache_enabled=cache_enabled,
             parsing_options=parsing_options,
         )
@@ -529,17 +544,17 @@ class MemoryGraph:
         max_file_size_bytes: int = 10 * 1024 * 1024,
         include_patterns: list[str] | None = None,
         exclude_patterns: list[str] | None = None,
+        config_path: str | Path | None = None,
         cache_enabled: bool = True,
-        parsing_options: dict[str, object] | None = None,
+        parsing_options: RawCompilationOptions = None,
     ) -> dict[str, object]:
-        if parsing_options is None:
-            parsing_options = self._compile_parsing_options()
         return self.incremental.cache_status(
             path,
 
             max_file_size_bytes=max_file_size_bytes,
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
+            config_path=config_path,
             cache_enabled=cache_enabled,
             parsing_options=parsing_options,
         )
@@ -750,14 +765,5 @@ class MemoryGraph:
             "line_end": line_end,
             "section": section,
             "artifact_id": artifact_id,
-        }
-
-    def _compile_parsing_options(self) -> dict[str, object]:
-        return {
-            "compile": self.config.compile.to_dict(),
-            "scan": {
-                "use_gitignore": self.config.scan.use_gitignore,
-                "ignore_defaults": self.config.scan.ignore_defaults,
-            },
         }
 

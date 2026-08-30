@@ -16,6 +16,7 @@ from .loader import (
     parse_config_override_assignment,
     parse_config_override_assignments,
     parse_config_overrides,
+    resolve_config_path,
     write_sample_config,
 )
 from .models import (
@@ -29,7 +30,9 @@ from .models import (
     ScanConfig,
     config_from_mapping,
     merge_config,
+    normalize_scan_path_pattern,
 )
+from .path_rules import ScanExcludeRule, normalize_scan_exclude_pattern, resolve_scan_exclude_pattern
 
 __all__ = [
     "AnalysisConfig",
@@ -46,6 +49,7 @@ __all__ = [
     "REQLConfig",
     "ReportingConfig",
     "ScanConfig",
+    "ScanExcludeRule",
     "canonical_config_path",
     "config_from_mapping",
     "default_config",
@@ -55,8 +59,12 @@ __all__ = [
     "load_project_config_data",
     "merge_config",
     "merge_overrides",
+    "normalize_scan_path_pattern",
+    "normalize_scan_exclude_pattern",
     "parse_config_override_assignment",
     "parse_config_override_assignments",
     "parse_config_overrides",
+    "resolve_scan_exclude_pattern",
+    "resolve_config_path",
     "write_sample_config",
 ]

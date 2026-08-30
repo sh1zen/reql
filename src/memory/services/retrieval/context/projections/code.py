@@ -1,7 +1,26 @@
 """Code-context working set, source-span, and change-plan projection."""
 from __future__ import annotations
 
-from ...common import *
+from collections import OrderedDict
+from pathlib import Path
+from typing import Any, Sequence
+
+from .....domain.models import MemoryNode, MemoryQuery, MemorySubgraph, RankedNode
+from .....extraction.normalization import canonicalize, tokenize
+from ...common import (
+    CALLER_EDGE_TYPES,
+    CODE_CONTEXT_EDGE_TYPES,
+    CODE_CONTEXT_NODE_TYPES,
+    PUBLIC_SURFACE_EDGE_TYPES,
+    QUERY_CONTEXT_MAX_RENDERED_FILES,
+    QUERY_CONTEXT_MODES,
+    QUERY_CONTEXT_SCOPES,
+    SOURCE_EDGE_TYPES,
+    SOURCE_NODE_TYPES,
+    TECHNICAL_NODE_TYPES,
+    _code_context_query_tokens,
+    _expanded_tokens,
+)
 
 
 class CodeContextProjectionMixin:
@@ -735,7 +754,7 @@ class CodeContextProjectionMixin:
             if not self._source_fragment_is_strong_query_match(node, query_text):
                 continue
             metrics = self._node_match_metrics(node, self._query_profile(query_text))
-            matches.append((metrics["match_score"], node))
+            matches.append((metrics.match_score, node))
         matches.sort(key=lambda item: (item[0], item[1].salience, self._location_summary(item[1]) or ""), reverse=True)
         return [node for _, node in matches[: min(max_items, 5)]]
 
@@ -772,7 +791,7 @@ class CodeContextProjectionMixin:
             return False
         profile = self._query_profile(query_text)
         metrics = self._node_match_metrics(node, profile)
-        if metrics["match_score"] >= 0.50:
+        if metrics.match_score >= 0.50:
             return True
         fragment_key = canonicalize(text)
         if not fragment_key:

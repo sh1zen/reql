@@ -82,7 +82,48 @@ def render_graph_html(payload: dict[str, Any]) -> str:
     #node-menu::-webkit-scrollbar-corner {
       background: #111122;
     }
-    #graph { flex: 1; min-width: 0; background: #0f0f1a; }
+    #graph-shell { position: relative; flex: 1; min-width: 0; background: #0f0f1a; overflow: hidden; }
+    #graph { width: 100%; height: 100%; background: #0f0f1a; }
+    #graph-toolbar {
+      position: absolute;
+      z-index: 10;
+      top: 12px;
+      left: 12px;
+      right: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      pointer-events: none;
+    }
+    #graph-hint {
+      max-width: min(620px, calc(100% - 180px));
+      padding: 8px 11px;
+      border: 1px solid #323252;
+      border-radius: 999px;
+      background: rgba(18, 18, 34, 0.9);
+      color: #b9c0d8;
+      box-shadow: 0 8px 24px rgba(0, 0, 0, 0.24);
+      font-size: 12px;
+      line-height: 1.25;
+      backdrop-filter: blur(8px);
+    }
+    #graph-actions { display: flex; gap: 7px; margin-left: auto; pointer-events: auto; }
+    .graph-button,
+    .node-toggle-button {
+      border: 1px solid #3a3a5e;
+      border-radius: 6px;
+      background: rgba(26, 26, 46, 0.94);
+      color: #e6eaff;
+      padding: 7px 10px;
+      font: inherit;
+      font-size: 12px;
+      cursor: pointer;
+    }
+    .graph-button:hover,
+    .graph-button:focus,
+    .node-toggle-button:hover,
+    .node-toggle-button:focus { border-color: #6d9ed0; background: #252542; outline: none; }
+    .node-toggle-button { width: 100%; margin: 4px 0 2px; font-weight: 700; }
     #node-menu {
       position: fixed;
       z-index: 20;
@@ -282,7 +323,8 @@ def render_graph_html(payload: dict[str, Any]) -> str:
     }
     @media (max-width: 860px) {
       body { flex-direction: column; overflow: auto; height: auto; min-height: 100vh; }
-      #graph { min-height: 62vh; flex: none; }
+      #graph-shell { min-height: 62vh; flex: none; }
+      #graph-hint { max-width: calc(100% - 110px); border-radius: 8px; }
       #sidebar { width: 100%; flex: none; max-height: none; border-right: 0; border-bottom: 1px solid #2a2a4e; }
     }
   </style>
@@ -300,9 +342,18 @@ def render_graph_html(payload: dict[str, Any]) -> str:
       </div>
       <div id="legend"></div>
     </div>
-    <div id="stats">__NODE_COUNT__ nodes &middot; __EDGE_COUNT__ edges &middot; <span id="visible-stats">0 visible</span></div>
+    <div id="stats">__NODE_COUNT__ source nodes &middot; <span id="visual-stats">0 explorable</span> &middot; <span id="visible-stats">0 shown</span></div>
   </div>
-  <div id="graph" role="img" aria-label="REQL memory graph visualization"></div>
+  <div id="graph-shell">
+    <div id="graph-toolbar">
+      <div id="graph-hint">Entry points only. Click a node to reveal one connected depth; click it again to collapse that branch.</div>
+      <div id="graph-actions">
+        <button type="button" class="graph-button" id="reset-graph">Reset</button>
+        <button type="button" class="graph-button" id="fit-graph">Fit</button>
+      </div>
+    </div>
+    <div id="graph" role="img" aria-label="Progressively expandable REQL memory graph visualization"></div>
+  </div>
   <div id="node-menu" role="dialog" aria-label="Node context menu"></div>
   <script id="graph-data" type="application/json">__GRAPH_DATA__</script>
   <script>
@@ -314,7 +365,10 @@ def render_graph_html(payload: dict[str, Any]) -> str:
   const legend = document.getElementById("legend");
   const selectAll = document.getElementById("select-all-cb");
   const visibleStats = document.getElementById("visible-stats");
+  const visualStats = document.getElementById("visual-stats");
   const nodeMenu = document.getElementById("node-menu");
+  const resetGraph = document.getElementById("reset-graph");
+  const fitGraph = document.getElementById("fit-graph");
   const palette = [
     "#4E79A7", "#F28E2B", "#E15759", "#76B7B2", "#59A14F", "#EDC949", "#AF7AA1", "#FF9DA7", "#9C755F", "#BAB0AC",
     "#86BCB6", "#D37295", "#A0CBE8", "#FFBE7D", "#8CD17D", "#B6992D", "#B07AA1", "#FABFD2", "#D4A6C8", "#9D7660"
@@ -365,8 +419,11 @@ def render_graph_html(payload: dict[str, Any]) -> str:
   const renderableEdges = graphEdges.filter((edge) => renderableIds.has(edge.from_id) && renderableIds.has(edge.to_id));
   const communities = buildCommunities();
   const colorByCommunity = new Map(communities.map((item, index) => [item.id, palette[index % palette.length]]));
-  assignStaticLayout(renderableNodes);
+  const adjacency = buildAdjacency();
+  const entryPointIds = findEntryPointIds();
   let selectedCommunities = new Set(communities.map((item) => item.id));
+  let expandedNodeIds = new Set();
+  let revealedNodeIds = new Set(entryPointIds);
   let activeNodes = [];
   let activeEdges = [];
   let nodeItems = [];
@@ -377,6 +434,8 @@ def render_graph_html(payload: dict[str, Any]) -> str:
   let selectedNodeId = null;
   let hoveredNodeId = null;
   let searchTimer = null;
+  const visualCounts = payload.visual_counts || {};
+  visualStats.textContent = `${Number(visualCounts.nodes || renderableNodes.length)} explorable · ${Number(visualCounts.tests_omitted || 0)} test nodes omitted`;
 
   function labelFor(node) {
     return node.label || node.text || node.canonical_key || node.id;
@@ -446,20 +505,21 @@ def render_graph_html(payload: dict[str, Any]) -> str:
   }
 
   function visNodeFor(node) {
-    const size = Math.max(2.2, Math.min(9, 2.1 + Math.sqrt(node.degree || 0) * 0.75));
+    const expanded = expandedNodeIds.has(node.id);
+    const size = Math.max(12, Math.min(28, 11 + Math.sqrt(node.degree || 0) * 1.2));
     return {
       id: node.id,
-      label: "",
-      x: Math.round(node.x || 0),
-      y: Math.round(node.y || 0),
-      fixed: { x: true, y: true },
-      physics: false,
+      label: labelFor(node),
+      title: `${escapeHtml(labelFor(node))}<br>${escapeHtml(node.type || "Node")}<br>${expanded ? "Expanded" : "Click to expand one level"}`,
+      shape: node.entrypoint ? "diamond" : "dot",
       color: colorForCommunity(node.community),
       size,
+      borderWidth: expanded ? 4 : (node.entrypoint ? 3 : 1),
       font: {
-        size: node.degree >= 18 ? 10 : 0,
+        size: node.entrypoint ? 15 : 12,
         color: "#ffffff",
-        strokeWidth: 4,
+        face: "Segoe UI, sans-serif",
+        strokeWidth: 5,
         strokeColor: "#0f0f1a"
       },
       _community: node.community,
@@ -499,103 +559,65 @@ def render_graph_html(payload: dict[str, Any]) -> str:
     return { kind: "adjacent", symbol: "--", otherId: edge.from_id };
   }
 
-  function assignStaticLayout(nodes) {
-    const groups = new Map();
-    for (const node of nodes) {
-      if (!groups.has(node.community)) groups.set(node.community, []);
-      groups.get(node.community).push(node);
+  function buildAdjacency() {
+    const connected = new Map(renderableNodes.map((node) => [node.id, []]));
+    for (const edge of renderableEdges) {
+      if (!connected.has(edge.from_id) || !connected.has(edge.to_id)) continue;
+      connected.get(edge.from_id).push({ edge, otherId: edge.to_id });
+      connected.get(edge.to_id).push({ edge, otherId: edge.from_id });
     }
-    const orderedGroups = Array.from(groups.entries())
-      .map(([community, items]) => ({
-        community,
-        nodes: items.sort((a, b) => b.degree - a.degree || labelFor(a).localeCompare(labelFor(b))),
-        radius: groupRadiusFor(items.length),
-        x: 0,
-        y: 0
-      }))
-      .sort((a, b) => b.nodes.length - a.nodes.length);
-    const groupLookup = new Map(orderedGroups.map((group) => [group.community, group]));
-    const groupLinks = buildCommunityLinks(groupLookup);
-    const cloudRadius = Math.max(480, Math.min(2300, Math.sqrt(Math.max(nodes.length, 1)) * 20 + Math.sqrt(Math.max(orderedGroups.length, 1)) * 100));
-    orderedGroups.forEach((group, groupIndex) => {
-      const angle = groupIndex * 2.399963229728653 - Math.PI / 2;
-      const radius = orderedGroups.length <= 1 ? 0 : cloudRadius * Math.sqrt((groupIndex + 0.45) / orderedGroups.length);
-      group.x = Math.cos(angle) * radius * 1.16;
-      group.y = Math.sin(angle) * radius * 0.82;
-    });
-    relaxGroupCenters(orderedGroups, groupLinks);
-    orderedGroups.forEach((group, groupIndex) => {
-      group.nodes.forEach((node, index) => {
-        const theta = index * 2.399963229728653 + groupIndex * 0.73;
-        const radius = group.radius * Math.sqrt((index + 0.5) / Math.max(group.nodes.length, 1));
-        const wobble = deterministicJitter(index, groupIndex) * 0.14;
-        node.x = group.x + Math.cos(theta + wobble) * radius;
-        node.y = group.y + Math.sin(theta - wobble) * radius * 0.9;
-      });
-    });
-  }
-
-  function groupRadiusFor(size) {
-    return Math.max(62, Math.min(500, 26 + Math.sqrt(size || 1) * 15));
-  }
-
-  function buildCommunityLinks(groupLookup) {
-    const links = new Map();
-    for (const edge of graphEdges) {
-      const source = byId.get(edge.from_id);
-      const target = byId.get(edge.to_id);
-      if (!source || !target || source.community === target.community) continue;
-      if (!groupLookup.has(source.community) || !groupLookup.has(target.community)) continue;
-      const key = source.community < target.community ? `${source.community}\t${target.community}` : `${target.community}\t${source.community}`;
-      links.set(key, (links.get(key) || 0) + Math.max(0.25, Math.min(2.5, Number(edge.weight || 1))));
+    for (const links of connected.values()) {
+      links.sort((a, b) => String(a.edge.type || "").localeCompare(String(b.edge.type || "")) || a.otherId.localeCompare(b.otherId));
     }
-    return Array.from(links.entries()).map(([key, weight]) => {
-      const [a, b] = key.split("\t");
-      return { a: groupLookup.get(a), b: groupLookup.get(b), weight };
-    }).filter((link) => link.a && link.b);
+    return connected;
   }
 
-  function relaxGroupCenters(groups, links) {
-    if (groups.length <= 1) return;
-    for (let iteration = 0; iteration < 96; iteration += 1) {
-      for (let i = 0; i < groups.length; i += 1) {
-        const a = groups[i];
-        for (let j = i + 1; j < groups.length; j += 1) {
-          const b = groups[j];
-          const dx = b.x - a.x;
-          const dy = b.y - a.y;
-          const distance = Math.max(0.01, Math.hypot(dx, dy));
-          const minimum = (a.radius + b.radius) * 1.05 + 70;
-          if (distance >= minimum) continue;
-          const push = (minimum - distance) * 0.035;
-          const fx = (dx / distance) * push;
-          const fy = (dy / distance) * push;
-          a.x -= fx;
-          a.y -= fy;
-          b.x += fx;
-          b.y += fy;
-        }
-      }
-      for (const link of links) {
-        const a = link.a;
-        const b = link.b;
-        const dx = b.x - a.x;
-        const dy = b.y - a.y;
-        const distance = Math.max(1, Math.hypot(dx, dy));
-        const target = (a.radius + b.radius) * 0.78 + 220;
-        const pull = (distance - target) * Math.min(0.005, 0.0014 * Math.sqrt(link.weight));
-        const fx = (dx / distance) * pull;
-        const fy = (dy / distance) * pull;
-        a.x += fx;
-        a.y += fy;
-        b.x -= fx;
-        b.y -= fy;
+  function findEntryPointIds() {
+    const explicit = renderableNodes
+      .filter((node) => node.entrypoint && (adjacency.get(node.id) || []).length > 0)
+      .sort((a, b) => labelFor(a).localeCompare(labelFor(b)) || a.id.localeCompare(b.id));
+    if (explicit.length) return explicit.map((node) => node.id);
+
+    const incoming = new Map(renderableNodes.map((node) => [node.id, 0]));
+    for (const edge of renderableEdges) incoming.set(edge.to_id, (incoming.get(edge.to_id) || 0) + 1);
+    const executableTypes = new Set(["Endpoint", "Function", "Method"]);
+    let roots = renderableNodes.filter((node) =>
+      executableTypes.has(node.type) && node.degree > 0 && (incoming.get(node.id) || 0) === 0
+    );
+    if (!roots.length) roots = renderableNodes.filter((node) => node.degree > 0 && (incoming.get(node.id) || 0) === 0);
+    if (!roots.length) roots = renderableNodes.filter((node) => node.degree > 0);
+    return roots
+      .sort((a, b) => b.degree - a.degree || labelFor(a).localeCompare(labelFor(b)) || a.id.localeCompare(b.id))
+      .slice(0, 24)
+      .map((node) => node.id);
+  }
+
+  function rebuildRevealedNodes() {
+    const next = new Set(entryPointIds);
+    const queue = [...entryPointIds];
+    const traversed = new Set();
+    while (queue.length) {
+      const nodeId = queue.shift();
+      if (traversed.has(nodeId) || !expandedNodeIds.has(nodeId)) continue;
+      traversed.add(nodeId);
+      for (const link of adjacency.get(nodeId) || []) {
+        const wasHidden = !next.has(link.otherId);
+        next.add(link.otherId);
+        if (wasHidden && expandedNodeIds.has(link.otherId)) queue.push(link.otherId);
       }
     }
+    revealedNodeIds = next;
   }
 
-  function deterministicJitter(index, groupIndex) {
-    return Math.sin((index + 1) * 12.9898 + (groupIndex + 1) * 78.233) * 0.5;
+  function toggleNodeExpansion(nodeId, pointer = null) {
+    if (expandedNodeIds.has(nodeId)) expandedNodeIds.delete(nodeId);
+    else expandedNodeIds.add(nodeId);
+    rebuildRevealedNodes();
+    renderLegend();
+    syncSelectAll();
+    applyFilters(true);
+    selectNode(nodeId, false);
+    showNodeMenu(nodeId, pointer);
   }
 
   function searchText(node) {
@@ -605,10 +627,11 @@ def render_graph_html(payload: dict[str, Any]) -> str:
       .toLowerCase();
   }
 
-  function buildCommunities() {
+  function buildCommunities(nodeIds = null) {
     const counts = new Map();
     const labels = new Map();
     for (const node of renderableNodes) {
+      if (nodeIds && !nodeIds.has(node.id)) continue;
       counts.set(node.community, (counts.get(node.community) || 0) + 1);
       labels.set(node.community, node.community_name);
     }
@@ -619,7 +642,7 @@ def render_graph_html(payload: dict[str, Any]) -> str:
 
   function renderLegend() {
     legend.innerHTML = "";
-    for (const item of communities) {
+    for (const item of buildCommunities(revealedNodeIds)) {
       const row = document.createElement("label");
       row.className = "legend-item";
       if (!selectedCommunities.has(item.id)) row.classList.add("dimmed");
@@ -648,13 +671,17 @@ def render_graph_html(payload: dict[str, Any]) -> str:
   }
 
   function syncSelectAll() {
-    selectAll.checked = selectedCommunities.size === communities.length;
-    selectAll.indeterminate = selectedCommunities.size > 0 && selectedCommunities.size < communities.length;
+    const relevant = buildCommunities(revealedNodeIds).map((item) => item.id);
+    const selectedCount = relevant.filter((id) => selectedCommunities.has(id)).length;
+    selectAll.checked = relevant.length > 0 && selectedCount === relevant.length;
+    selectAll.indeterminate = selectedCount > 0 && selectedCount < relevant.length;
   }
 
-  function applyFilters() {
+  function applyFilters(fitAfterUpdate = false) {
     const query = search.value.trim().toLowerCase();
-    activeNodes = renderableNodes.filter((node) => selectedCommunities.has(node.community) && (!query || searchText(node).includes(query)));
+    activeNodes = renderableNodes.filter((node) =>
+      revealedNodeIds.has(node.id) && selectedCommunities.has(node.community) && (!query || searchText(node).includes(query))
+    );
     const activeIds = new Set(activeNodes.map((node) => node.id));
     activeEdges = renderableEdges.filter((edge) => activeIds.has(edge.from_id) && activeIds.has(edge.to_id));
     nodeItems = activeNodes.map(visNodeFor);
@@ -665,10 +692,14 @@ def render_graph_html(payload: dict[str, Any]) -> str:
     edgesDS.add(edgeItems);
     if (network) {
       network.setData({ nodes: nodesDS, edges: edgesDS });
+      if (fitAfterUpdate) {
+        network.stabilize(90);
+        window.setTimeout(() => network.fit({ animation: { duration: 220, easingFunction: "easeInOutQuad" } }), 0);
+      }
     }
     hideNodeMenu();
     renderSearchResults(query);
-    visibleStats.textContent = `${activeNodes.length} visible`;
+    visibleStats.textContent = `${activeNodes.length} shown · ${revealedNodeIds.size} revealed · ${entryPointIds.length} entry points`;
   }
 
   function renderSearchResults(query) {
@@ -750,6 +781,13 @@ def render_graph_html(payload: dict[str, Any]) -> str:
     }
     nodeMenu.appendChild(grid);
 
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "node-toggle-button";
+    toggle.textContent = expandedNodeIds.has(nodeId) ? "Collapse branch" : "Reveal connected nodes";
+    toggle.addEventListener("click", () => toggleNodeExpansion(nodeId, null));
+    nodeMenu.appendChild(toggle);
+
     const text = node.text || node.canonical_key || "";
     if (text && text !== labelFor(node)) {
       const section = menuSection("Text");
@@ -791,6 +829,13 @@ def render_graph_html(payload: dict[str, Any]) -> str:
         item.textContent = `${direction.symbol} ${displayEdgeType(edge.type)} ${labelFor(other)}`;
         item.title = `${direction.kind}: ${edge.from_id} -> ${edge.to_id}`;
         item.addEventListener("click", () => {
+          if (!revealedNodeIds.has(other.id)) {
+            expandedNodeIds.add(nodeId);
+            rebuildRevealedNodes();
+            renderLegend();
+            syncSelectAll();
+            applyFilters(true);
+          }
           selectNode(other.id, true);
           showNodeMenu(other.id, null);
         });
@@ -856,14 +901,14 @@ def render_graph_html(payload: dict[str, Any]) -> str:
       autoResize: true,
       nodes: {
         shape: "dot",
-        borderWidth: 0,
-        borderWidthSelected: 2,
-        scaling: { min: 2, max: 10 }
+        borderWidth: 1,
+        borderWidthSelected: 4,
+        scaling: { min: 12, max: 28 }
       },
       edges: {
-        selectionWidth: 1,
-        hoverWidth: 1,
-        smooth: false
+        selectionWidth: 2,
+        hoverWidth: 2,
+        smooth: { enabled: true, type: "dynamic", roundness: 0.18 }
       },
       interaction: {
         hover: true,
@@ -873,7 +918,19 @@ def render_graph_html(payload: dict[str, Any]) -> str:
         multiselect: false,
         navigationButtons: false
       },
-      physics: { enabled: false },
+      physics: {
+        enabled: true,
+        solver: "forceAtlas2Based",
+        forceAtlas2Based: {
+          gravitationalConstant: -72,
+          centralGravity: 0.012,
+          springLength: 150,
+          springConstant: 0.045,
+          damping: 0.52,
+          avoidOverlap: 0.7
+        },
+        stabilization: { enabled: true, iterations: 180, updateInterval: 25 }
+      },
       layout: { improvedLayout: false }
     });
     network.on("hoverNode", (params) => {
@@ -886,18 +943,22 @@ def render_graph_html(payload: dict[str, Any]) -> str:
     });
     network.on("click", (params) => {
       if (params.nodes.length > 0) {
-        selectNode(params.nodes[0], false);
-        showNodeMenu(params.nodes[0], params.pointer.DOM);
+        toggleNodeExpansion(params.nodes[0], params.pointer.DOM);
       } else if (hoveredNodeId === null) {
         selectedNodeId = null;
         hideNodeMenu();
       }
     });
+    network.once("stabilizationIterationsDone", () => network.fit({ animation: false }));
     network.fit({ animation: false });
   }
 
   selectAll.addEventListener("change", () => {
-    selectedCommunities = selectAll.checked ? new Set(communities.map((item) => item.id)) : new Set();
+    const relevant = buildCommunities(revealedNodeIds).map((item) => item.id);
+    for (const communityId of relevant) {
+      if (selectAll.checked) selectedCommunities.add(communityId);
+      else selectedCommunities.delete(communityId);
+    }
     syncSelectAll();
     renderLegend();
     updateGraph();
@@ -906,6 +967,14 @@ def render_graph_html(payload: dict[str, Any]) -> str:
     window.clearTimeout(searchTimer);
     searchTimer = window.setTimeout(updateGraph, 80);
   });
+  resetGraph.addEventListener("click", () => {
+    expandedNodeIds = new Set();
+    rebuildRevealedNodes();
+    renderLegend();
+    syncSelectAll();
+    applyFilters(true);
+  });
+  fitGraph.addEventListener("click", () => network?.fit({ animation: { duration: 220, easingFunction: "easeInOutQuad" } }));
   renderLegend();
   syncSelectAll();
   applyFilters();
@@ -968,6 +1037,7 @@ _NODE_PROPERTY_KEYS = {
     "handler",
     "is_semantic",
     "is_technical",
+    "is_entrypoint",
     "language",
     "line_end",
     "line_start",
@@ -979,29 +1049,47 @@ _NODE_PROPERTY_KEYS = {
     "qualified_name",
     "relative_path",
     "route",
+    "roles",
     "severity",
+    "semantic_roles",
     "source_file",
     "start_line",
     "status",
     "symbol_name",
 }
+_ENTRYPOINT_NODE_TYPES = {"Endpoint", "Function", "Method"}
+_ENTRYPOINT_NAMES = {"_main", "execute", "handle", "main", "run"}
+_ENTRYPOINT_ROLE_TOKENS = {"command", "controller", "endpoint", "entrypoint", "handler", "public-api", "route"}
+_TEST_PATH_PARTS = {"test", "tests", "__tests__"}
 _NODE_TEXT_MAX_CHARS = 420
 _LABEL_MAX_CHARS = 180
 _PROPERTY_VALUE_MAX_CHARS = 180
 
 
 def _visual_graph_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Return the full graph payload with compact fields for the HTML viewer."""
+    """Return a compact, progressively explorable HTML graph payload."""
 
-    nodes = [node for node in payload.get("nodes", []) or [] if isinstance(node, dict)]
-    edges = [edge for edge in payload.get("edges", []) or [] if isinstance(edge, dict)]
+    source_nodes = [node for node in payload.get("nodes", []) or [] if isinstance(node, dict)]
+    source_edges = [edge for edge in payload.get("edges", []) or [] if isinstance(edge, dict)]
+    nodes = [node for node in source_nodes if not _is_test_node(node)]
+    node_ids = {str(node.get("id") or "") for node in nodes}
+    edges = [
+        edge
+        for edge in source_edges
+        if str(edge.get("from_id") or "") in node_ids and str(edge.get("to_id") or "") in node_ids
+    ]
     return {
         "format": "reql-memory-visual-export-v1",
         "source_format": payload.get("format"),
         "created_at": payload.get("created_at"),
         "source_counts": {
-            "nodes": len([node for node in payload.get("nodes", []) or [] if isinstance(node, dict)]),
-            "edges": len([edge for edge in payload.get("edges", []) or [] if isinstance(edge, dict)]),
+            "nodes": len(source_nodes),
+            "edges": len(source_edges),
+        },
+        "visual_counts": {
+            "nodes": len(nodes),
+            "edges": len(edges),
+            "tests_omitted": len(source_nodes) - len(nodes),
         },
         "visual_limits": {
             "nodes": None,
@@ -1024,9 +1112,57 @@ def _visual_node(node: dict[str, Any]) -> dict[str, Any]:
         "salience": _round_float(node.get("salience")),
         "confidence": _round_float(node.get("confidence")),
         "activation": _round_float(node.get("activation")),
+        "entrypoint": _is_entrypoint_node(node),
         "properties": _visual_properties(properties),
     }
     return {key: value for key, value in compact.items() if value not in (None, "", {})}
+
+
+def _is_test_node(node: dict[str, Any]) -> bool:
+    if str(node.get("type") or "").casefold() == "test":
+        return True
+    properties = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+    path = str(
+        properties.get("relative_path")
+        or properties.get("source_file")
+        or properties.get("path")
+        or ""
+    ).replace("\\", "/")
+    if not path:
+        return False
+    parts = [part.casefold() for part in path.split("/") if part]
+    if any(part in _TEST_PATH_PARTS for part in parts[:-1]):
+        return True
+    filename = parts[-1] if parts else ""
+    stem = filename.rsplit(".", 1)[0]
+    return stem.startswith("test_") or stem.endswith("_test")
+
+
+def _is_entrypoint_node(node: dict[str, Any]) -> bool:
+    node_type = str(node.get("type") or "")
+    if node_type not in _ENTRYPOINT_NODE_TYPES or _is_test_node(node):
+        return False
+    if node_type == "Endpoint":
+        return True
+    properties = node.get("properties") if isinstance(node.get("properties"), dict) else {}
+    if properties.get("is_entrypoint") is True:
+        return True
+    role_values: list[str] = []
+    for key in ("roles", "semantic_roles"):
+        value = properties.get(key)
+        if isinstance(value, str):
+            role_values.append(value)
+        elif isinstance(value, list | tuple):
+            role_values.extend(str(item) for item in value)
+    role_tokens = {
+        token
+        for value in role_values
+        for token in value.casefold().replace("_", "-").split()
+    }
+    if role_tokens & _ENTRYPOINT_ROLE_TOKENS:
+        return True
+    name = str(properties.get("name") or properties.get("qualified_name") or node.get("label") or "")
+    return name.rsplit(".", 1)[-1].casefold() in _ENTRYPOINT_NAMES
 
 
 def _visual_edge(edge: dict[str, Any]) -> dict[str, Any]:

@@ -33,6 +33,21 @@ def find_config_path(start_dir: str | Path | None = None) -> Path | None:
     return None
 
 
+def resolve_config_path(
+    path: str | Path | None = None,
+    *,
+    start_dir: str | Path | None = None,
+    env: Mapping[str, str] | None = None,
+) -> Path | None:
+    """Resolve the selected project config using effective-config precedence."""
+
+    env_values = os.environ if env is None else env
+    selected = path or env_values.get(CONFIG_PATH_ENV) or None
+    if selected:
+        return Path(selected).expanduser().resolve(strict=False)
+    return find_config_path(start_dir)
+
+
 def canonical_config_path() -> Path:
     """Return the repository canonical ``conf.yaml`` path."""
 
@@ -117,8 +132,7 @@ def load_effective_config(
     """
 
     env_values = os.environ if env is None else env
-    env_path = env_values.get(CONFIG_PATH_ENV)
-    selected_path = path or env_path or None
+    selected_path = resolve_config_path(path, start_dir=start_dir, env=env_values)
     config = load_config(selected_path, start_dir=start_dir)
 
     env_overrides = env_values.get(CONFIG_OVERRIDES_ENV)

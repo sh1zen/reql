@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any, Protocol, Sequence
+from typing import MutableMapping, Protocol, Sequence
 
 from ....domain.query_context import ContextPayload
 from ....domain.models import MemoryEdge, MemoryNode, MemoryQuery, MemorySubgraph
@@ -20,6 +20,18 @@ class QueryProfile:
     phrase_terms: set[str]
 
 
+@dataclass(frozen=True, slots=True)
+class NodeMatchMetrics:
+    match_score: float
+    coverage: float
+    overlap_tokens: frozenset[str] = frozenset()
+    strong_identifier_overlap: bool = False
+
+    @property
+    def overlap_count(self) -> int:
+        return len(self.overlap_tokens)
+
+
 @dataclass(slots=True)
 class PathCandidate:
     node: MemoryNode
@@ -33,9 +45,6 @@ class PathCandidate:
     edge_ids: list[str] = field(default_factory=list)
 
 
-# Private aliases preserve the existing internal annotations during the migration.
-_QueryProfile = QueryProfile
-_PathCandidate = PathCandidate
 class SearchComponent(Protocol):
     store: GraphStore
 
@@ -60,6 +69,7 @@ class ExpansionComponent(Protocol):
         *,
         edge_types: set[str],
         code_context: bool,
+        metrics_cache: MutableMapping[str, NodeMatchMetrics] | None = None,
     ) -> tuple[OrderedDict[str, PathCandidate], OrderedDict[str, MemoryEdge]]: ...
 
 

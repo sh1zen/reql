@@ -11,18 +11,31 @@ from pathlib import Path
 from typing import Any, Callable
 
 from .agent.progress import ProgressingAgentWorkspace
-from .config import PROJECT_CONFIG_FILENAME, ConfigError, REQLConfig, load_effective_config, load_project_config_data, parse_config_override_assignments, write_sample_config
+from .artifacts.options import CompilationOptions
+from .config import (
+    PROJECT_CONFIG_FILENAME,
+    ConfigError,
+    REQLConfig,
+    load_effective_config,
+    load_project_config_data,
+    normalize_scan_exclude_pattern,
+    parse_config_override_assignments,
+    resolve_config_path,
+    resolve_scan_exclude_pattern,
+    write_sample_config,
+)
 from .diagnostics import PerformanceLogger
 from .domain.exceptions import StorageError
 from .domain.query_context import DEFAULT_MAX_DEPTH, DEFAULT_MAX_ITEMS, DEFAULT_TOP_K, QueryContextRequest
 from .storage import BlockGraphStore, inspect_store_locks
+from .storage.maintenance import clear_project_storage
 from .reporting.html_graph import write_graph_html
+from .reporting.project_pipeline import write_pipeline_html, write_pipeline_mermaid
 from api.memory_graph import MemoryGraph
 
 
 DEFAULT_STORAGE_DIR = ".reql"
 DEFAULT_STORAGE_FILE = "memory.reql"
-DANGEROUS_EXCLUDE_PATTERNS = {"*", "**", "**/*", "/**", "/*", "/", ".", "./"}
 LOCKED_FOR_WRITE_PREFIX = "REQL block store is locked for write: "
 
 
@@ -424,6 +437,16 @@ def _print_storage_compaction(payload: dict[str, Any]) -> None:
     print(f"Bytes reclaimed: {payload['bytes_reclaimed']}")
 
 
+def _print_storage_clear(payload: dict[str, Any]) -> None:
+    print(f"Cleared and rebuilt: {payload['path']}")
+    print(f"Project: {payload['project_path']}")
+    print(f"Files compiled: {payload['files_changed']} / {payload['files_seen']}")
+    print(f"Nodes: {payload['nodes_after']} (archived: {payload['archived_nodes_after']})")
+    print(f"Edges: {payload['edges_after']}")
+    print(f"Bytes: {payload['bytes_before']} -> {payload['bytes_after']}")
+    print(f"Bytes reclaimed: {payload['bytes_reclaimed']}")
+
+
 def _print_agent_status(payload: dict[str, Any]) -> None:
     print(f"Agent workspace: {'initialized' if payload['exists'] else 'not initialized'}")
     print(f"Agent id: {payload.get('agent_id') or ''}")
@@ -632,6 +655,38 @@ def _handle_project_explain(context: CommandContext) -> int:
     return 0
 
 
+def _configure_project_pipeline_parser(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("path", nargs="?", default=".", help="Registered project path; defaults to the current working directory")
+    formats = parser.add_mutually_exclusive_group()
+    formats.add_argument("--code", action="store_true", help="Write Mermaid source to pipeline.mmd")
+    formats.add_argument("--html", action="store_true", help="Write an interactive pipeline.html visualization (default)")
+    parser.add_argument("--out", default=None, help="Output file or directory; defaults to the registered project root")
+
+
+def _handle_project_pipeline(context: CommandContext) -> int:
+    args = context.args
+    try:
+        pipeline = context.graph.project_pipeline(args.path)
+        output_format = "mermaid" if args.code else "html"
+        output_path = _project_pipeline_output_path(
+            args.out,
+            project_root=str(pipeline.project.get("root_path") or args.path),
+            output_format=output_format,
+        )
+        if output_format == "mermaid":
+            written = write_pipeline_mermaid(pipeline, output_path)
+        else:
+            written = write_pipeline_html(pipeline, output_path)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"Cannot write project pipeline: {exc}", file=sys.stderr)
+        return 1
+    print(written)
+    return 0
+
+
 def _configure_project_compile_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("path", nargs="?", default=".", help="Project path to compile; defaults to the current working directory")
     parser.add_argument("--max-file-size-mb", type=float, default=None)
@@ -711,8 +766,9 @@ def _handle_project_compile(context: CommandContext) -> int:
         "max_file_size_bytes": max_file_size,
         "include_patterns": config.scan.include,
         "exclude_patterns": config.scan.exclude,
+        "config_path": _effective_config_path(args),
         "cache_enabled": config.cache.enabled,
-        "parsing_options": _parsing_options(config),
+        "parsing_options": CompilationOptions.from_config(config),
     }
     if args.project_command == "compile" and args.watch:
         print(f"Monitor mode: {Path(args.path).expanduser().resolve(strict=False)}")
@@ -839,8 +895,9 @@ def _handle_cache_status(context: CommandContext) -> int:
         max_file_size_bytes=_max_file_size_bytes(args, config),
         include_patterns=config.scan.include,
         exclude_patterns=config.scan.exclude,
+        config_path=_effective_config_path(args),
         cache_enabled=config.cache.enabled,
-        parsing_options=_parsing_options(config),
+        parsing_options=CompilationOptions.from_config(config),
     )
     if args.json:
         _print_json(status)
@@ -1145,15 +1202,27 @@ def _resolve_storage_arg(args: argparse.Namespace) -> str:
     if explicit:
         return str(explicit)
     build_path: str | Path = "."
-    if getattr(args, "command", None) in {"project", "cache"}:
+    if getattr(args, "command", None) in {"project", "cache"} or (
+        getattr(args, "command", None) == "storage" and getattr(args, "storage_command", None) == "clear"
+    ):
         build_path = getattr(args, "path", ".")
     return str(_default_storage_path(build_path))
 
 
 def _config_start_dir(args: argparse.Namespace) -> str | Path | None:
-    if getattr(args, "command", None) in {"project", "cache"}:
+    if getattr(args, "command", None) in {"project", "cache"} or (
+        getattr(args, "command", None) == "storage" and getattr(args, "storage_command", None) == "clear"
+    ):
         return getattr(args, "path", None)
     return None
+
+
+def _effective_config_path(args: argparse.Namespace) -> Path | None:
+    return resolve_config_path(
+        getattr(args, "config", None),
+        start_dir=_config_start_dir(args),
+        env=os.environ,
+    )
 
 
 def _profile_logger_from_config(config: REQLConfig, command: str) -> PerformanceLogger | None:
@@ -1350,6 +1419,14 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         help="Explain repository capabilities, architecture, workflows, and change starting points",
         configure_parser=_configure_project_explain_parser,
         handler=_handle_project_explain,
+    ),
+    CommandSpec(
+        path=("project", "pipeline"),
+        access=AccessMode.MUTATING,
+        snapshot=False,
+        help="Export all detected project flows as Mermaid or interactive HTML",
+        configure_parser=_configure_project_pipeline_parser,
+        handler=_handle_project_pipeline,
     ),
     CommandSpec(
         path=("project", "history"),
@@ -1653,8 +1730,11 @@ def build_parser() -> argparse.ArgumentParser:
     cache = sub.add_parser("cache", help="Cache commands: status, clear")
     cache_sub = cache.add_subparsers(dest="cache_command", required=True)
 
-    storage = sub.add_parser("storage", help="Storage commands: inspect, locks, compact")
+    storage = sub.add_parser("storage", help="Storage commands: inspect, locks, compact, clear")
     storage_sub = storage.add_subparsers(dest="storage_command", required=True)
+    storage_clear = storage_sub.add_parser("clear", help="Rebuild storage from the current project and discard historical graph state")
+    storage_clear.add_argument("path", nargs="?", default=".", help="Project directory to rebuild; defaults to the current working directory")
+    storage_clear.add_argument("--json", action="store_true", help="Print structured JSON result")
     storage_compact = storage_sub.add_parser("compact", help="Rewrite the block store into a compact generation")
     storage_compact.add_argument("--json", action="store_true", help="Print structured JSON result")
     storage_inspect = storage_sub.add_parser("inspect", help="Inspect block layout, compression, dense nodes, and indexes")
@@ -1699,24 +1779,6 @@ def _max_file_size_bytes(args: argparse.Namespace, config: REQLConfig) -> int:
     return max(0, int(float(value) * 1024 * 1024))
 
 
-def _parsing_options(config: REQLConfig) -> dict[str, object]:
-    return {
-        "compile": config.compile.to_dict(),
-        "scan": {
-            "use_gitignore": config.scan.use_gitignore,
-            "ignore_defaults": config.scan.ignore_defaults,
-        },
-    }
-
-
-def _document_format_ingest_enabled(document_policies: list[dict[str, object]], format_name: str) -> bool:
-    wanted = format_name.casefold()
-    return any(
-        str(item.get("format") or "").casefold() == wanted and bool(item.get("ingest", True))
-        for item in document_policies
-    )
-
-
 def _append_config_exclude_patterns(project_path: str | Path, patterns: list[str]) -> dict[str, object]:
     root = Path(project_path).expanduser().resolve(strict=False)
     if root.exists() and not root.is_dir():
@@ -1725,15 +1787,18 @@ def _append_config_exclude_patterns(project_path: str | Path, patterns: list[str
         raise ValueError(f"project path does not exist: {root}")
 
     normalized: list[str] = []
+    normalized_keys: set[str] = set()
     for raw in patterns:
-        pattern = raw.strip().replace("\\", "/")
+        pattern = raw
         if not pattern:
             raise ValueError("exclude patterns must not be empty")
         if "\n" in raw or "\r" in raw:
             raise ValueError("exclude patterns must be single-line values")
         _validate_exclude_pattern(pattern)
-        if pattern not in normalized:
+        key = normalize_scan_exclude_pattern(pattern)
+        if key not in normalized_keys:
             normalized.append(pattern)
+            normalized_keys.add(key)
 
     config_path = root / PROJECT_CONFIG_FILENAME
     created = False
@@ -1743,9 +1808,9 @@ def _append_config_exclude_patterns(project_path: str | Path, patterns: list[str
     project_data = load_project_config_data(config_path)
     scan_data = project_data.get("scan", {})
     project_excludes = list(scan_data.get("exclude", [])) if isinstance(scan_data, dict) else []
-    existing_rules = set(project_excludes)
-    added = [pattern for pattern in normalized if pattern not in existing_rules]
-    skipped = [pattern for pattern in normalized if pattern in existing_rules]
+    existing_rules = {normalize_scan_exclude_pattern(pattern) for pattern in project_excludes}
+    added = [pattern for pattern in normalized if normalize_scan_exclude_pattern(pattern) not in existing_rules]
+    skipped = [pattern for pattern in normalized if normalize_scan_exclude_pattern(pattern) in existing_rules]
 
     if added:
         current_text = config_path.read_text(encoding="utf-8")
@@ -1816,14 +1881,30 @@ def _render_yaml_string_list(key: str, values: list[str]) -> str:
     if not values:
         return f"  {key}: []"
     lines = [f"  {key}:"]
-    lines.extend(f"    - {json.dumps(value, ensure_ascii=False)}" for value in values)
+    lines.extend(f"    - {_render_yaml_string(value)}" for value in values)
     return "\n".join(lines)
 
 
+def _render_yaml_string(value: str) -> str:
+    """Render a plain scalar when REQL's YAML subset can read it unchanged."""
+
+    requires_quotes = (
+        not value
+        or value != value.strip()
+        or value in {"true", "false", "[]", "{}"}
+        or value.startswith(("[", "{"))
+        or any(char in value for char in ("#", '"', "'", "\n", "\r"))
+    )
+    if not requires_quotes:
+        try:
+            float(value) if "." in value else int(value)
+        except ValueError:
+            return value
+    return json.dumps(value, ensure_ascii=False)
+
+
 def _validate_exclude_pattern(pattern: str) -> None:
-    compact = pattern.strip("/")
-    if pattern in DANGEROUS_EXCLUDE_PATTERNS or compact in DANGEROUS_EXCLUDE_PATTERNS:
-        raise ValueError(f"refusing dangerous scan.exclude pattern that would exclude the workspace: {pattern}")
+    resolve_scan_exclude_pattern(pattern)
 
 
 def _write_text_atomic(path: Path, text: str) -> None:
@@ -1843,6 +1924,38 @@ def _graph_json_path(raw_path: str | None) -> Path:
     path = Path(raw_path or "graph.json")
     if path.suffix.casefold() != ".json":
         path = path / "graph.json"
+    return path
+
+
+def _project_pipeline_output_path(
+    raw_path: str | None,
+    *,
+    project_root: str | Path,
+    output_format: str,
+) -> Path:
+    if output_format == "html":
+        filename = "pipeline.html"
+        allowed_suffixes = {".html", ".htm"}
+    elif output_format == "mermaid":
+        filename = "pipeline.mmd"
+        allowed_suffixes = {".mmd", ".mermaid"}
+    else:
+        raise ValueError(f"Unsupported pipeline output format: {output_format}")
+
+    if raw_path is None:
+        path = Path(project_root).expanduser().resolve(strict=False) / filename
+    else:
+        path = Path(raw_path).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+        if path.is_dir() or not path.suffix:
+            path = path / filename
+        elif path.suffix.casefold() not in allowed_suffixes:
+            expected = ", ".join(sorted(allowed_suffixes))
+            raise ValueError(
+                f"Pipeline {output_format} output must use one of {expected}: {path}"
+            )
+        path = path.resolve(strict=False)
     return path
 
 
@@ -2194,6 +2307,20 @@ def _main(argv: list[str] | None = None) -> int:
             else:
                 _print_storage_locks(payload)
             return 0
+        if args.storage_command == "clear":
+            payload = clear_project_storage(
+                args.storage,
+                args.path,
+                config=config,
+                config_path=_effective_config_path(args),
+                max_file_size_bytes=_max_file_size_bytes(args, config),
+                parsing_options=CompilationOptions.from_config(config),
+            )
+            if args.json:
+                _print_json(payload)
+            else:
+                _print_storage_clear(payload)
+            return 0
         read_only = args.storage_command == "inspect"
         if profile_logger:
             profile_logger.event("storage.open.start", category="lifecycle", path=str(args.storage), read_only=read_only)
@@ -2253,6 +2380,9 @@ def main(argv: list[str] | None = None) -> int:
     except StorageError as exc:
         print(_format_storage_error(exc), file=sys.stderr)
         return 1
+    except ConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":

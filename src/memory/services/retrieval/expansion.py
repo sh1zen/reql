@@ -1,7 +1,17 @@
 """Bounded graph expansion for retrieval candidates."""
 from __future__ import annotations
 
-from .common import *
+from collections import OrderedDict
+from typing import MutableMapping
+
+from ...domain.constants import INACTIVE_STATUSES
+from ...domain.models import MemoryEdge, MemoryNode, MemoryQuery
+from ...extraction.normalization import clamp
+from .common import (
+    SOURCE_NODE_TYPES,
+    TECHNICAL_EDGE_TYPES,
+)
+from .context.models import NodeMatchMetrics, PathCandidate, QueryProfile
 
 
 class GraphExpansionMixin:
@@ -10,31 +20,24 @@ class GraphExpansionMixin:
         seed_node_ids: list[str],
         seed_scores: OrderedDict[str, float],
         query: MemoryQuery,
-        query_profile: _QueryProfile,
+        query_profile: QueryProfile,
         *,
         edge_types: set[str],
         code_context: bool,
-    ) -> tuple[OrderedDict[str, _PathCandidate], OrderedDict[str, MemoryEdge]]:
-        candidates: dict[str, _PathCandidate] = {}
+        metrics_cache: MutableMapping[str, NodeMatchMetrics] | None = None,
+    ) -> tuple[OrderedDict[str, PathCandidate], OrderedDict[str, MemoryEdge]]:
+        candidates: dict[str, PathCandidate] = {}
         candidate_edges: OrderedDict[str, MemoryEdge] = OrderedDict()
         queue: list[tuple[str, int, float, float, set[str], list[str]]] = []
         seen_depth: dict[str, int] = {}
-        metrics_by_node: dict[str, dict[str, float]] = {}
-        overlap_by_node: dict[str, set[str]] = {}
+        metrics_by_node = metrics_cache if metrics_cache is not None else {}
 
-        def metrics_for(node: MemoryNode) -> dict[str, float]:
+        def metrics_for(node: MemoryNode) -> NodeMatchMetrics:
             metrics = metrics_by_node.get(node.id)
             if metrics is None:
                 metrics = self._node_match_metrics(node, query_profile)
                 metrics_by_node[node.id] = metrics
             return metrics
-
-        def overlap_for(node: MemoryNode) -> set[str]:
-            overlap = overlap_by_node.get(node.id)
-            if overlap is None:
-                overlap = self._node_query_token_overlap_tokens(node, query_profile.informative_tokens)
-                overlap_by_node[node.id] = overlap
-            return overlap
 
         for seed_id in seed_node_ids:
             seed = self.store.get_node(seed_id)
@@ -43,7 +46,8 @@ class GraphExpansionMixin:
             if not self._candidate_node_allowed(seed, query, code_context=code_context):
                 continue
             seed_score = seed_scores.get(seed_id, 0.0)
-            seed_tokens = overlap_for(seed)
+            seed_metrics = metrics_for(seed)
+            seed_tokens = set(seed_metrics.overlap_tokens)
             self._add_path_candidate(
                 candidates,
                 seed,
@@ -53,7 +57,7 @@ class GraphExpansionMixin:
                 depth=0,
                 edge_signal=1.0,
                 edge_ids=[],
-                metrics=metrics_for(seed),
+                metrics=seed_metrics,
             )
             queue.append((seed_id, 0, seed_score, seed_score, seed_tokens, []))
             seen_depth[seed_id] = 0
@@ -77,7 +81,8 @@ class GraphExpansionMixin:
                 if not self._candidate_node_allowed(neighbor, query, code_context=code_context):
                     continue
                 next_depth = depth + 1
-                neighbor_tokens = overlap_for(neighbor)
+                metrics = metrics_for(neighbor)
+                neighbor_tokens = set(metrics.overlap_tokens)
                 combined_tokens = set(path_tokens) | neighbor_tokens
                 previous_depth = seen_depth.get(neighbor.id)
                 existing = candidates.get(neighbor.id)
@@ -88,10 +93,9 @@ class GraphExpansionMixin:
                     and existing.coverage >= self._coverage(combined_tokens, query_profile)
                 ):
                     continue
-                metrics = metrics_for(neighbor)
                 if (
                     next_depth > 1
-                    and metrics["match_score"] <= 0.0
+                    and metrics.match_score <= 0.0
                     and self._coverage(combined_tokens, query_profile) <= self._coverage(path_tokens, query_profile)
                 ):
                     continue
@@ -143,25 +147,25 @@ class GraphExpansionMixin:
 
     def _add_path_candidate(
         self,
-        candidates: dict[str, _PathCandidate],
+        candidates: dict[str, PathCandidate],
         node: MemoryNode,
-        query_profile: _QueryProfile,
+        query_profile: QueryProfile,
         *,
         seed_score: float,
         path_tokens: set[str],
         depth: int,
         edge_signal: float,
         edge_ids: list[str],
-        metrics: dict[str, float] | None = None,
+        metrics: NodeMatchMetrics | None = None,
     ) -> None:
         metrics = metrics or self._node_match_metrics(node, query_profile)
-        direct_coverage = metrics["coverage"]
+        direct_coverage = metrics.coverage
         path_coverage = max(direct_coverage, self._coverage(path_tokens, query_profile))
-        type_bonus = self._retrieval_type_bonus(node, metrics["match_score"])
+        type_bonus = self._retrieval_type_bonus(node, metrics.match_score)
         depth_penalty = min(0.30, depth * 0.08)
         path_score = clamp(0.60 * edge_signal + 0.40 * path_coverage)
         score = clamp(
-            0.52 * metrics["match_score"]
+            0.52 * metrics.match_score
             + 0.28 * path_coverage
             + 0.14 * path_score
             + 0.06 * seed_score
@@ -172,13 +176,13 @@ class GraphExpansionMixin:
             score = clamp(score - 0.08)
         elif node.type in SOURCE_NODE_TYPES:
             score = clamp(score - 0.16)
-        if len(query_profile.informative_tokens) >= 4 and metrics["match_score"] < 0.10 and path_coverage < 0.35:
+        if len(query_profile.informative_tokens) >= 4 and metrics.match_score < 0.10 and path_coverage < 0.35:
             return
         existing = candidates.get(node.id)
-        candidate = _PathCandidate(
+        candidate = PathCandidate(
             node=node,
             score=score,
-            match_score=metrics["match_score"],
+            match_score=metrics.match_score,
             coverage=direct_coverage,
             path_score=path_score,
             type_bonus=type_bonus,

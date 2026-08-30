@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from .models import (
+    ArtifactCompilationResult,
     ArtifactFingerprint,
     GraphRegistrationSummary,
     Project,
@@ -12,6 +13,7 @@ from .models import (
     ScanSkippedFile,
     SourceArtifact,
 )
+from .options import CompilationOptions, DocumentPolicy
 
 __all__ = [
     "ArtifactFingerprint",
@@ -22,8 +24,10 @@ __all__ = [
     "ArtifactCompiler",
     "archive_artifact_fragments",
     "CompilationRun",
+    "CompilationOptions",
     "DeltaRepository",
     "DirtySet",
+    "DocumentPolicy",
     "GraphRegistrationSummary",
     "GraphDelta",
     "Project",
@@ -41,7 +45,7 @@ def __getattr__(name: str) -> Any:
         from . import cache
 
         return getattr(cache, name)
-    if name in {"ArtifactCompiler", "ArtifactCompilationResult", "archive_artifact_fragments"}:
+    if name in {"ArtifactCompiler", "archive_artifact_fragments"}:
         from . import compiler
 
         return getattr(compiler, name)

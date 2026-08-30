@@ -1,7 +1,24 @@
 """General and document context projections."""
 from __future__ import annotations
 
-from ...common import *
+from collections import OrderedDict
+from dataclasses import replace
+from pathlib import Path
+from typing import Any, Sequence
+
+from .....domain.constants import INACTIVE_STATUSES
+from .....domain.models import MemoryEdge, MemoryNode, MemoryQuery, MemorySubgraph, RankedNode
+from .....extraction.normalization import clamp, tokenize
+from ...common import (
+    CODE_CONTEXT_EXCLUDED_NODE_TYPES,
+    CODE_CONTEXT_NODE_TYPES,
+    GRAPH_SEED_NODE_TYPES,
+    SOURCE_EDGE_TYPES,
+    SOURCE_NODE_TYPES,
+    TECHNICAL_EDGE_TYPES,
+    TECHNICAL_NODE_TYPES,
+    _expanded_tokens,
+)
 
 
 class GeneralContextProjectionMixin:
@@ -269,25 +286,25 @@ class GeneralContextProjectionMixin:
             if node.type == "Concept" and node.properties.get("extractor") == "document_processor":
                 label_node = replace(node, text="", canonical_key=node.label or node.canonical_key)
                 label_metrics = self._node_match_metrics(label_node, query_profile)
-                label_score = float(label_metrics["match_score"])
+                label_score = label_metrics.match_score
                 if (
-                    float(label_metrics["match_score"]),
-                    float(label_metrics["coverage"]),
+                    label_metrics.match_score,
+                    label_metrics.coverage,
                 ) > (
-                    float(metrics["match_score"]),
-                    float(metrics["coverage"]),
+                    metrics.match_score,
+                    metrics.coverage,
                 ):
                     metrics = label_metrics
                 best_evidence: tuple[float, float, MemoryNode, dict[str, float]] | None = None
                 for evidence in evidence_by_concept.get(node.id, []):
                     evidence_metrics = self._node_match_metrics(evidence, query_profile)
                     evidence_rank = (
-                        float(evidence_metrics["match_score"]),
-                        float(evidence_metrics["coverage"]),
+                        evidence_metrics.match_score,
+                        evidence_metrics.coverage,
                     )
                     if best_evidence is None or evidence_rank > best_evidence[:2]:
                         best_evidence = (*evidence_rank, evidence, evidence_metrics)
-                if best_evidence is not None and best_evidence[0] > float(metrics["match_score"]):
+                if best_evidence is not None and best_evidence[0] > metrics.match_score:
                     evidence_score, _, evidence, metrics = best_evidence
                     display_node = replace(
                         node,
@@ -299,8 +316,8 @@ class GeneralContextProjectionMixin:
                             "evidence_node_id": evidence.id,
                         },
                     )
-            match_score = float(metrics["match_score"])
-            coverage = float(metrics["coverage"])
+            match_score = metrics.match_score
+            coverage = metrics.coverage
             if match_score <= 0.0:
                 continue
             score = clamp(0.82 * match_score + 0.18 * coverage)
