@@ -1,13 +1,32 @@
 """Public deterministic retrieval engine assembled from pipeline components."""
 from __future__ import annotations
 
-from .common import *
+from collections import OrderedDict
+from contextlib import nullcontext
+
+from ...diagnostics import PerformanceLogger
+from ...domain.constants import INACTIVE_STATUSES
+from ...domain.ids import stable_id
+from ...domain.models import MemoryEdge, MemoryNode, MemoryQuery, MemorySubgraph, RankedNode
+from ...domain.timeutils import utcnow_iso
+from ...extraction.deterministic import DeterministicExtractor
+from ...extraction.normalization import canonicalize
+from ...storage.extractor import SemanticExtractor
+from ...storage.graph_store import GraphStore
+from .common import (
+    CODE_CONTEXT_EDGE_TYPES,
+    CODE_CONTEXT_NODE_TYPES,
+    DEFAULT_CONTEXT_EDGE_TYPES,
+    TECHNICAL_EDGE_TYPES,
+    TECHNICAL_NODE_TYPES,
+)
 from .context.projections.cleanup import CleanupContextProjectionMixin
 from .context.projections.code import CodeContextProjectionMixin
 from .context.projections.general import GeneralContextProjectionMixin
 from .context.renderers.json import JsonContextRendererMixin
 from .context.renderers.markdown import MarkdownContextRendererMixin
 from .context.service import ContextServiceMixin
+from .context.models import NodeMatchMetrics
 from .expansion import GraphExpansionMixin
 from .search import RetrievalSearchMixin
 
@@ -45,6 +64,7 @@ class RetrievalEngine(
         with (profile.span("retrieval.extract") if profile else nullcontext()):
             extraction = self.extractor.extract(query.text)
         seed_scores: OrderedDict[str, float] = OrderedDict()
+        match_metrics: dict[str, NodeMatchMetrics] = {}
         with (profile.span("retrieval.tokenize") if profile else nullcontext()):
             query_profile = self._query_profile(query.text)
         query_scopes = self._normalize_query_context_scopes(query.context_scopes)
@@ -78,14 +98,16 @@ class RetrievalEngine(
                     )
 
         # 2) lexical search across the graph.
-        with (profile.span("retrieval.lexical_search", top_k=max(query.top_k * 3, 30)) if profile else nullcontext()):
+        lexical_limit = max(query.top_k * 3, 30)
+        with (profile.span("retrieval.lexical_search", top_k=lexical_limit) if profile else nullcontext()):
             lexical_matches = (
                 self._scoped_lexical_search(
                     query,
                     query_profile,
                     lexical_node_types=lexical_node_types,
                     scopes=query_scopes,
-                    top_k=max(query.top_k * 8, 120),
+                    top_k=lexical_limit,
+                    metrics_cache=match_metrics,
                 )
                 if query_scopes
                 else self.store.lexical_search(
@@ -102,20 +124,23 @@ class RetrievalEngine(
                     continue
                 if query_scopes and not self._node_matches_query_context_scope(node, query_scopes):
                     continue
-                metrics = self._node_match_metrics(node, query_profile)
+                metrics = match_metrics.get(node.id)
+                if metrics is None:
+                    metrics = self._node_match_metrics(node, query_profile)
+                    match_metrics[node.id] = metrics
                 if self._is_weak_multiterm_match(
                     node,
                     query_tokens=query_profile.informative_tokens,
-                    direct_relevance=metrics["match_score"],
-                    overlap_count=int(metrics.get("overlap_count", 0.0)),
-                    has_strong_identifier_overlap=bool(metrics.get("strong_identifier_overlap", 0.0)),
+                    direct_relevance=metrics.match_score,
+                    overlap_count=metrics.overlap_count,
+                    has_strong_identifier_overlap=metrics.strong_identifier_overlap,
                 ):
                     continue
-                adjusted_score = max(score, metrics["match_score"])
+                adjusted_score = max(score, metrics.match_score)
                 seed_scores[node.id] = max(seed_scores.get(node.id, 0.0), adjusted_score)
 
         sorted_seed_scores = sorted(seed_scores.items(), key=lambda item: item[1], reverse=True)
-        seed_node_ids = self._pick_seed_node_ids(sorted_seed_scores, max_k=max(query.top_k * 2, 20))
+        seed_node_ids = self._pick_seed_node_ids(sorted_seed_scores, max_k=max(query.top_k * 2, 20), gap_ratio=0.20)
         with (profile.span("retrieval.expand", seed_nodes=len(seed_node_ids), max_depth=query.max_depth) if profile else nullcontext()):
             candidates, candidate_edges = self._expand_and_rank_candidates(
                 seed_node_ids,
@@ -124,6 +149,7 @@ class RetrievalEngine(
                 query_profile,
                 edge_types=traversal_edge_types,
                 code_context=code_context,
+                metrics_cache=match_metrics,
             )
 
         ranked: list[RankedNode] = []
@@ -145,7 +171,17 @@ class RetrievalEngine(
                         },
                     )
                 )
-        ranked.sort(key=lambda item: item.score, reverse=True)
+        ranked.sort(
+            key=lambda item: (
+                -item.score,
+                -float(item.reasons.get("match_score", 0.0)),
+                -float(item.reasons.get("coverage", 0.0)),
+                -float(item.reasons.get("type_bonus", 0.0)),
+                -item.node.salience,
+                self._node_relative_path(item.node) or "",
+                self._node_label(item.node),
+            )
+        )
         ranked = ranked[: query.top_k]
         if query.store_trace:
             self.store.record_usage_event(

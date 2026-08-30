@@ -1,7 +1,24 @@
 """Orchestration service for structured and rendered retrieval context."""
 from __future__ import annotations
 
-from ..common import *
+from collections import OrderedDict
+from dataclasses import replace
+from typing import Any, Sequence
+
+from ....domain.constants import INACTIVE_STATUSES
+from ....domain.models import MemoryEdge, MemoryNode, MemoryQuery, MemorySubgraph, RankedNode
+from ..common import (
+    CODE_CONTEXT_NODE_TYPES,
+    DEFAULT_CONTEXT_EDGE_TYPES,
+    GRAPH_SEED_NODE_TYPES,
+    QUERY_CONTEXT_MIN_CONFIDENCE_SCORE,
+    QUERY_EXPLORE_EDGE_TYPES,
+    SOURCE_EDGE_TYPES,
+    SOURCE_NODE_TYPES,
+    TECHNICAL_EDGE_TYPES,
+    TECHNICAL_NODE_TYPES,
+    _expanded_tokens,
+)
 
 
 class ContextServiceMixin:
@@ -582,7 +599,7 @@ class ContextServiceMixin:
         sources: list[MemoryNode],
         max_items: int = 18,
     ) -> str:
-        lines = [f"# REQL Query Graph", "", f"Query: {query_text}", ""]
+        lines = ["# REQL Query Graph", "", f"Query: {query_text}", ""]
         if seed_nodes:
             lines.append("## Seed nodes")
             for node in seed_nodes[:max_items]:

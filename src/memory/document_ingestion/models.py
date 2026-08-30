@@ -37,13 +37,33 @@ class DocumentFragment:
         return asdict(self)
 
 
+@dataclass(frozen=True, slots=True)
+class DocumentLink:
+    source_fragment_id: str
+    text: str
+    uri: str
+
+    def to_dict(self) -> dict[str, str]:
+        return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class DocumentTable:
+    fragment_id: str
+    rows: int
+    columns: int
+
+    def to_dict(self) -> dict[str, int | str]:
+        return asdict(self)
+
+
 @dataclass(slots=True)
 class DocumentParseResult:
     title: str | None
     metadata: dict[str, Any]
     fragments: list[DocumentFragment]
-    links: list[dict[str, Any]]
-    tables: list[dict[str, Any]]
+    links: list[DocumentLink]
+    tables: list[DocumentTable]
     errors: list[str]
     parser_name: str
     parser_version: str
@@ -53,8 +73,8 @@ class DocumentParseResult:
             "title": self.title,
             "metadata": dict(self.metadata),
             "fragments": [fragment.to_dict() for fragment in self.fragments],
-            "links": list(self.links),
-            "tables": list(self.tables),
+            "links": [link.to_dict() for link in self.links],
+            "tables": [table.to_dict() for table in self.tables],
             "errors": list(self.errors),
             "parser_name": self.parser_name,
             "parser_version": self.parser_version,

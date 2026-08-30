@@ -12,7 +12,13 @@ import hashlib
 from typing import Any, Iterable, Sequence
 
 from ...domain.models import MemoryNode
-from ...extraction.normalization import keyword_scores, token_signal_score, tokenize
+from ...extraction.normalization import (
+    identifier_expanded_text,
+    keyword_scores,
+    token_signal_score,
+    tokenize,
+    token_variants,
+)
 from .block_store import INDEXED_NODE_PROPERTIES, BlockGraphStore as _BaseBlockGraphStore
 
 LEXICAL_INDEX_SCHEMA_VERSION = 2
@@ -154,14 +160,25 @@ def _metadata_term_weights(node: MemoryNode, property_values: Sequence[str]) -> 
     text = " ".join(value for value in values if value)
     if not text:
         return {}
-    weights = _selected_token_weights(text, LEXICAL_METADATA_TOKEN_BUDGET)
+    weights = {
+        term: min(1.20, weight * 1.20)
+        for term, weight in _selected_token_weights(text, LEXICAL_METADATA_TOKEN_BUDGET).items()
+    }
     for term, score in keyword_scores(text, max_terms=LEXICAL_METADATA_KEYWORD_BUDGET):
-        weights[term] = max(weights.get(term, 0.0), float(score))
+        weights[term] = max(weights.get(term, 0.0), min(1.20, float(score) * 1.20))
+    expanded_text = identifier_expanded_text(text)
+    if expanded_text != text:
+        for term, score in keyword_scores(expanded_text, max_terms=LEXICAL_METADATA_KEYWORD_BUDGET):
+            weights[term] = max(weights.get(term, 0.0), min(1.20, float(score) * 1.20))
     return _cap_terms(weights, LEXICAL_METADATA_TERM_BUDGET)
 
 
 def _selected_token_weights(value: str, limit: int) -> dict[str, float]:
     tokens = tokenize(value)
+    expanded = tokenize(identifier_expanded_text(value))
+    existing = set(tokens)
+    tokens.extend(token for token in expanded if token not in existing)
+    tokens = [variant for token in tokens for variant in token_variants(token)]
     if not tokens or limit <= 0:
         return {}
 

@@ -15,6 +15,7 @@ except ImportError:  # pragma: no cover - exercised in environments without opti
     Observer = None  # type: ignore[assignment]
 
 from ..domain.timeutils import utcnow_iso
+from ..artifacts.options import RawCompilationOptions
 from .incremental_compilation import CompileProjectResult, IncrementalCompilationService
 
 
@@ -63,8 +64,9 @@ class ProjectWatchService:
         max_file_size_bytes: int = 10 * 1024 * 1024,
         include_patterns: list[str] | None = None,
         exclude_patterns: list[str] | None = None,
+        config_path: str | Path | None = None,
         cache_enabled: bool = True,
-        parsing_options: dict[str, object] | None = None,
+        parsing_options: RawCompilationOptions = None,
         interval_seconds: float = 0.5,
         debounce_seconds: float = 0.1,
         max_iterations: int | None = None,
@@ -83,7 +85,11 @@ class ProjectWatchService:
         root = Path(path).expanduser().resolve(strict=False)
         change_event = Event()
         observer = Observer()
-        observer.schedule(_WatchdogChangeHandler(change_event), str(root), recursive=True)
+        observer.schedule(
+            _WatchdogChangeHandler(change_event, ignored_paths=self._internal_watch_paths(root)),
+            str(root),
+            recursive=True,
+        )
         observer.start()
 
         iteration = 1
@@ -95,6 +101,7 @@ class ProjectWatchService:
                 max_file_size_bytes=max_file_size_bytes,
                 include_patterns=include_patterns,
                 exclude_patterns=exclude_patterns,
+                config_path=config_path,
                 cache_enabled=cache_enabled,
                 parsing_options=parsing_options,
                 debounce_seconds=0,
@@ -117,6 +124,7 @@ class ProjectWatchService:
                     max_file_size_bytes=max_file_size_bytes,
                     include_patterns=include_patterns,
                     exclude_patterns=exclude_patterns,
+                    config_path=config_path,
                     cache_enabled=cache_enabled,
                     parsing_options=parsing_options,
                     debounce_seconds=0,
@@ -134,8 +142,9 @@ class ProjectWatchService:
         max_file_size_bytes: int = 10 * 1024 * 1024,
         include_patterns: list[str] | None = None,
         exclude_patterns: list[str] | None = None,
+        config_path: str | Path | None = None,
         cache_enabled: bool = True,
-        parsing_options: dict[str, object] | None = None,
+        parsing_options: RawCompilationOptions = None,
     ) -> ProjectWatchEvent:
         return self._poll_once(
             path,
@@ -144,6 +153,7 @@ class ProjectWatchService:
             max_file_size_bytes=max_file_size_bytes,
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
+            config_path=config_path,
             cache_enabled=cache_enabled,
             parsing_options=parsing_options,
             debounce_seconds=0,
@@ -159,8 +169,9 @@ class ProjectWatchService:
         max_file_size_bytes: int,
         include_patterns: list[str] | None,
         exclude_patterns: list[str] | None,
+        config_path: str | Path | None,
         cache_enabled: bool,
-        parsing_options: dict[str, object] | None,
+        parsing_options: RawCompilationOptions,
         debounce_seconds: float,
         sleeper: SleepFn,
     ) -> ProjectWatchEvent:
@@ -174,6 +185,7 @@ class ProjectWatchService:
             max_file_size_bytes=max_file_size_bytes,
             include_patterns=include_patterns,
             exclude_patterns=exclude_patterns,
+            config_path=config_path,
             cache_enabled=cache_enabled,
             parsing_options=parsing_options,
         )
@@ -194,11 +206,41 @@ class ProjectWatchService:
             errors=errors,
         )
 
+    def _internal_watch_paths(self, root: Path) -> tuple[Path, ...]:
+        paths = {root / ".reql"}
+        store_path = getattr(self.incremental.store, "path", None)
+        if store_path is not None:
+            storage = Path(store_path).expanduser().resolve(strict=False)
+            paths.update(
+                {
+                    storage,
+                    storage.with_name(f"{storage.name}.wal"),
+                    storage.with_name(f"{storage.name}.lock"),
+                    storage.with_name(f"{storage.name}.readers"),
+                    storage.with_name(f"{storage.name}.usage.jsonl"),
+                }
+            )
+        profile = self.incremental.profile_logger
+        if profile is not None:
+            paths.add(profile.path)
+        return tuple(sorted(paths, key=lambda item: str(item).casefold()))
+
 
 class _WatchdogChangeHandler(FileSystemEventHandler):
-    def __init__(self, changed: Event) -> None:
+    def __init__(self, changed: Event, *, ignored_paths: tuple[Path, ...] = ()) -> None:
         super().__init__()
         self.changed = changed
+        self.ignored_paths = tuple(path.expanduser().resolve(strict=False) for path in ignored_paths)
 
     def on_any_event(self, event: object) -> None:
+        event_paths = [
+            Path(value).expanduser().resolve(strict=False)
+            for attribute in ("src_path", "dest_path")
+            if (value := getattr(event, attribute, None))
+        ]
+        if event_paths and all(self._is_ignored(path) for path in event_paths):
+            return
         self.changed.set()
+
+    def _is_ignored(self, path: Path) -> bool:
+        return any(path == ignored or path.is_relative_to(ignored) for ignored in self.ignored_paths)

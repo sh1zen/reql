@@ -37,7 +37,9 @@ parse(artifact, content) -> DocumentParseResult
 ```
 
 `DocumentParseResult` includes title, parser metadata, fragments, discovered
-links, tables, parser errors, parser name, and parser version.
+links, tables, parser errors, parser name, and parser version. Links and tables
+remain `DocumentLink` and `DocumentTable` objects through parsing and graph
+compilation; they become dictionaries only at serialization boundaries.
 
 `DocumentFragment` records:
 
@@ -49,6 +51,10 @@ links, tables, parser errors, parser name, and parser version.
 - content hash;
 - confidence;
 - parser metadata.
+
+Code parsers similarly return one authoritative `CodeParseResult.symbols`
+collection. The `classes`, `functions`, and `methods` views are derived from it,
+so parser stages cannot maintain contradictory symbol lists.
 
 ## Graph Output
 

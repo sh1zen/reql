@@ -80,12 +80,31 @@ The JSON form prints the generated file paths as `graph_report`,
 Use it when you want to inspect the stored graph visually without starting a
 service.
 
-The HTML export is for exploration and sharing. Use `reql export --json` when
-you need the complete graph payload for backup, automation, or data exchange.
-Use `reql export --html --json` when you want both the browser view and the
-machine-readable graph files in the same output location. Large stores render a
-bounded connected visual core so the browser view stays dense and responsive;
-the layout is static and does not run automatic movement. Isolated records
-remain available in the JSON export.
+The HTML export is for exploration and sharing. It opens on detected entry
+points only. Clicking a node toggles exactly one level of connected nodes;
+expanding one of those nodes reveals the following level, while collapsing a
+node hides its branch unless another expanded path still reaches it. Test-local
+nodes are omitted from this visual projection so repository test suites do not
+dominate the diagram. Reset, fit, search, cluster filters, and node details are
+available in the page.
+
+Use `reql export --json` when you need the complete graph payload, including
+test nodes, for backup, automation, or data exchange. Use
+`reql export --html --json` when you want both the progressive browser view and
+the machine-readable graph files in the same output location.
+
+## Project Pipeline Export
+
+```bash
+reql project pipeline .
+reql project pipeline . --code
+```
+
+This export is intentionally narrower than `reql export --html`: it follows
+detected project entrypoints and collapses the supporting code into shared
+architectural components. HTML is the default and provides zoom, pan, search,
+workflow/layer filters, and source-symbol details. `--code` writes Mermaid.
+Both formats contain deterministic graph evidence only and write to the
+registered project root unless `--out` is supplied.
 
 

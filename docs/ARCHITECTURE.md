@@ -52,6 +52,13 @@ reports, tests, and explicit administrative inspection.
 
 ## Compile Flow
 
+Effective configuration is normalized once into the immutable
+`CompilationOptions` model before the compile service starts. Scanner policy,
+document-format policy, parser selection, watch mode, and cache fingerprinting
+all consume that same object. Mapping-based `parsing_options` remain accepted
+at the public Python boundary for compatibility, but are not propagated through
+the internal pipeline.
+
 ```text
 project root
   -> read-only filesystem scan
@@ -66,6 +73,10 @@ project root
   -> archive graph records for deleted artifacts
   -> persist CompilationRun and GraphDelta nodes
 ```
+
+Every compile phase returns `ArtifactCompilationResult`, whose change sets are
+deduplicated at creation time and merged directly. There is no second aggregate
+representation with parallel node and edge state.
 
 Code artifacts produce deterministic nodes such as `Module`, `Package`,
 `Class`, `Interface`, `Function`, `Method`, `Variable`, `Import`,
@@ -105,6 +116,16 @@ implementation is assembled from focused pipeline components:
 - `retrieval/context/models.py` defines the internal models and component
   protocols shared by the pipeline.
 
+Scoped retrieval starts from bounded lexical posting candidates instead of
+enumerating every node in a scope. Matching metrics are computed once and reused
+by seed selection and graph expansion; identifier/path components and plural
+variants participate in the same deterministic ranking used by `SEARCH`,
+`query_context`, `query_graph`, `query_explore`, and `query_memories`.
+
+Retrieval modules use explicit imports for their shared constants, helpers, and
+domain types. This keeps component dependencies visible and prevents additions
+to a common module from silently changing every pipeline stage.
+
 `memory.services.query_context.QueryContextService` is the application boundary
 above that pipeline. Python API, CLI, and MCP adapters all submit the same
 immutable `QueryContextRequest` and receive a versioned `ContextResult`.
@@ -140,6 +161,26 @@ a node id and source location. Workflow participants are exposed through
 `implemented_by` relations rather than an invented linear call path. This keeps
 the business view explainable while allowing the underlying code graph to
 remain the single source of truth.
+
+## Project Pipeline Projection
+
+`memory.pipeline.ProjectPipelineService` is a second read-only view over the
+same compiled graph. Unlike repository explanation, it preserves observed flow
+direction: all admitted entrypoints are traversed through project-local calls,
+route handling, instantiation, wrappers, and resolved imports. Return, write,
+emit, and raise relations become outcomes. Private implementation symbols may
+connect the traversal. Test nodes and every node originating from a test path
+are removed before adjacency, import, outcome, and component projection, so no
+test data can enter the typed pipeline payload or its rendered output.
+
+The service groups reachable symbols with the repository-explanation
+capability and layer heuristics. Component nodes are global to the projection,
+so multiple workflows converge on the same application, domain, core, or
+infrastructure component instead of duplicating it. Aggregated edges retain
+their relation and workflow ids; strongly connected components are marked as
+feedback cycles. `MemoryGraph.project_pipeline` returns the versioned typed
+payload without persisting nodes or metrics. The CLI renders that payload as
+Mermaid or as an embedded-data `vis-network` HTML file.
 
 ## Maintenance
 

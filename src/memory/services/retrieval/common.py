@@ -1,25 +1,14 @@
 """Deterministic lexical + bounded graph retrieval."""
 from __future__ import annotations
 
-from collections import OrderedDict
-from contextlib import nullcontext
-from dataclasses import replace
-from functools import lru_cache
-from pathlib import Path
-import re
-from typing import Any, Sequence
+from typing import Sequence
 
-from .context.models import _PathCandidate, _QueryProfile
-
-from ...diagnostics import PerformanceLogger
-from ...domain.constants import INACTIVE_STATUSES
-from ...extraction.deterministic import DeterministicExtractor
-from ...domain.ids import stable_id
-from ...domain.models import MemoryEdge, MemoryNode, MemoryQuery, MemorySubgraph, RankedNode
-from ...extraction.normalization import canonicalize, clamp, token_signal_score, tokenize
-from ...domain.timeutils import utcnow_iso
-from ...storage.extractor import SemanticExtractor
-from ...storage.graph_store import GraphStore
+from ...extraction.normalization import (
+    expanded_tokens as _expanded_tokens,
+    identifier_expanded_text as _identifier_expanded_text,
+    singular_source_variants as _singular_source_variants,
+    token_variants as _token_variants,
+)
 
 TECHNICAL_NODE_TYPES = {"RetrievalTrace", "System", "Session", "Debug", "Log", "Comment", "Docstring", "Import"}
 GRAPH_SEED_NODE_TYPES = {"Topic", "Entity", "Fact", "File", "SourceArtifact", "Module", "Function", "Class", "Interface", "Method", "Variable", "Endpoint", "Schema", "StaticAnalysisFinding"}
@@ -157,70 +146,25 @@ CODE_CONTEXT_GENERIC_QUERY_TOKENS = {
     "unrelated",
     "workflow",
 }
-_CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
-_CANONICAL_TOKEN_RE = re.compile(r"[a-z0-9_][a-z0-9_'-]{1,}")
-
-
-
-@lru_cache(maxsize=32768)
-def _expanded_tokens(value: str) -> tuple[str, ...]:
-    tokens: list[str] = []
-    seen: set[str] = set()
-    for candidate in (value, _identifier_expanded_text(value)):
-        for token in tokenize(candidate):
-            for variant in _token_variants(token):
-                if variant not in seen:
-                    seen.add(variant)
-                    tokens.append(variant)
-    return tuple(tokens)
-
-
 def _code_context_query_tokens(value: str) -> set[str]:
     tokens = set(_expanded_tokens(value))
     filtered = {token for token in tokens if token not in CODE_CONTEXT_GENERIC_QUERY_TOKENS}
     return filtered or tokens
 
 
-def _identifier_expanded_text(value: str) -> str:
-    separated = str(value).replace("\\", " ").replace("/", " ").replace(".", " ")
-    separated = separated.replace("_", " ").replace("-", " ").replace(":", " ")
-    return _CAMEL_BOUNDARY_RE.sub(" ", separated)
-
-
-def _token_variants(token: str) -> tuple[str, ...]:
-    variants = [token]
-    singular = _singular_token(token)
-    if singular and singular != token:
-        variants.append(singular)
-    return tuple(variants)
-
-
-def _singular_token(token: str) -> str | None:
-    if len(token) <= 3:
-        return None
-    if token.endswith("ies") and len(token) > 4:
-        return f"{token[:-3]}y"
-    if token.endswith("sses"):
-        return None
-    if token.endswith("ses") and len(token) > 4:
-        return token[:-2]
-    if token.endswith("s") and not token.endswith("ss"):
-        return token[:-1]
-    return None
-
-
 def _canonical_token_overlap(value: str, query_tokens: set[str]) -> set[str]:
     """Return expanded query-token matches from already-canonical search text."""
     if not value or not query_tokens:
         return set()
-    overlap: set[str] = set()
-    for match in _CANONICAL_TOKEN_RE.finditer(value):
-        token = match.group(0).strip("_-")
-        if len(token) < 2:
-            continue
-        for variant in _token_variants(token):
-            if variant in query_tokens:
-                overlap.add(variant)
+    value_tokens = {
+        token
+        for raw_token in value.split()
+        if len(token := raw_token.strip("_-")) >= 2
+    }
+    overlap = value_tokens & query_tokens
+    for query_token in query_tokens - overlap:
+        if any(candidate in value_tokens for candidate in _singular_source_variants(query_token)):
+            overlap.add(query_token)
     return overlap
 
 
@@ -236,7 +180,3 @@ def _raw_query_token_overlap(parts: Sequence[str], query_tokens: set[str]) -> se
         if any(needle in folded for needle in needles):
             overlap.add(token)
     return overlap
-
-
-
-__all__ = [name for name in globals() if not name.startswith("__")]

@@ -32,7 +32,8 @@ scan:
   ignore_defaults: false
   include: []
   exclude:
-    - ".tmp/"
+    - .tmp/
+    - .pytest-tmp/
 
 compile:
   ingest_documents: true
@@ -59,8 +60,18 @@ diagnostics:
 ## Behavior
 
 - `scan.max_file_size_mb`, `scan.include`, and `scan.exclude` are used by
-  project compile/update, watch mode, and cache status. Add project-specific
-  ignored paths to `scan.exclude` in this YAML config.
+  project compile/update, watch mode, and cache status. `scan.include` retains
+  glob matching. `scan.exclude` uses one strict, scope-aware grammar: a literal
+  relative path, optionally prefixed with `./` and optionally followed by `/`;
+  `*suffix` is allowed only as the final path segment. A rule prefixed with
+  `./` is anchored to the directory containing that `reql.conf`; an unprefixed
+  rule can match at any depth below it. Thus `./dir`, `./file.py`, and
+  `./*.generated` match only directly in the config directory, while `dir`,
+  `file.py`, and `*.generated` match at every depth. `dir/*.generated` matches
+  files anywhere inside every directory named `dir`; `./dir/*generated`
+  matches anywhere inside only the config directory's direct `dir` child. A trailing
+  slash does not change matching. Absolute paths, `..`, empty segments,
+  backslashes, and every other glob form are configuration errors.
 - `scan.ignore_defaults` controls list merging. With `false` (the default),
   project `include` and `exclude` entries are appended to the internal lists
   and deduplicated. With `true`, both internal lists and the scanner's internal
@@ -87,6 +98,10 @@ diagnostics:
   observations, `CO_OCCURS_WITH` term relations, and `REFERENCES` edges from
   document terms to code symbols when the same fragment explicitly mentions a
   compiled symbol.
+  The effective compile and scan settings are represented internally by one
+  immutable `CompilationOptions` object, including normalized typed
+  `DocumentPolicy` entries. The same object drives scanning, parsing, watch
+  mode, and the cache options hash.
 - `cache.enabled = false` disables incremental skip decisions. Compilation
   still runs, but `.reql/artifact-cache.json` is not read or updated.
 - `analysis.enable_hubs` is respected by the MCP `reql_hubs` tool. CLI REQL
@@ -109,15 +124,21 @@ directory when `PATH` is omitted. If no project config exists, only the
 packaged internal `conf.yaml` is used. A project-level `conf.yaml` is never
 discovered.
 
-For example, a subdirectory can contain only the settings it needs to change:
+When a parent project is compiled, REQL also discovers `reql.conf` files in
+visited subdirectories. Their `scan.exclude` entries are added only for that
+subtree and are resolved relative to the directory containing the nested file.
+Directories already excluded by a parent rule are not visited. Other settings
+in a nested config are validated, but affect a command only when that subpath is
+itself used as the command root.
+
+For example, a subdirectory can contain only the exclusions it needs:
 
 ```yaml
 # services/search/reql.conf
-project:
-  id: search-service
 scan:
   exclude:
-    - generated/
+    - ./generated/
+    - fixtures/*.snapshot
 ```
 
 Passing `--config path/to/reql.conf` explicitly selects that project config.

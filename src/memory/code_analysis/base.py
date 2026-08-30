@@ -81,9 +81,6 @@ class TreeSitterExtractorBase(ABC):
             imports=self.imports,
             calls=self.calls,
             references=self.references,
-            classes=[symbol for symbol in self.symbols if symbol.kind == "class"],
-            functions=[symbol for symbol in self.symbols if symbol.kind in {"function", "async_function"}],
-            methods=[symbol for symbol in self.symbols if symbol.kind in {"method", "async_method"}],
             comments=self.comments,
             docstrings=self.docstrings,
             errors=[],
@@ -130,7 +127,7 @@ def _language(artifact: SourceArtifact) -> str:
 
 def _empty_result(artifact: SourceArtifact, language: str, error: str) -> CodeParseResult:
     module = CodeModule(id=stable_id("module", artifact.id), artifact_id=artifact.id, name=_module_name(artifact.relative_path), path=artifact.relative_path, language=language, metadata={"tree_sitter": True})
-    return CodeParseResult(module=module, symbols=[], imports=[], calls=[], references=[], classes=[], functions=[], methods=[], comments=[], docstrings=[], errors=[error], parser_name=TreeSitterCodeParser.parser_name, parser_version=TreeSitterCodeParser.parser_version)
+    return CodeParseResult(module=module, symbols=[], imports=[], calls=[], references=[], comments=[], docstrings=[], errors=[error], parser_name=TreeSitterCodeParser.parser_name, parser_version=TreeSitterCodeParser.parser_version)
 
 
 def _parser_unavailable_result(artifact: SourceArtifact, language: str, warning: str) -> CodeParseResult:
@@ -152,9 +149,6 @@ def _parser_unavailable_result(artifact: SourceArtifact, language: str, warning:
         imports=[],
         calls=[],
         references=[],
-        classes=[],
-        functions=[],
-        methods=[],
         comments=[],
         docstrings=[],
         errors=[],
@@ -184,9 +178,6 @@ def _syntax_recovery_result(artifact: SourceArtifact, language: str) -> CodePars
         imports=[],
         calls=[],
         references=[],
-        classes=[],
-        functions=[],
-        methods=[],
         comments=[],
         docstrings=[],
         errors=[],

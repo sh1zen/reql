@@ -20,6 +20,51 @@ _SUPERBLOCK_HEADER_SIZE = struct.calcsize("<8sIIII32s")
 
 
 class BlockStorageTests(unittest.TestCase):
+    def test_fresh_store_defers_and_coalesces_lexical_updates(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "memory.reql"
+            store = BlockGraphStore(path, defer_lexical_index=True)
+            try:
+                self.assertFalse(store._lexical_index_loaded)
+                with store.transaction():
+                    store.upsert_node(MemoryNode(id="n1", type="Topic", text="first value", canonical_key="n1"))
+                    store.upsert_node(MemoryNode(id="n1", type="Topic", text="final searchable value", canonical_key="n1"))
+
+                self.assertFalse(store._lexical_index_loaded)
+                self.assertEqual(set(store._deferred_lexical_changes), {"n1"})
+                self.assertEqual([node.id for node, _ in store.lexical_search("final searchable")], ["n1"])
+                self.assertTrue(store._lexical_index_loaded)
+            finally:
+                store.close()
+
+            reopened = BlockGraphStore(path)
+            try:
+                self.assertEqual([node.id for node, _ in reopened.lexical_search("final searchable")], ["n1"])
+            finally:
+                reopened.close()
+
+    def test_deferred_lexical_changes_are_discarded_on_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            store = BlockGraphStore(Path(td) / "memory.reql", defer_lexical_index=True)
+            try:
+                with self.assertRaisesRegex(RuntimeError, "rollback"):
+                    with store.transaction():
+                        store.upsert_node(
+                            MemoryNode(
+                                id="n1",
+                                type="Topic",
+                                text="should never be searchable",
+                                canonical_key="n1",
+                            )
+                        )
+                        raise RuntimeError("rollback")
+
+                self.assertIsNone(store.get_node("n1"))
+                self.assertFalse(store._deferred_lexical_changes)
+                self.assertEqual(store.lexical_search("never searchable"), [])
+            finally:
+                store.close()
+
     def test_graph_queries_accept_none_for_unbounded_results(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             store = BlockGraphStore(Path(td) / "memory.reql")
@@ -246,6 +291,21 @@ class BlockStorageTests(unittest.TestCase):
             finally:
                 reopened.close()
 
+    def test_large_record_parts_are_generated_lazily(self) -> None:
+        max_payload_size = 128
+        record = {"kind": "meta", "value": {"id": "meta", "blob": "x" * 1024}}
+        payload = block_store_module._encode_record(record)
+
+        parts = block_store_module._encode_record_parts(payload, max_payload_size=max_payload_size)
+
+        self.assertIs(iter(parts), parts)
+        encoded_parts = list(parts)
+        decoded_parts = [block_store_module._decode_record_part(part) for part in encoded_parts]
+        decoded, payload_length, compressed = block_store_module._decode_record_parts(decoded_parts)
+        self.assertEqual(decoded, record)
+        self.assertEqual(payload_length, len(payload) - block_store_module._BINARY_RECORD_HEADER.size)
+        self.assertFalse(compressed)
+
     def test_manifest_checksum_is_validated_on_open(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "memory.reql"
@@ -319,7 +379,8 @@ class BlockStorageTests(unittest.TestCase):
             self.assertTrue(lock_path.exists())
             self.assertFalse(recent["writer"]["stale"])
 
-            old = time.time() - block_store_module.DEFAULT_INCOMPLETE_LOCK_STALE_SECONDS - 1
+            # Some Windows filesystems expose mtimes at two-second precision.
+            old = time.time() - block_store_module.DEFAULT_INCOMPLETE_LOCK_STALE_SECONDS - 3
             os.utime(lock_path, (old, old))
             expired = block_store_module.inspect_store_locks(path, recover_stale=True)
             self.assertFalse(lock_path.exists())

@@ -1,7 +1,7 @@
 """Document-aware source artifact compiler for incremental graph updates."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 import posixpath
@@ -15,7 +15,7 @@ from ..code_analysis.surface import CssDeclaration, analyze_css
 from ..code_analysis.symbol_table import SymbolTable
 from ..document_ingestion.base import ParserRegistry, default_parser_registry
 from ..document_ingestion.metadata import make_fragment
-from ..document_ingestion.models import DocumentFragment, DocumentParseResult
+from ..document_ingestion.models import DocumentFragment, DocumentLink, DocumentParseResult
 from ..domain.ids import stable_id
 from ..domain.models import MemoryEdge, MemoryNode
 from ..domain.timeutils import utcnow_iso
@@ -23,22 +23,8 @@ from ..extraction.document_processor import DocumentProcessingResult, DocumentPr
 from ..extraction.normalization import canonicalize
 from ..storage.graph_store import GraphStore
 from .context_scope import artifact_context_scope
-from .models import SourceArtifact
-
-
-@dataclass(slots=True)
-class ArtifactCompilationResult:
-    artifact_id: str
-    added_nodes: list[str] = field(default_factory=list)
-    updated_nodes: list[str] = field(default_factory=list)
-    archived_nodes: list[str] = field(default_factory=list)
-    added_edges: list[str] = field(default_factory=list)
-    updated_edges: list[str] = field(default_factory=list)
-    archived_edges: list[str] = field(default_factory=list)
-    affected_node_ids: set[str] = field(default_factory=set)
-    affected_edge_ids: set[str] = field(default_factory=set)
-    affected_community_ids: set[str] = field(default_factory=set)
-    errors: list[str] = field(default_factory=list)
+from .models import ArtifactCompilationResult, SourceArtifact
+from .options import CompilationOptions, DocumentPolicy
 
 
 DOCUMENT_CODE_LINK_NODE_TYPES = {"Module", "Function", "Class", "Interface", "Method", "Endpoint", "Schema"}
@@ -251,17 +237,34 @@ class ArtifactCompiler:
         code_parser_registry: CodeParserRegistry | None = None,
         enable_pdf: bool = True,
         ingest_documents: bool = True,
-        document_policies: list[dict[str, object]] | None = None,
+        document_policies: list[dict[str, object]] | tuple[DocumentPolicy, ...] | None = None,
         document_processor: DocumentProcessor | None = None,
+        options: CompilationOptions | None = None,
     ) -> None:
-        self.enable_pdf = enable_pdf
-        self.ingest_documents = ingest_documents
-        self.document_policies = _normalize_document_policies(document_policies)
+        if options is None:
+            policies = tuple(
+                item if isinstance(item, DocumentPolicy) else DocumentPolicy.from_mapping(item)
+                for item in (document_policies or ())
+            )
+            options = CompilationOptions(
+                ingest_documents=ingest_documents,
+                document_policies=policies,
+            )
+        self.options = options
+        self.enable_pdf = enable_pdf and options.format_ingest_enabled("pdf")
         self.document_processor = document_processor or DocumentProcessor()
         self.parser_registry = parser_registry or default_parser_registry(
             enable_pdf=enable_pdf,
         )
         self.code_parser_registry = code_parser_registry or default_code_parser_registry()
+
+    @property
+    def ingest_documents(self) -> bool:
+        return self.options.ingest_documents
+
+    @property
+    def document_policies(self) -> tuple[DocumentPolicy, ...]:
+        return self.options.document_policies
 
     def compile_artifact(self, store: GraphStore, artifact: SourceArtifact) -> ArtifactCompilationResult:
         code_result: CodeParseResult | None = None
@@ -275,12 +278,7 @@ class ArtifactCompiler:
             parse_result = self.build_fragments(artifact)
         result = ArtifactCompilationResult(artifact_id=artifact.id, errors=list(parse_result.errors))
         classification_result = self._persist_compile_classification(store, artifact)
-        result.added_nodes.extend(classification_result.added_nodes)
-        result.updated_nodes.extend(classification_result.updated_nodes)
-        result.added_edges.extend(classification_result.added_edges)
-        result.updated_edges.extend(classification_result.updated_edges)
-        result.affected_node_ids.update(classification_result.affected_node_ids)
-        result.affected_edge_ids.update(classification_result.affected_edge_ids)
+        result.merge(classification_result)
 
         existing = _artifact_fragments(store, artifact)
         existing_ids = {node.id for node in existing}
@@ -294,42 +292,23 @@ class ArtifactCompiler:
             persisted_fragment_ids.add(node.id)
             result.affected_node_ids.add(node.id)
             if created:
-                result.added_nodes.append(node.id)
+                result.added_nodes.add(node.id)
             elif node.id in existing_ids:
-                result.updated_nodes.append(node.id)
+                result.updated_nodes.add(node.id)
 
             for edge in _fragment_edges(artifact, fragment, node.id):
                 fragment_edges.append(edge)
         _upsert_edges_deduped(store, result, fragment_edges)
 
         relation_result = self._persist_document_relations(store, artifact, parse_result, fragment_id_map)
-        result.added_nodes.extend(relation_result.added_nodes)
-        result.updated_nodes.extend(relation_result.updated_nodes)
-        result.added_edges.extend(relation_result.added_edges)
-        result.updated_edges.extend(relation_result.updated_edges)
-        result.affected_node_ids.update(relation_result.affected_node_ids)
-        result.affected_edge_ids.update(relation_result.affected_edge_ids)
+        result.merge(relation_result)
 
         surface_result = _persist_application_surface_links(store, artifact, parse_result, fragment_id_map, code_result=code_result)
-        result.added_nodes.extend(surface_result.added_nodes)
-        result.updated_nodes.extend(surface_result.updated_nodes)
-        result.archived_nodes.extend(surface_result.archived_nodes)
-        result.added_edges.extend(surface_result.added_edges)
-        result.updated_edges.extend(surface_result.updated_edges)
-        result.archived_edges.extend(surface_result.archived_edges)
-        result.affected_node_ids.update(surface_result.affected_node_ids)
-        result.affected_edge_ids.update(surface_result.affected_edge_ids)
+        result.merge(surface_result)
 
         if self.document_processing_enabled(artifact):
             processing_result = self._persist_document_processing(store, artifact, parse_result, fragment_id_map)
-            result.added_nodes.extend(processing_result.added_nodes)
-            result.updated_nodes.extend(processing_result.updated_nodes)
-            result.archived_nodes.extend(processing_result.archived_nodes)
-            result.added_edges.extend(processing_result.added_edges)
-            result.updated_edges.extend(processing_result.updated_edges)
-            result.archived_edges.extend(processing_result.archived_edges)
-            result.affected_node_ids.update(processing_result.affected_node_ids)
-            result.affected_edge_ids.update(processing_result.affected_edge_ids)
+            result.merge(processing_result)
             parse_result.metadata["document_processor"] = {
                 "status": "completed",
                 "updated_at": utcnow_iso(),
@@ -337,33 +316,26 @@ class ArtifactCompiler:
 
         if code_result is not None and code_result.parser_name != "none":
             code_graph_result = self._persist_code_graph(store, artifact, code_result, parse_result)
-            result.added_nodes.extend(code_graph_result.added_nodes)
-            result.updated_nodes.extend(code_graph_result.updated_nodes)
-            result.archived_nodes.extend(code_graph_result.archived_nodes)
-            result.added_edges.extend(code_graph_result.added_edges)
-            result.updated_edges.extend(code_graph_result.updated_edges)
-            result.archived_edges.extend(code_graph_result.archived_edges)
-            result.affected_node_ids.update(code_graph_result.affected_node_ids)
-            result.affected_edge_ids.update(code_graph_result.affected_edge_ids)
+            result.merge(code_graph_result)
 
         for node in existing:
             if node.id in persisted_fragment_ids or node.status == "archived":
                 continue
             for concept in _concepts_for_fragment(store, node):
                 _archive_concept(store, concept)
-                result.archived_nodes.append(concept.id)
+                result.archived_nodes.add(concept.id)
                 result.affected_node_ids.add(concept.id)
             _archive_fragment(store, node)
-            result.archived_nodes.append(node.id)
+            result.archived_nodes.add(node.id)
             result.affected_node_ids.add(node.id)
             for edge in _fragment_related_edges(store, node):
                 _archive_edge(store, edge)
-                result.archived_edges.append(edge.id)
+                result.archived_edges.add(edge.id)
                 result.affected_edge_ids.add(edge.id)
 
         _mark_artifact_compiled(store, artifact, parse_result)
         result.affected_node_ids.add(artifact.id)
-        result.updated_nodes.append(artifact.id)
+        result.updated_nodes.add(artifact.id)
         return result
 
     def build_fragments(self, artifact: SourceArtifact) -> DocumentParseResult:
@@ -394,10 +366,7 @@ class ArtifactCompiler:
             return False
         if _is_application_surface_path(artifact.relative_path):
             return True
-        policy = _document_policy_for_artifact(self.document_policies, artifact)
-        if policy is None:
-            return True
-        return bool(policy.get("ingest", True))
+        return self.options.document_ingest_enabled(artifact)
 
     def document_processing_enabled(self, artifact: SourceArtifact) -> bool:
         return self.document_ingest_enabled(artifact)
@@ -430,7 +399,7 @@ class ArtifactCompiler:
                     edges.append(edge)
 
         for (fragment, fragment_id, _), (concept, concept_created) in zip(concept_upserts, _batch_upsert_nodes(store, [item[2] for item in concept_upserts])):
-            _track_node(result, concept.id, concept_created)
+            result.record_node(concept.id, created=concept_created)
             common = {
                 "project_id": artifact.project_id,
                 "artifact_id": artifact.id,
@@ -442,17 +411,17 @@ class ArtifactCompiler:
             edges.append(_typed_edge(fragment_id, concept.id, "CONTAINS", common, source_file=artifact.relative_path, line_start=fragment.start_line, line_end=fragment.end_line, extractor=parse_result.parser_name, evidence=fragment.text))
             edges.append(_typed_edge(concept.id, fragment_id, "DERIVED_FROM", common, source_file=artifact.relative_path, line_start=fragment.start_line, line_end=fragment.end_line, extractor=parse_result.parser_name, evidence=fragment.text))
 
-        uri_upserts: list[tuple[dict[str, Any], str, str, MemoryNode]] = []
+        uri_upserts: list[tuple[DocumentLink, str, str, MemoryNode]] = []
         for link in parse_result.links:
-            raw_source_id = str(link.get("source_fragment_id") or "")
+            raw_source_id = link.source_fragment_id
             source_id = fragment_id_map.get(raw_source_id, raw_source_id)
-            uri = str(link.get("uri") or "")
+            uri = link.uri
             if not source_id or not uri:
                 continue
-            uri_upserts.append((link, source_id, uri, _uri_node(uri, str(link.get("text") or uri))))
+            uri_upserts.append((link, source_id, uri, _uri_node(uri, link.text or uri)))
 
         for (link, source_id, uri, _), (target, created) in zip(uri_upserts, _batch_upsert_nodes(store, [item[3] for item in uri_upserts])):
-            _track_node(result, target.id, created)
+            result.record_node(target.id, created=created)
             edge = _typed_edge(source_id, target.id, "LINKS_TO", {"project_id": artifact.project_id, "artifact_id": artifact.id, "relative_path": artifact.relative_path, "uri": uri}, source_file=artifact.relative_path, line_start=None, line_end=None, extractor=parse_result.parser_name, evidence=uri)
             edges.append(edge)
 
@@ -469,7 +438,7 @@ class ArtifactCompiler:
         if _is_test_artifact(artifact):
             node_upserts.append(("test", _test_node(artifact)))
         for kind, (node, created) in zip([kind for kind, _ in node_upserts], _batch_upsert_nodes(store, [node for _, node in node_upserts])):
-            _track_node(result, node.id, created)
+            result.record_node(node.id, created=created)
             edges.append(
                 _typed_edge(
                     file_id,
@@ -509,7 +478,7 @@ class ArtifactCompiler:
         concept_nodes = {term.key: _document_term_node(artifact, term, output) for term in output.terms}
         raw_event_nodes = {event.id_key: _document_raw_event_node(artifact, event) for event in output.raw_events}
         for node, created in _batch_upsert_nodes(store, [*concept_nodes.values(), *raw_event_nodes.values()]):
-            _track_node(result, node.id, created)
+            result.record_node(node.id, created=created)
             current_node_ids.add(node.id)
         edges: list[MemoryEdge] = []
         for term in output.terms:
@@ -553,14 +522,14 @@ class ArtifactCompiler:
             if edge.properties.get("extractor") != "document_processor" or edge.id in current_edge_ids or edge.properties.get("status") == "archived":
                 continue
             _archive_edge(store, edge)
-            result.archived_edges.append(edge.id)
+            result.archived_edges.add(edge.id)
             result.affected_edge_ids.add(edge.id)
         for node_type in ("Concept", "RawEvent"):
             for node in _find_nodes_by_property(store, "artifact_id", artifact.id, type_=node_type, limit=100000):
                 if node.properties.get("extractor") != "document_processor" or node.id in current_node_ids or node.status == "archived":
                     continue
                 _archive_concept(store, node)
-                result.archived_nodes.append(node.id)
+                result.archived_nodes.add(node.id)
                 result.affected_node_ids.add(node.id)
 
     def _persist_code_graph(
@@ -598,7 +567,7 @@ class ArtifactCompiler:
 
         module_node, created = store.upsert_node(_module_node(artifact, code_result.module, code_result))
         current_ids.add(module_node.id)
-        _track_node(result, module_node.id, created)
+        result.record_node(module_node.id, created=created)
         for edge in (
             _typed_edge(
                 artifact.id,
@@ -640,7 +609,7 @@ class ArtifactCompiler:
         for (symbol, _), (node, node_created) in zip(symbol_upserts, _batch_upsert_nodes(store, [node for _, node in symbol_upserts])):
             current_ids.add(node.id)
             symbol_nodes[symbol.qualified_name] = node
-            _track_node(result, node.id, node_created)
+            result.record_node(node.id, created=node_created)
         symbol_resolver = _SymbolNodeResolver(symbol_nodes)
 
         for symbol in code_result.symbols:
@@ -681,7 +650,7 @@ class ArtifactCompiler:
                 schema_upserts.append((symbol, _schema_node(artifact, symbol), node.id))
         for (symbol, _, parent_node_id), (schema_node, schema_created) in zip(schema_upserts, _batch_upsert_nodes(store, [node for _, node, _ in schema_upserts])):
             current_ids.add(schema_node.id)
-            _track_node(result, schema_node.id, schema_created)
+            result.record_node(schema_node.id, created=schema_created)
             pending_edges.append(
                 _typed_edge(
                     parent_node_id,
@@ -721,7 +690,7 @@ class ArtifactCompiler:
                 pending_edges.append(_typed_edge(node.id, target.id, "RETURNS", {"project_id": artifact.project_id, "artifact_id": artifact.id, "hint": symbol.returns}, source_file=artifact.relative_path, line_start=symbol.start_line, line_end=symbol.start_line, extractor=code_result.parser_name, evidence=symbol.returns or ""))
         for (symbol, handler_node_id, decorator, _), (endpoint, endpoint_created) in zip(endpoint_upserts, _batch_upsert_nodes(store, [node for _, _, _, node in endpoint_upserts])):
             current_ids.add(endpoint.id)
-            _track_node(result, endpoint.id, endpoint_created)
+            result.record_node(endpoint.id, created=endpoint_created)
             pending_edges.append(
                 _typed_edge(
                     handler_node_id,
@@ -743,7 +712,7 @@ class ArtifactCompiler:
         for (item, _), (node, node_created) in zip(import_nodes, _batch_upsert_nodes(store, [node for _, node in import_nodes])):
             current_ids.add(node.id)
             import_node_ids[item.id] = node.id
-            _track_node(result, node.id, node_created)
+            result.record_node(node.id, created=node_created)
             pending_edges.append(_typed_edge(module_node.id, node.id, "IMPORTS", {"project_id": artifact.project_id, "artifact_id": artifact.id, "module": item.module, "name": item.name}, source_file=artifact.relative_path, line_start=item.line, line_end=item.line, extractor=code_result.parser_name, evidence=item.raw or item.module or item.name or ""))
             pending_edges.append(_typed_edge(file_id, node.id, "IMPORTS", {"project_id": artifact.project_id, "artifact_id": artifact.id, "module": item.module, "name": item.name}, source_file=artifact.relative_path, line_start=item.line, line_end=item.line, extractor=code_result.parser_name, evidence=item.raw or item.module or item.name or ""))
             resolved_file = _resolved_import_file_node(store, artifact, item)
@@ -763,7 +732,7 @@ class ArtifactCompiler:
                 pending_edges.append(_typed_edge(module_node.id, node.id, "RE_EXPORTS", {"project_id": artifact.project_id, "artifact_id": artifact.id, "module": item.module, "name": item.name, "alias": item.alias}, source_file=artifact.relative_path, line_start=item.line, line_end=item.line, extractor=code_result.parser_name, evidence=item.raw or item.module or item.name or ""))
         for (item, _), (dependency, dep_created) in zip(dependency_nodes, _batch_upsert_nodes(store, [node for _, node in dependency_nodes])):
             current_ids.add(dependency.id)
-            _track_node(result, dependency.id, dep_created)
+            result.record_node(dependency.id, created=dep_created)
             pending_edges.append(_typed_edge(file_id, dependency.id, "DEPENDS_ON", {"project_id": artifact.project_id, "artifact_id": artifact.id, "module": item.module, "name": item.name}, source_file=artifact.relative_path, line_start=item.line, line_end=item.line, extractor=code_result.parser_name, evidence=item.raw or item.module or item.name or ""))
             pending_edges.append(_typed_edge(module_node.id, dependency.id, "IMPORTS_FROM", {"project_id": artifact.project_id, "artifact_id": artifact.id, "module": item.module, "name": item.name}, source_file=artifact.relative_path, line_start=item.line, line_end=item.line, extractor=code_result.parser_name, evidence=item.raw or item.module or item.name or ""))
             resolved_file = _resolved_import_file_node(store, artifact, item)
@@ -823,19 +792,19 @@ class ArtifactCompiler:
                 )
 
         for node, node_created in _batch_upsert_nodes(store, list(external_nodes.values())):
-            _track_node(result, node.id, node_created)
+            result.record_node(node.id, created=node_created)
 
         comment_nodes = [(text_item, _code_text_node(artifact, text_item)) for text_item in code_result.comments]
         for (text_item, _), (node, node_created) in zip(comment_nodes, _batch_upsert_nodes(store, [node for _, node in comment_nodes])):
             current_ids.add(node.id)
-            _track_node(result, node.id, node_created)
+            result.record_node(node.id, created=node_created)
             owner = symbol_nodes.get(text_item.owner or "") or module_node
             pending_edges.append(_typed_edge(owner.id, node.id, "HAS_COMMENT", {"project_id": artifact.project_id, "artifact_id": artifact.id}, source_file=artifact.relative_path, line_start=text_item.start_line, line_end=text_item.end_line, extractor=code_result.parser_name, evidence=(text_item.text or "")[:200]))
 
         docstring_nodes = [(text_item, _code_text_node(artifact, text_item)) for text_item in code_result.docstrings]
         for (text_item, _), (node, node_created) in zip(docstring_nodes, _batch_upsert_nodes(store, [node for _, node in docstring_nodes])):
             current_ids.add(node.id)
-            _track_node(result, node.id, node_created)
+            result.record_node(node.id, created=node_created)
             owner = symbol_nodes.get(text_item.owner or "") or module_node
             pending_edges.append(_typed_edge(owner.id, node.id, "HAS_DOCSTRING", {"project_id": artifact.project_id, "artifact_id": artifact.id}, source_file=artifact.relative_path, line_start=text_item.start_line, line_end=text_item.end_line, extractor=code_result.parser_name, evidence=(text_item.text or "")[:200]))
 
@@ -852,7 +821,7 @@ class ArtifactCompiler:
             _batch_upsert_nodes(store, [item[0] for item in finding_upserts]),
         ):
             current_ids.add(node.id)
-            _track_node(result, node.id, node_created)
+            result.record_node(node.id, created=node_created)
             pending_edges.append(
                 _typed_edge(
                     artifact.id,
@@ -896,11 +865,11 @@ class ArtifactCompiler:
         stale_edges = _code_related_edges_for_nodes(store, stale_nodes)
         for old_node in stale_nodes:
             _archive_code_node(store, old_node)
-            result.archived_nodes.append(old_node.id)
+            result.archived_nodes.add(old_node.id)
             result.affected_node_ids.add(old_node.id)
         for edge in stale_edges:
             _archive_edge(store, edge)
-            result.archived_edges.append(edge.id)
+            result.archived_edges.add(edge.id)
             result.affected_edge_ids.add(edge.id)
 
         return result
@@ -913,34 +882,34 @@ def archive_artifact_fragments(store: GraphStore, artifact: SourceArtifact | Mem
     for node in _fragments_for_artifact_id(store, project_id, artifact_id):
         if node.status != "archived":
             _archive_fragment(store, node)
-            result.archived_nodes.append(node.id)
+            result.archived_nodes.add(node.id)
         result.affected_node_ids.add(node.id)
         for edge in _fragment_related_edges(store, node):
             _archive_edge(store, edge)
-            result.archived_edges.append(edge.id)
+            result.archived_edges.add(edge.id)
             result.affected_edge_ids.add(edge.id)
     code_nodes = [node for node in _code_nodes_for_artifact(store, artifact) if node.status != "archived"]
     code_edges = _code_related_edges_for_nodes(store, code_nodes)
     for node in code_nodes:
         _archive_code_node(store, node)
-        result.archived_nodes.append(node.id)
+        result.archived_nodes.add(node.id)
         result.affected_node_ids.add(node.id)
     for edge in code_edges:
         _archive_edge(store, edge)
-        result.archived_edges.append(edge.id)
+        result.archived_edges.add(edge.id)
         result.affected_edge_ids.add(edge.id)
     for node_type in ("Concept", "RawEvent"):
         for node in _find_nodes_by_property(store, "artifact_id", artifact_id, type_=node_type, limit=100000):
             if node.status == "archived" or node.properties.get("extractor") != "document_processor":
                 continue
             _archive_concept(store, node)
-            result.archived_nodes.append(node.id)
+            result.archived_nodes.add(node.id)
             result.affected_node_ids.add(node.id)
             for edge in _incident_edges(store, [node.id], limit=10000):
                 if edge.properties.get("artifact_id") != artifact_id or edge.properties.get("status") == "archived":
                     continue
                 _archive_edge(store, edge)
-                result.archived_edges.append(edge.id)
+                result.archived_edges.add(edge.id)
                 result.affected_edge_ids.add(edge.id)
     return result
 
@@ -1289,17 +1258,8 @@ def _persist_application_surface_links(
         if edge.properties.get("extractor") != APPLICATION_SURFACE_LINKER or edge.id in current_edge_ids or edge.properties.get("status") == "archived":
             continue
         _archive_edge(store, edge)
-        result.archived_edges.append(edge.id)
+        result.archived_edges.add(edge.id)
         result.affected_edge_ids.add(edge.id)
-    css_result = _persist_css_surface_findings(store, artifact)
-    result.added_nodes.extend(css_result.added_nodes)
-    result.updated_nodes.extend(css_result.updated_nodes)
-    result.archived_nodes.extend(css_result.archived_nodes)
-    result.added_edges.extend(css_result.added_edges)
-    result.updated_edges.extend(css_result.updated_edges)
-    result.archived_edges.extend(css_result.archived_edges)
-    result.affected_node_ids.update(css_result.affected_node_ids)
-    result.affected_edge_ids.update(css_result.affected_edge_ids)
     return result
 
 
@@ -1496,14 +1456,16 @@ def _is_application_template_path(path: str) -> bool:
     return any(part in value for part in ("/views/", "/templates/"))
 
 
-def _persist_css_surface_findings(store: GraphStore, triggering_artifact: SourceArtifact) -> ArtifactCompilationResult:
-    result = ArtifactCompilationResult(artifact_id=triggering_artifact.id)
+def refresh_project_css_surface_findings(store: GraphStore, project_id: str) -> ArtifactCompilationResult:
+    """Refresh project-wide CSS findings once after artifact compilation."""
+
+    result = ArtifactCompilationResult(artifact_id="*")
     fragments = [
         node
         for node in _find_nodes_by_property(
             store,
             "project_id",
-            triggering_artifact.project_id,
+            project_id,
             type_="SourceFragment",
             status="active",
             limit=100000,
@@ -1533,7 +1495,7 @@ def _persist_css_surface_findings(store: GraphStore, triggering_artifact: Source
                 continue
             line = fragment_line + min(lines) - 1
             finding = _css_surface_finding_node(
-                triggering_artifact.project_id,
+                project_id,
                 css_artifact_id,
                 path,
                 finding_type="unused_css_class",
@@ -1544,12 +1506,12 @@ def _persist_css_surface_findings(store: GraphStore, triggering_artifact: Source
                 cleanup_priority="medium",
                 removal_safety="validate",
             )
-            findings.append((finding, css_artifact_id, _file_id_for_relative_path(triggering_artifact.project_id, path)))
+            findings.append((finding, css_artifact_id, _file_id_for_relative_path(project_id, path)))
         for declaration in analysis.overridden_declarations:
             line = fragment_line + declaration.line - 1
             context = f" inside {' / '.join(declaration.context)}" if declaration.context else ""
             finding = _css_surface_finding_node(
-                triggering_artifact.project_id,
+                project_id,
                 css_artifact_id,
                 path,
                 finding_type="always_overridden_css_declaration",
@@ -1564,16 +1526,16 @@ def _persist_css_surface_findings(store: GraphStore, triggering_artifact: Source
                 removal_safety="safe",
                 declaration=declaration,
             )
-            findings.append((finding, css_artifact_id, _file_id_for_relative_path(triggering_artifact.project_id, path)))
+            findings.append((finding, css_artifact_id, _file_id_for_relative_path(project_id, path)))
 
     expected_node_ids = {finding.id for finding, _, _ in findings}
     finding_nodes = [finding for finding, _, _ in findings]
     for (finding, _, _), (stored, created) in zip(findings, _batch_upsert_nodes(store, finding_nodes)):
-        _track_node(result, stored.id, created)
+        result.record_node(stored.id, created=created)
     pending_edges: list[MemoryEdge] = []
     for finding, css_artifact_id, css_file_id in findings:
         common = {
-            "project_id": triggering_artifact.project_id,
+            "project_id": project_id,
             "artifact_id": css_artifact_id,
             "relative_path": finding.properties.get("relative_path"),
             "finding_type": finding.properties.get("finding_type"),
@@ -1601,7 +1563,7 @@ def _persist_css_surface_findings(store: GraphStore, triggering_artifact: Source
         for node in _find_nodes_by_property(
             store,
             "project_id",
-            triggering_artifact.project_id,
+            project_id,
             type_="StaticAnalysisFinding",
             limit=100000,
         )
@@ -1611,14 +1573,14 @@ def _persist_css_surface_findings(store: GraphStore, triggering_artifact: Source
     for node in existing_findings:
         if node.id in stale_ids:
             _archive_code_node(store, node)
-            result.archived_nodes.append(node.id)
+            result.archived_nodes.add(node.id)
             result.affected_node_ids.add(node.id)
     for edge in _find_edges_by_property(store, "extractor", APPLICATION_SURFACE_LINKER, limit=100000):
         if edge.type != "HAS_FINDING" or edge.id in expected_edge_ids or edge.properties.get("status") == "archived":
             continue
         if edge.to_id in stale_ids or edge.to_id not in expected_node_ids:
             _archive_edge(store, edge)
-            result.archived_edges.append(edge.id)
+            result.archived_edges.add(edge.id)
             result.affected_edge_ids.add(edge.id)
     return result
 
@@ -1964,7 +1926,7 @@ def _archive_stale_document_code_links(
         if (edge.from_id, edge.to_id) in current_pairs or edge.properties.get("status") == "archived":
             continue
         _archive_edge(store, edge)
-        result.archived_edges.append(edge.id)
+        result.archived_edges.add(edge.id)
         result.affected_edge_ids.add(edge.id)
 
 
@@ -1984,7 +1946,7 @@ def _archive_stale_document_processor_code_links(
         if (edge.from_id, edge.to_id) in current_pairs or edge.properties.get("status") == "archived":
             continue
         _archive_edge(store, edge)
-        result.archived_edges.append(edge.id)
+        result.archived_edges.add(edge.id)
         result.affected_edge_ids.add(edge.id)
 
 
@@ -2241,22 +2203,6 @@ def _typed_edge(
     )
 
 
-def _track_node(result: ArtifactCompilationResult, node_id: str, created: bool) -> None:
-    result.affected_node_ids.add(node_id)
-    if created:
-        result.added_nodes.append(node_id)
-    else:
-        result.updated_nodes.append(node_id)
-
-
-def _track_edge(result: ArtifactCompilationResult, edge_id: str, created: bool) -> None:
-    result.affected_edge_ids.add(edge_id)
-    if created:
-        result.added_edges.append(edge_id)
-    else:
-        result.updated_edges.append(edge_id)
-
-
 def _upsert_edges_deduped(store: GraphStore, result: ArtifactCompilationResult, edges: list[MemoryEdge]) -> None:
     if not edges:
         return
@@ -2264,7 +2210,7 @@ def _upsert_edges_deduped(store: GraphStore, result: ArtifactCompilationResult, 
     for edge in edges:
         by_pattern[(edge.from_id, edge.type, edge.to_id)] = edge
     for stored, created in _batch_upsert_edges(store, list(by_pattern.values())):
-        _track_edge(result, stored.id, created)
+        result.record_edge(stored.id, created=created)
 
 
 def _batch_upsert_nodes(store: GraphStore, nodes: list[MemoryNode]) -> list[tuple[MemoryNode, bool]]:
@@ -2353,42 +2299,6 @@ def _is_code_artifact(artifact: SourceArtifact) -> bool:
 
 def _is_document_artifact(artifact: SourceArtifact) -> bool:
     return artifact.artifact_type in {"markdown", "text", "pdf", "config", "data", "unknown"}
-
-
-def _normalize_document_policies(policies: list[dict[str, object]] | None) -> dict[str, dict[str, object]]:
-    normalized: dict[str, dict[str, object]] = {}
-    for item in policies or []:
-        format_name = str(item.get("format") or "").strip().casefold()
-        if not format_name:
-            continue
-        extensions = item.get("extensions", [])
-        filenames = item.get("filenames", [])
-        normalized[format_name] = {
-            "extensions": [str(extension).strip().casefold() for extension in extensions if str(extension).strip()],
-            "filenames": [str(filename).strip().casefold() for filename in filenames if str(filename).strip()],
-            "ingest": bool(item.get("ingest", True)),
-        }
-    return normalized
-
-
-def _document_policy_for_artifact(policies: dict[str, dict[str, object]], artifact: SourceArtifact) -> dict[str, object] | None:
-    if not policies:
-        return None
-    path = Path(artifact.relative_path or artifact.path)
-    suffix = path.suffix.casefold()
-    filename = path.name.casefold()
-    for policy in policies.values():
-        filenames = policy.get("filenames", [])
-        if isinstance(filenames, list) and filename in filenames:
-            return policy
-    detected_policy = policies.get(artifact.artifact_type.casefold())
-    if detected_policy is not None:
-        return detected_policy
-    for policy in policies.values():
-        extensions = policy.get("extensions", [])
-        if isinstance(extensions, list) and suffix and suffix in extensions:
-            return policy
-    return {"ingest": False}
 
 
 def _is_test_artifact(artifact: SourceArtifact) -> bool:
@@ -2481,9 +2391,6 @@ def _empty_code_result(artifact: SourceArtifact, error: str | None) -> CodeParse
         imports=[],
         calls=[],
         references=[],
-        classes=[],
-        functions=[],
-        methods=[],
         comments=[],
         docstrings=[],
         errors=[error] if error else [],

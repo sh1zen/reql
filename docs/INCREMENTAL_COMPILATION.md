@@ -5,8 +5,9 @@ technical graph for programming agents from compile-time scanning plus AST/stati
 analysis.
 
 The scanner first runs read-only. It hashes the full content of every candidate
-file in a bounded worker pool and verifies that size and nanosecond modification
-time remain stable across each read. Unstable files are retried and then reported
+file and verifies that size and nanosecond modification time remain stable across
+each read. Zero- and one-file scans use a direct path; small repositories use two
+workers, while larger scans scale to at most eight workers. Unstable files are retried and then reported
 as scan errors rather than indexed from a mixed snapshot. The compiler compares fingerprints and
 project-local cache entries before graph writes, then registers only changed or
 deleted artifact deltas so unchanged project metadata is not rewritten.
@@ -41,6 +42,8 @@ project update PATH
   -> refresh context-scope metadata for dirty files or records missing that metadata
   -> compile changed supported code artifacts into technical graph nodes
   -> compile changed text document fragments structurally
+  -> refresh project-wide CSS findings once after all changed artifacts
+  -> derive structural links from indexed graph views and persist only differences
   -> link document fragments to code symbols
   -> archive fragments for deleted artifacts
   -> write .reql/artifact-cache.json and ArtifactCacheEntry graph records
@@ -88,7 +91,9 @@ project compile PATH --watch
 The watcher uses Python `watchdog` filesystem events. Treat it as monitor mode
 for active editing: run it from the agent's working directory, keep one watcher
 running, and query the maintained graph instead of launching repeated manual
-compile/rebuild loops.
+compile/rebuild loops. Events emitted by the configured storage, WAL, locks,
+usage sidecars, diagnostics output, and the project `.reql` cache are ignored so
+the watcher cannot trigger itself.
 
 Check watcher liveness without inspecting operating-system processes:
 
@@ -169,6 +174,9 @@ Node and edge writes are batched where the compiler can safely do so, including
 source fragments and cohesive code-graph groups. When storage resolves an
 upsert to an existing node through `canonical_key`, subsequent edges use the
 persisted node ID returned by the store rather than the candidate ID.
+Diagnostics split structural linking into load, derive, and persist spans, and
+report project-wide application-surface refresh and lexical-index finalization
+separately.
 
 Document-code linking is scoped when only document artifacts changed: only the
 dirty document fragments are relinked. If any code artifact changed, the linker

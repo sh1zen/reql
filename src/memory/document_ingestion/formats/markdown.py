@@ -6,7 +6,7 @@ import re
 from ...artifacts.models import SourceArtifact
 from ..base import BaseDocumentParser
 from ..metadata import line_offsets, make_fragment
-from ..models import DocumentFragment, DocumentParseResult
+from ..models import DocumentFragment, DocumentLink, DocumentParseResult, DocumentTable
 
 HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 WORDPRESS_HEADING_RE = re.compile(r"^(={1,3})\s*(\S.*?)\s*\1$")
@@ -27,8 +27,8 @@ class MarkdownParser(BaseDocumentParser):
         offsets = line_offsets(text)
         metadata = self.base_metadata(artifact)
         fragments: list[DocumentFragment] = []
-        links: list[dict[str, object]] = []
-        tables: list[dict[str, object]] = []
+        links: list[DocumentLink] = []
+        tables: list[DocumentTable] = []
         heading_stack: list[tuple[int, str, str]] = []
         title = self.title_from_path(artifact)
         current_heading_id: str | None = None
@@ -124,7 +124,13 @@ class MarkdownParser(BaseDocumentParser):
                     metadata={"parser": self.parser_name, "parent_heading_id": current_heading_id},
                 )
                 fragments.append(fragment)
-                tables.append({"fragment_id": fragment.id, "rows": max(0, len(table_lines) - 2), "columns": _table_columns(table_lines[0])})
+                tables.append(
+                    DocumentTable(
+                        fragment_id=fragment.id,
+                        rows=max(0, len(table_lines) - 2),
+                        columns=_table_columns(table_lines[0]),
+                    )
+                )
                 index += 1
                 continue
 
@@ -185,9 +191,9 @@ class MarkdownParser(BaseDocumentParser):
         )
 
 
-def _collect_references(fragment: DocumentFragment, links: list[dict[str, object]]) -> None:
+def _collect_references(fragment: DocumentFragment, links: list[DocumentLink]) -> None:
     for match in LINK_RE.finditer(fragment.text):
-        links.append({"source_fragment_id": fragment.id, "text": match.group(1), "uri": match.group(2)})
+        links.append(DocumentLink(source_fragment_id=fragment.id, text=match.group(1), uri=match.group(2)))
 
 
 def _is_block_start(lines: list[str], index: int) -> bool:

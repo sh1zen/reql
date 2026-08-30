@@ -1,7 +1,12 @@
 """Cleanup-specific context selection and planning."""
 from __future__ import annotations
 
-from ...common import *
+from collections import OrderedDict
+from typing import Any
+
+from .....domain.models import MemoryEdge, MemoryNode, MemorySubgraph, RankedNode
+from .....extraction.normalization import tokenize
+from ...common import _expanded_tokens
 
 
 class CleanupContextProjectionMixin:

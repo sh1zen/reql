@@ -62,7 +62,9 @@ buckets, selected property indexes, counters, and a block space map. Lexical
 postings live in a separate `lexical_index` record referenced by root-index
 version 3. Query sessions load both records; compile/update sessions defer the
 lexical record and append changed nodes to the WAL, so a small graph delta does
-not pay the full lexical-index startup cost. The deferred session tracks an exact
+not pay the full lexical-index startup cost. This also applies to a newly created
+store. Repeated updates to the same node are coalesced before the first query or
+checkpoint builds the postings. The deferred session tracks an exact
 old/new lexical overlay: an in-process query applies it before searching, rollback
 restores it transactionally, and an automatic checkpoint loads and folds it into
 the persisted postings once the WAL threshold is reached. Deferral therefore
@@ -86,6 +88,11 @@ The adapter keeps operational indexes available for deterministic graph access:
 This keeps retrieval, activation, cache inspection, project compilation, and
 common REQL query paths bounded without relying on SQL or a graph database
 service.
+
+Lexical postings include bounded identifier components (camelCase, snake_case,
+hyphenated names, and paths) plus conservative singular variants. Bounded
+searches rank posting scores before materializing records and only load a small
+candidate pool; unbounded callers retain the complete-result behavior.
 
 ## Data Locality
 
@@ -111,7 +118,7 @@ keeps more graph records in each page and improves page-cache density.
 The default block size intentionally matches common filesystem and cache use
 better than many tiny files while remaining simple to inspect and rewrite.
 
-## Inspection And Compaction
+## Inspection, Compaction, And Clean Rebuilds
 
 Use `reql storage inspect` to print block-level diagnostics for the selected
 storage file. The report includes block count, record count by kind,
@@ -128,6 +135,16 @@ command reloads the logical graph, writes a fresh compact generation, and
 reports generation id, block count, record count, and byte size before and after
 compaction. It does not delete archived graph records; retention policy remains
 a graph-level operation.
+
+Use `reql storage clear [PATH]` when archived records, compilation history, and
+other state that no longer belongs to the current project tree must be removed.
+REQL compiles `PATH` into a temporary block store while holding the destination
+writer lock, compacts and validates that clean generation, and atomically
+replaces the old store only after a successful compile. The artifact cache is
+rebuilt in the same maintenance window; failures restore the previous cache and
+leave the old store untouched. A successful clear also removes the old WAL and
+usage journal. With `--storage`, the explicitly selected store is replaced in
+full and should therefore not be shared by unrelated projects.
 
 ## Reader/Writer Locking
 

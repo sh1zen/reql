@@ -83,6 +83,8 @@ context, retrieve focused evidence, and keep working memory:
 ```bash
 reql project compile .
 reql project explain . --focus "payment workflow"
+reql project pipeline .
+reql project pipeline . --code
 reql query_context --query "payment service"
 reql query_memories --query "payment service" --limit 8 --json
 reql query_explore --query "payment service serialization" --view owners --view code
@@ -170,11 +172,13 @@ Start MCP when an integration needs a tool server:
 reql-mcp --read-only
 ```
 
-Project/cache commands default storage to `<project>/.reql/memory.reql`; other
-commands default to `./.reql/memory.reql`. Use `--storage`, `--config`, `--set`,
-and `--json` for automation. See [docs/CLI.md](docs/CLI.md) for the complete
-command reference, query modes, install behavior, MCP startup, config lookup,
-reports, exports, and maintenance workflows.
+Project/cache commands and `reql storage clear [PATH]` default storage to
+`<project>/.reql/memory.reql`; other commands default to
+`./.reql/memory.reql`. `storage clear` rebuilds that store from the current
+project tree and discards historical or archived graph state. Use `--storage`,
+`--config`, `--set`, and `--json` for automation. See [docs/CLI.md](docs/CLI.md)
+for the complete command reference, query modes, install behavior, MCP startup,
+config lookup, reports, exports, and maintenance workflows.
 
 ## Features
 
@@ -187,7 +191,7 @@ reports, exports, and maintenance workflows.
   findings, plans, risks, and links without contaminating the standard graph.
 - Local block-file persistence with fixed-size pages, compressed records,
   reader/writer lock diagnostics, safe stale-lock recovery, read-only snapshots,
-  transactions, and compaction.
+  transactions, compaction, and atomic clean rebuilds.
 - Incremental compilation cache with persistent compilation runs and graph deltas.
 - Artifact document parsing for Markdown, plain text, and PDF with graceful
   fallbacks.
@@ -200,8 +204,9 @@ reports, exports, and maintenance workflows.
   of file by file.
 - Deterministic community detection, hub analysis, and bridge analysis with
   generic-node penalties.
-- Markdown reports, JSON export, standalone `graph.html`, guided launcher,
-  installable CLI, typed Python API, and optional dependency-free MCP server.
+- Markdown reports, JSON export, standalone `graph.html`, interactive project
+  pipeline HTML and Mermaid export, guided launcher, installable CLI, typed
+  Python API, and optional dependency-free MCP server.
 
 ## Runtime Model
 
@@ -225,6 +230,9 @@ REQL works as a local repository index backed by a property graph:
   architectural layers, multi-evidence semantic workflows with explicit
   `implemented_by` participants, and focus-specific change guidance without
   persisting another graph or requiring an LLM;
+- `project pipeline` follows every detected entrypoint through project-local
+  flow relations, collapses symbols into shared architectural components, and
+  writes an interactive `pipeline.html` or Mermaid `pipeline.mmd`;
 - `project update` and watch mode reuse the same incremental compiler and write
   `CompilationRun`, `GraphDelta`, and cache records for changed or deleted
   artifacts.
@@ -454,6 +462,7 @@ Main operations:
 - `project_history(path)`
 - `project_revision(revision_id)`
 - `project_report(path, output_dir=...)`
+- `project_pipeline(path)`
 - `cache_status(path)`
 - `clear_cache(path)`
 - `list_deltas()`

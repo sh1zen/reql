@@ -4,9 +4,11 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections import Counter
+from functools import lru_cache
 
 _WORD_RE = re.compile(r"[\w\u00C0-\u017F][\w\u00C0-\u017F'\-]{1,}", re.UNICODE)
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\n+")
+_CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
 
 
 def strip_accents(value: str) -> str:
@@ -66,6 +68,62 @@ def _token_signal_score_stripped(token: str) -> float:
 def tokenize(value: str, *, keep_stopwords: bool = False) -> list[str]:
     tokens, _ = _tokenize_with_signal_scores(value, keep_stopwords=keep_stopwords)
     return tokens
+
+
+def identifier_expanded_text(value: str) -> str:
+    """Expose path and identifier components as ordinary lexical words."""
+
+    separated = str(value).replace("\\", " ").replace("/", " ").replace(".", " ")
+    separated = separated.replace("_", " ").replace("-", " ").replace(":", " ")
+    return _CAMEL_BOUNDARY_RE.sub(" ", separated)
+
+
+@lru_cache(maxsize=32768)
+def expanded_tokens(value: str) -> tuple[str, ...]:
+    """Return deterministic tokens including identifier and plural forms."""
+
+    tokens: list[str] = []
+    seen: set[str] = set()
+    for candidate in (value, identifier_expanded_text(value)):
+        for token in tokenize(candidate):
+            for variant in token_variants(token):
+                if variant not in seen:
+                    seen.add(variant)
+                    tokens.append(variant)
+    return tuple(tokens)
+
+
+def token_variants(token: str) -> tuple[str, ...]:
+    variants = [token]
+    singular = singular_token(token)
+    if singular and singular != token:
+        variants.append(singular)
+    return tuple(variants)
+
+
+@lru_cache(maxsize=32768)
+def singular_token(token: str) -> str | None:
+    if len(token) <= 3:
+        return None
+    if token.endswith("ies") and len(token) > 4:
+        return f"{token[:-3]}y"
+    if token.endswith("sses"):
+        return None
+    if token.endswith("ses") and len(token) > 4:
+        return token[:-2]
+    if token.endswith("s") and not token.endswith("ss"):
+        return token[:-1]
+    return None
+
+
+@lru_cache(maxsize=32768)
+def singular_source_variants(token: str) -> tuple[str, ...]:
+    """Return plural spellings whose normalized form is ``token``."""
+
+    candidates = {f"{token}s", f"{token}es"}
+    if token.endswith("y"):
+        candidates.add(f"{token[:-1]}ies")
+    return tuple(candidate for candidate in candidates if singular_token(candidate) == token)
 
 
 def _tokenize_with_signal_scores(value: str, *, keep_stopwords: bool = False) -> tuple[list[str], dict[str, float]]:
