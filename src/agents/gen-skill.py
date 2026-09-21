@@ -674,7 +674,7 @@ Every agent must leave the working roster when its pass ends, including single-a
 {command_name} agent finish "Focused tests passed; dashboard command ready"
 ```
 
-`agent finish` snapshots a final handoff, closes the current session, marks the bus identity completed, and deletes the private agent store. The compact handoff remains on the bus for the configured retention period. Reuse the same identity with `agent init` before starting another session.
+`agent finish` snapshots a final handoff, closes the current session, marks the bus identity completed, and deletes the private agent store. The compact handoff remains on the bus while its session is among the latest `retention.agent_sessions`. Reuse the same identity with `agent init` before starting another session.
 
 ## Dashboard Drill-down
 

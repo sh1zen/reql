@@ -222,15 +222,21 @@ class ConfigExclusionValidationTests(unittest.TestCase):
     def test_retention_defaults_and_overrides_are_validated(self) -> None:
         config = default_config()
 
-        self.assertEqual(config.retention.days, 30)
-        self.assertEqual(merge_config(config, {"retention.days": 0}).retention.days, 0)
+        self.assertEqual(config.retention.commits, 20)
+        self.assertEqual(config.retention.agent_sessions, 20)
+        self.assertEqual(merge_config(config, {"retention.commits": 5}).retention.commits, 5)
         with self.assertRaisesRegex(
             ValueError,
-            "retention.days must be zero or greater",
+            "retention.commits must be greater than zero",
         ):
-            merge_config(config, {"retention.days": -1})
-        with self.assertRaisesRegex(ValueError, "retention.days must be an integer"):
-            merge_config(config, {"retention.days": "30"})
+            merge_config(config, {"retention.commits": 0})
+        with self.assertRaisesRegex(ValueError, "retention.commits must be an integer"):
+            merge_config(config, {"retention.commits": "20"})
+        with self.assertRaisesRegex(
+            ValueError,
+            "retention.agent_sessions must be zero or greater",
+        ):
+            merge_config(config, {"retention.agent_sessions": -1})
 
     def test_config_merge_deduplicates_equivalent_rules_but_keeps_anchor(self) -> None:
         with tempfile.TemporaryDirectory() as td:

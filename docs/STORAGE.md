@@ -134,8 +134,9 @@ automatic checkpoints and bounded WAL replay are part of normal operation. The
 command reloads the logical graph, writes a fresh compact generation, and
 reports generation id, block count, record count, and byte size before and after
 compaction. It does not itself delete archived graph records. Successful
-compile/update operations enforce the graph-level `retention.days` policy and
-invoke compaction only when they actually remove graph records.
+compile/update operations that create a changed-manifest `ProjectRevision`
+enforce the graph-level `retention.commits` policy and invoke compaction only
+when they actually remove graph records.
 
 Use `reql storage clear [PATH]` when archived records, compilation history, and
 other state that no longer belongs to the current project tree must be removed.
@@ -158,8 +159,8 @@ and initialization does not open the canonical store.
 Completed agents do not retain private stores. `agent finish` publishes a
 compact bus handoff, closes the store, and removes its block file and sidecars.
 Agent init/finish reconcile known completed stores and retain bus identities,
-messages, and handoffs only for `retention.days`; active and unregistered files
-are not removed.
+messages, and handoffs for the latest `retention.agent_sessions` completed
+sessions; active sessions and unregistered files are not removed.
 
 ## Reader/Writer Locking
 

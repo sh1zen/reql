@@ -18,7 +18,7 @@ class AutomaticRetentionTests(unittest.TestCase):
             project.mkdir()
             source = project / "old.py"
             source.write_text("value = 1\n", encoding="utf-8")
-            config = merge_config(default_config(), {"retention.days": 0})
+            config = merge_config(default_config(), {"retention.commits": 1})
             storage = root / "memory.reql"
             graph = MemoryGraph.open(storage, config=config)
             try:
@@ -86,6 +86,34 @@ class AutomaticRetentionTests(unittest.TestCase):
                 self.assertIsNotNone(reopened.get_node("other:archived"))
             finally:
                 reopened.close()
+
+    def test_retention_counts_changed_project_revisions_not_compile_invocations(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            project = root / "project"
+            project.mkdir()
+            source = project / "version.py"
+            config = merge_config(default_config(), {"retention.commits": 20})
+            graph = MemoryGraph.open(root / "memory.reql", config=config)
+            try:
+                for version in range(21):
+                    source.write_text(f"value = {version}\n", encoding="utf-8")
+                    result = graph.compile_project(project)
+                    self.assertIsNotNone(result.revision)
+
+                revisions = graph.project_history(project, limit=30)
+                self.assertEqual(len(revisions), 20)
+                self.assertEqual([revision.sequence for revision in revisions], list(range(21, 1, -1)))
+
+                no_op = graph.compile_project(project)
+
+                self.assertIsNone(no_op.revision)
+                self.assertIsNone(no_op.retention)
+                self.assertEqual(len(graph.project_history(project, limit=30)), 20)
+                self.assertEqual(graph.store.count_nodes(node_types={"CompilationRun"}), 21)
+                self.assertEqual(graph.store.count_nodes(node_types={"GraphDelta"}), 21)
+            finally:
+                graph.close()
 
 
 if __name__ == "__main__":

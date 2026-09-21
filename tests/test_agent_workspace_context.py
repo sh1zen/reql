@@ -282,15 +282,16 @@ class AgentWorkspaceContextTests(unittest.TestCase):
             self.assertTrue(active.paths.agent_storage.exists())
             self.assertTrue(unknown.exists())
 
-    def test_zero_day_retention_prunes_completed_bus_records_on_next_init(self) -> None:
+    def test_zero_session_retention_prunes_completed_bus_records_on_next_init(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             standard = root / "memory.reql"
             bus = root / "bus.reql"
             completed = AgentWorkspace(standard, agent_id="completed", bus_storage=bus)
             completed.init()
+            completed.start_session("Short-lived session")
             completed.finish("short-lived handoff")
-            immediate = merge_config(default_config(), {"retention.days": 0})
+            immediate = merge_config(default_config(), {"retention.agent_sessions": 0})
 
             cleaner = AgentWorkspace(standard, agent_id="cleaner", bus_storage=bus, config=immediate)
             cleanup = cleaner.init()["retention"]
@@ -299,6 +300,47 @@ class AgentWorkspaceContextTests(unittest.TestCase):
             self.assertGreater(cleanup["records_removed"], 0)
             self.assertNotIn("completed", {item["agent_id"] for item in current_bus["agents"]})
             self.assertNotIn("short-lived handoff", {item["content"] for item in current_bus["handoffs"]})
+
+    def test_agent_retention_keeps_latest_completed_sessions_with_their_bus_records(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            standard = root / "memory.reql"
+            bus = root / "bus.reql"
+            config = merge_config(default_config(), {"retention.agent_sessions": 2})
+
+            for agent_id in ("first", "second", "third"):
+                workspace = AgentWorkspace(
+                    standard,
+                    agent_id=agent_id,
+                    bus_storage=bus,
+                    config=config,
+                )
+                workspace.init()
+                workspace.start_session(f"{agent_id} session")
+                workspace.dashboard(post=f"{agent_id} message")
+                workspace.finish(f"{agent_id} handoff")
+
+            reader = AgentWorkspace(
+                standard,
+                agent_id="reader",
+                bus_storage=bus,
+                config=config,
+            )
+            reader.init()
+            current_bus = reader.bus(include_payloads=True)
+
+            self.assertEqual(
+                {item["agent_id"] for item in current_bus["agents"]},
+                {"reader", "second", "third"},
+            )
+            self.assertEqual(
+                {item["content"] for item in current_bus["messages"]},
+                {"second message", "third message"},
+            )
+            self.assertEqual(
+                {item["content"] for item in current_bus["handoffs"]},
+                {"second handoff", "third handoff"},
+            )
 
     def test_dashboard_rejects_long_posts_to_keep_shared_state_compact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:

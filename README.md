@@ -207,11 +207,14 @@ project tree and discards historical or archived graph state. Use `--storage`,
 for the complete command reference, query modes, install behavior, MCP startup,
 config lookup, reports, exports, and maintenance workflows.
 
-Automatic maintenance uses `retention.days` from `reql.conf` (default `30`).
-Successful compile/update operations remove expired project history, archived
-records, and project-owned usage entries while preserving the active graph and
-newest successful history. Agent init/finish removes expired bus coordination
-records, and finish removes the completed agent's private store immediately.
+Automatic project maintenance uses `retention.commits` from `reql.conf`
+(default `20`). A REQL commit is a successful compile/update that changes the
+project manifest and creates a `ProjectRevision`; clean compile invocations do
+not advance retention. When the limit is exceeded, REQL removes history,
+archived records, and project-owned usage entries older than the oldest retained
+commit while preserving the active graph. Agent coordination records retain
+the latest `retention.agent_sessions` completed sessions (default `20`), and
+finish removes the completed agent's private store immediately.
 
 ## Features
 

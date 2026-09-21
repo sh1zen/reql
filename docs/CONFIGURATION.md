@@ -57,7 +57,8 @@ diagnostics:
   path: ""
 
 retention:
-  days: 30
+  commits: 20
+  agent_sessions: 20
 ```
 
 ## Behavior
@@ -114,10 +115,16 @@ retention:
   provided.
 - `diagnostics.enabled` controls structured JSONL performance logging.
   `diagnostics.path` is required when diagnostics are enabled.
-- `retention.days` is the non-negative age limit for superseded project
-  history, archived graph records, project-owned usage events, and completed
-  agent-bus records. The default is `30`; `0` makes eligible data removable on
-  the next successful compile/update or agent lifecycle maintenance pass.
+- `retention.commits` is the positive number of meaningful project versions to
+  retain. A REQL commit is a successful compile/update that changes the project
+  manifest and creates a `ProjectRevision`; a clean compile does not count.
+  The default is `20`. When a new commit exceeds the limit, older project
+  history, archived graph records, and project-owned usage events become
+  eligible for removal.
+- `retention.agent_sessions` is the non-negative number of completed agent
+  sessions retained on the shared bus. The default is `20`. Identity, handoff,
+  and message records owned by older completed sessions are removed together;
+  active sessions are never removed.
 
 REQL never downloads parser dependencies at runtime. Project compile and
 document processing are deterministic local operations.

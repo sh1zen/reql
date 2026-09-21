@@ -1,8 +1,8 @@
-"""Project-scoped retention for superseded graph and usage history."""
+"""Commit-count retention for superseded project graph and usage history."""
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import Any
 
 from ..domain.models import MemoryEdge, MemoryNode
@@ -38,21 +38,36 @@ def prune_project_data(
     store: GraphStore,
     *,
     project_id: str,
-    retention_days: int,
-    now: datetime | None = None,
+    retention_commits: int,
 ) -> RetentionCleanupResult:
-    """Prune expired data owned by one project and compact after graph deletion."""
+    """Prune data older than the project's retained meaningful compile commits."""
 
-    cutoff_dt = (now or utcnow()) - timedelta(days=retention_days)
+    if retention_commits < 1:
+        raise ValueError("retention_commits must be greater than zero")
+    nodes = store.all_nodes()
+    revisions = sorted(
+        (
+            node
+            for node in nodes
+            if node.type == "ProjectRevision"
+            and str(node.properties.get("project_id") or "") == project_id
+        ),
+        key=_revision_order,
+        reverse=True,
+    )
+    oldest_retained = revisions[min(len(revisions), retention_commits) - 1]
+    cutoff_dt = _node_timestamp(oldest_retained)
     cutoff = cutoff_dt.isoformat()
     result = RetentionCleanupResult(cutoff=cutoff, project_id=project_id)
-    nodes = store.all_nodes()
+    if len(revisions) <= retention_commits:
+        return result
+
     project_node_ids = {
         node.id
         for node in nodes
         if node.id == project_id or str(node.properties.get("project_id") or "") == project_id
     }
-    protected_history = _newest_history_ids(nodes, project_id)
+    protected_history = _retained_history_ids(nodes, revisions[:retention_commits])
     removal_ids = {
         node.id
         for node in nodes
@@ -87,19 +102,27 @@ def prune_project_data(
     return result
 
 
-def _newest_history_ids(nodes: list[MemoryNode], project_id: str) -> set[str]:
-    protected: set[str] = set()
-    for node_type in HISTORY_NODE_TYPES:
-        candidates = [
-            node
-            for node in nodes
-            if node.type == node_type
-            and str(node.properties.get("project_id") or "") == project_id
-            and (node_type != "CompilationRun" or node.properties.get("status") == "completed")
-        ]
-        if candidates:
-            protected.add(max(candidates, key=_node_timestamp).id)
-    return protected
+def _retained_history_ids(
+    nodes: list[MemoryNode],
+    retained_revisions: list[MemoryNode],
+) -> set[str]:
+    """Return retained revisions plus their originating runs and deltas."""
+
+    retained_revision_ids = {revision.id for revision in retained_revisions}
+    retained_run_ids = {
+        str(revision.properties.get("run_id") or "")
+        for revision in retained_revisions
+    }
+    return {
+        node.id
+        for node in nodes
+        if node.id in retained_run_ids
+        or node.id in retained_revision_ids
+        or (
+            node.type == "GraphDelta"
+            and str(node.properties.get("run_id") or "") in retained_run_ids
+        )
+    }
 
 
 def _expired_project_node(
@@ -143,6 +166,12 @@ def _node_timestamp(node: MemoryNode) -> datetime:
         if parsed is not None:
             return parsed
     return utcnow()
+
+
+def _revision_order(node: MemoryNode) -> tuple[int, datetime, str]:
+    """Order project revisions by their monotonic sequence with stable fallbacks."""
+
+    return (int(node.properties.get("sequence") or 0), _node_timestamp(node), node.id)
 
 
 def _edge_timestamp(edge: MemoryEdge) -> datetime:

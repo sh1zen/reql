@@ -83,4 +83,5 @@ diagnostics:
   path: ""
 
 retention:
-  days: 30
+  commits: 20
+  agent_sessions: 20

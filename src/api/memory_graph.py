@@ -100,7 +100,7 @@ class MemoryGraph:
         self.incremental = IncrementalCompilationService(
             store,
             compile_options=CompilationOptions.from_config(self.config),
-            retention_days=self.config.retention.days,
+            retention_commits=self.config.retention.commits,
             profile_logger=profile_logger,
         )
         self.project_watcher = ProjectWatchService(self.incremental)

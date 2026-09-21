@@ -5,7 +5,6 @@ import os
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -15,7 +14,7 @@ from memory.config import REQLConfig, default_config
 from memory.domain.exceptions import StorageError
 from memory.domain.ids import stable_id
 from memory.domain.models import MemoryEdge, MemoryNode
-from memory.domain.timeutils import parse_dt, utcnow, utcnow_iso
+from memory.domain.timeutils import parse_dt, utcnow_iso
 from memory.storage import BlockGraphStore, StoreLease, inspect_store_locks
 
 AGENT_STORAGE_FILE = "agent.reql"
@@ -123,7 +122,7 @@ class AgentWorkspace:
         return self.paths.agent_storage.exists() and self.paths.agent_storage.stat().st_size > 0
 
     def init(self) -> dict[str, Any]:
-        cleanup = self._prune_expired_bus(exclude_agent_ids={self.agent_id})
+        cleanup = self._prune_bus_sessions(exclude_agent_ids={self.agent_id})
         init_lease = self.paths.agent_storage.with_name(f"{self.paths.agent_storage.name}.init")
         with StoreLease(init_lease, timeout_seconds=AGENT_READ_LOCK_TIMEOUT_SECONDS):
             already_initialized = self.exists()
@@ -760,7 +759,11 @@ class AgentWorkspace:
 
         if not self.exists():
             raise ValueError("Agent workspace is not initialized. Run `reql agent init` first.")
-        handoff = self.handoff(summary or f"Finished work for {self.agent_id}", target="all")
+        handoff = self._handoff(
+            summary or f"Finished work for {self.agent_id}",
+            target="all",
+            final=True,
+        )
         graph = self._require_agent()
         closed_session = None
         try:
@@ -789,16 +792,17 @@ class AgentWorkspace:
                     graph.store.update_node_fields(workspace.id, properties=workspace_properties)
         finally:
             graph.close()
-        self._register_agent(status="completed")
+        self._register_agent(status="completed", session_id=closed_session)
         private_cleanup = self._remove_agent_store()
-        bus_cleanup = self._prune_expired_bus()
+        bus_cleanup = self._prune_bus_sessions()
         return {
             "agent_id": self.agent_id,
             "status": "completed",
             "closed_session_id": closed_session,
             "handoff": handoff["handoff"],
             "retention": {
-                "cutoff": bus_cleanup["cutoff"],
+                "session_limit": bus_cleanup["session_limit"],
+                "sessions_removed": bus_cleanup["sessions_removed"],
                 "files_removed": private_cleanup["files_removed"] + bus_cleanup["files_removed"],
                 "records_removed": bus_cleanup["records_removed"],
                 "bytes_reclaimed": private_cleanup["bytes_reclaimed"] + bus_cleanup["bytes_reclaimed"],
@@ -914,6 +918,7 @@ class AgentWorkspace:
             raise ValueError("Agent bus message must not be empty")
         kind = kind.strip().casefold() or "note"
         target = target.strip() or "all"
+        session_id = self._active_session_id()
         graph = self._ensure_bus()
         try:
             with graph.store.transaction():
@@ -932,6 +937,7 @@ class AgentWorkspace:
                         "target_agent_id": target,
                         "content": content,
                         "title": self._title_from_content(content),
+                        "session_id": session_id,
                     },
                     status="active",
                     created_at=now,
@@ -945,7 +951,21 @@ class AgentWorkspace:
         finally:
             graph.close()
 
-    def handoff(self, summary: str | None = None, *, target: str = DEFAULT_AGENT_ID) -> dict[str, Any]:
+    def handoff(
+        self,
+        summary: str | None = None,
+        *,
+        target: str = DEFAULT_AGENT_ID,
+    ) -> dict[str, Any]:
+        return self._handoff(summary, target=target, final=False)
+
+    def _handoff(
+        self,
+        summary: str | None,
+        *,
+        target: str,
+        final: bool,
+    ) -> dict[str, Any]:
         target = target.strip() or DEFAULT_AGENT_ID
         summary_text = (summary or "").strip()
         try:
@@ -954,6 +974,8 @@ class AgentWorkspace:
             snapshot = self.map()
         if not summary_text:
             summary_text = f"Handoff from {self.agent_id}"
+        current_session = snapshot.get("context", {}).get("sessions", {}).get("current")
+        session_id = str(current_session.get("id") or "") if current_session else ""
         graph = self._ensure_bus()
         try:
             with graph.store.transaction():
@@ -972,6 +994,8 @@ class AgentWorkspace:
                         "content": summary_text,
                         "title": self._title_from_content(summary_text),
                         "payload": snapshot,
+                        "session_id": session_id or None,
+                        "is_final": final,
                     },
                     status="active",
                     created_at=now,
@@ -1291,20 +1315,20 @@ class AgentWorkspace:
         safe = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in agent_id)
         return safe.strip("._") or "agent"
 
-    def _register_agent(self, *, status: str) -> None:
+    def _register_agent(self, *, status: str, session_id: str | None = None) -> None:
         graph = self._ensure_bus()
         try:
             with graph.store.transaction():
-                self._register_agent_in_graph(graph, status=status)
+                self._register_agent_in_graph(graph, status=status, session_id=session_id)
         finally:
             graph.close()
 
-    def _prune_expired_bus(self, *, exclude_agent_ids: set[str] | None = None) -> dict[str, Any]:
-        """Prune expired coordination records and completed private stores."""
+    def _prune_bus_sessions(self, *, exclude_agent_ids: set[str] | None = None) -> dict[str, Any]:
+        """Retain the latest completed sessions and remove their older bus records."""
 
-        cutoff_dt = utcnow() - timedelta(days=self.config.retention.days)
         result: dict[str, Any] = {
-            "cutoff": cutoff_dt.isoformat(),
+            "session_limit": self.config.retention.agent_sessions,
+            "sessions_removed": 0,
             "files_removed": 0,
             "records_removed": 0,
             "bytes_reclaimed": 0,
@@ -1334,11 +1358,17 @@ class AgentWorkspace:
                 result["files_removed"] += cleanup["files_removed"]
                 result["bytes_reclaimed"] += cleanup["bytes_reclaimed"]
 
-            expired_ids = {
-                node.id
-                for node in nodes
-                if self._expired_bus_node(node, cutoff_dt)
-            }
+            completed_sessions = self._completed_bus_session_ids(nodes)
+            expired_sessions = set(completed_sessions[self.config.retention.agent_sessions :])
+            result["sessions_removed"] = len(expired_sessions)
+            expired_ids = set()
+            for node in nodes:
+                session_id = str(node.properties.get("session_id") or "")
+                if session_id not in expired_sessions:
+                    continue
+                if node.type == "agent" and node.status == "active":
+                    continue
+                expired_ids.add(node.id)
             edge_ids = {
                 edge.id
                 for edge in graph.store.all_edges()
@@ -1360,18 +1390,30 @@ class AgentWorkspace:
             graph.close()
 
     @staticmethod
-    def _expired_bus_node(node: MemoryNode, cutoff: datetime) -> bool:
-        if node.type not in {"agent", "bus_message", "handoff"}:
-            return False
-        if node.type == "agent" and node.status == "active":
-            return False
-        try:
-            timestamp = parse_dt(node.updated_at) or parse_dt(node.created_at)
-        except ValueError:
-            return False
-        return timestamp is not None and timestamp < cutoff
+    def _completed_bus_session_ids(nodes: list[MemoryNode]) -> list[str]:
+        """Return completed session ids newest first from authoritative final handoffs."""
 
-    def _register_agent_in_graph(self, graph: MemoryGraph, *, status: str, updated_at: str | None = None) -> MemoryNode:
+        final_handoffs = sorted(
+            (
+                node
+                for node in nodes
+                if node.type == "handoff"
+                and node.properties.get("is_final") is True
+                and node.properties.get("session_id")
+            ),
+            key=lambda node: (node.updated_at, node.created_at, node.id),
+            reverse=True,
+        )
+        return list(dict.fromkeys(str(node.properties["session_id"]) for node in final_handoffs))
+
+    def _register_agent_in_graph(
+        self,
+        graph: MemoryGraph,
+        *,
+        status: str,
+        session_id: str | None = None,
+        updated_at: str | None = None,
+    ) -> MemoryNode:
         now = updated_at or utcnow_iso()
         bus_node = self._bus_workspace_node(graph, now)
         bus_props = dict(bus_node.properties)
@@ -1383,6 +1425,7 @@ class AgentWorkspace:
         existing = graph.get_node(node_id)
         props = dict(existing.properties) if existing is not None else {}
         props.pop("standard_storage", None)
+        props.pop("session_id", None)
         props.update(
             {
                 "source": "bus",
@@ -1396,6 +1439,8 @@ class AgentWorkspace:
                 "selection_source": self.selection_source,
             }
         )
+        if session_id:
+            props["session_id"] = session_id
         node = MemoryNode(
             id=node_id,
             type="agent",
@@ -1411,6 +1456,18 @@ class AgentWorkspace:
         )
         stored, _ = graph.add_node(node)
         return stored
+
+    def _active_session_id(self) -> str | None:
+        """Read the current private session id for bus-record ownership."""
+
+        if not self.exists():
+            return None
+        graph = self._require_agent(read_only=True)
+        try:
+            workspace = graph.get_node(WORKSPACE_NODE_ID)
+            return self._current_session_id(workspace) if workspace is not None else None
+        finally:
+            graph.close()
 
     def _agent_store_files(self, base: Path) -> Iterable[Path]:
         yield base

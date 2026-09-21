@@ -117,12 +117,12 @@ class IncrementalCompilationService:
         parser_version: str = DEFAULT_PARSER_VERSION,
         chunking_version: str = DEFAULT_CHUNKING_VERSION,
         compile_options: RawCompilationOptions = None,
-        retention_days: int = 30,
+        retention_commits: int = 20,
         profile_logger: PerformanceLogger | None = None,
     ) -> None:
         self.store = store
         self.profile_logger = profile_logger
-        self.retention_days = retention_days
+        self.retention_commits = retention_commits
         self.project_registry = ProjectRegistry(store)
         self.default_options = normalize_compilation_options(compile_options)
         self.compiler = compiler or ArtifactCompiler(options=self.default_options)
@@ -238,16 +238,20 @@ class IncrementalCompilationService:
         if cache_enabled and pending_disk_entries:
             cache.persist_disk_entries(pending_disk_entries)
         retention = None
-        if run.status == "completed":
+        if revision is not None:
             with (
-                profile.span("compile.retention", project_id=scan.project.id, days=self.retention_days)
+                profile.span(
+                    "compile.retention",
+                    project_id=scan.project.id,
+                    commits=self.retention_commits,
+                )
                 if profile
                 else nullcontext()
             ):
                 retention = prune_project_data(
                     self.store,
                     project_id=scan.project.id,
-                    retention_days=self.retention_days,
+                    retention_commits=self.retention_commits,
                 )
         checkpoint = self._checkpoint_store_if_needed(profile)
 

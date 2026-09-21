@@ -110,12 +110,13 @@ class DiagnosticsConfig:
 
 @dataclass(frozen=True, slots=True)
 class RetentionConfig:
-    """Retention policy for superseded project and completed agent data."""
+    """Count-based retention for project commits and completed agent sessions."""
 
-    days: int
+    commits: int
+    agent_sessions: int
 
     def to_dict(self) -> dict[str, Any]:
-        return {"days": self.days}
+        return {"commits": self.commits, "agent_sessions": self.agent_sessions}
 
 
 @dataclass(frozen=True, slots=True)
@@ -365,5 +366,7 @@ def _validate(config: REQLConfig) -> None:
         )
     if config.diagnostics.enabled and not config.diagnostics.path.strip():
         raise ValueError("Config option diagnostics.path must not be empty when diagnostics.enabled is true")
-    if config.retention.days < 0:
-        raise ValueError("Config option retention.days must be zero or greater")
+    if config.retention.commits < 1:
+        raise ValueError("Config option retention.commits must be greater than zero")
+    if config.retention.agent_sessions < 0:
+        raise ValueError("Config option retention.agent_sessions must be zero or greater")

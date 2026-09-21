@@ -204,10 +204,11 @@ inter-session continuity, and points deeper reads back to the authoritative
 private item, session map, handoff payload, or canonical project query.
 `reql agent finish` publishes the final handoff, closes the current session,
 changes the bus identity from active to completed, and deletes the private
-agent store and sidecars. The compact bus handoff remains available for
-`retention.days`; reusing the identity requires `agent init`. Init and finish
-also remove completed private stores and prune expired bus records without
-touching active or unregistered stores.
+agent store and sidecars. The compact bus handoff remains available while its
+session is among the latest `retention.agent_sessions`; reusing the identity
+requires `agent init`. Init and finish also remove completed private stores and
+prune older completed-session bus records without touching active or
+unregistered stores.
 
 The canonical CLI writes typed notes through `agent note add` and `note.add`
 batch operations. `dashboard --agents` owns explicit cross-store inspection,
@@ -226,10 +227,13 @@ activation and usage signals
 Salience ranks project and source graph records from structural, retrieval, and
 usage signals.
 
-After each successful compile/update, project-scoped retention removes expired
-run, delta, revision, archived graph, and usage-journal data. It preserves the
-active graph and newest successful history set, skips failed compiles, and
-compacts storage only when graph records were removed.
+After each successful compile/update that creates a changed-manifest
+`ProjectRevision`, project-scoped retention keeps the latest
+`retention.commits` REQL commits and removes run, delta, revision, archived
+graph, and usage-journal data before that commit boundary. It preserves the
+active graph and retained commits' associated history, does not advance on
+clean or failed compiles, and compacts storage only when graph records were
+removed.
 
 ## Analysis
 

@@ -314,8 +314,9 @@ reql agent finish "Focused tests passed; serializer fix ready"
 `agent finish` snapshots a final handoff to the shared bus, closes the current
 session, marks the agent completed so it disappears from the dashboard's
 working roster, and removes its private store and sidecars. The compact final
-handoff remains on the bus for `retention.days`. Reuse the identity with
-`agent init` before starting another session.
+handoff remains on the bus while its completed session is among the latest
+`retention.agent_sessions`. Reuse the identity with `agent init` before starting
+another session.
 
 `agent bus` lists registered agents, bus messages, and handoffs. Its JSON
 output omits handoff payload snapshots by default so old handoffs stay compact;
@@ -526,11 +527,14 @@ counts, compression ratio, dense-node count, manifest fields, WAL status, and
 logical index sizes. `storage compact` rewrites the current logical graph into a
 new compact storage generation.
 
-Successful `project compile` and `project update` commands automatically prune
-project-owned history, archived records, and usage events older than
-`retention.days`. The current graph and newest successful run, delta, and
-revision are always retained. Cleanup counts appear in JSON output and in human
-output when data was removed.
+When `project compile` or `project update` creates a changed-manifest
+`ProjectRevision`, it is a REQL commit. REQL retains the latest
+`retention.commits` commits (default `20`) and automatically prunes older
+project-owned history, archived records, and usage events at that commit
+boundary. Clean compile invocations do not advance the retention window. The
+current graph and retained commits' runs, deltas, and revisions remain
+available. Cleanup counts appear in JSON output and in human output when data
+was removed.
 
 `storage clear [PATH]` performs a clean build of the current project in a
 temporary store, then atomically replaces the selected `memory.reql` only after

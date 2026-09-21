@@ -156,13 +156,16 @@ During a run the compiler aggregates these IDs in internal sets to avoid
 duplicate list growth. The persisted and public `GraphDelta` record still uses
 ordered lists with the same field names.
 
-After a successful run, retention removes project-owned `CompilationRun`,
-`GraphDelta`, `ProjectRevision`, archived/deleted graph records, and usage
-journal entries older than `retention.days`. The newest successful run, delta,
-and revision remain even beyond the cutoff. Failed runs do not trigger cleanup;
-shared stores retain data and mixed usage-event entries owned by other
-projects. A graph deletion triggers one compact rewrite so tombstones and old
-pages do not remain as wasted disk space.
+A successful run that changes the project manifest creates a `ProjectRevision`
+and is a REQL commit. After such a commit, retention keeps the latest
+`retention.commits` revisions (default `20`) and removes older project-owned
+`CompilationRun`, `GraphDelta`, `ProjectRevision`, archived/deleted graph
+records, and usage-journal entries. Clean runs still persist their run and
+delta records but do not advance or trigger the commit-count window. Failed
+runs do not trigger cleanup; shared stores retain data and mixed usage-event
+entries owned by other projects. The runs and deltas associated with retained
+commits are protected. A graph deletion triggers one compact rewrite so
+tombstones and old pages do not remain as wasted disk space.
 
 Supported code artifacts produce deterministic technical nodes such as
 `Module`, `Package`, `Class`, `Interface`, `Function`, `Method`, meaningful
