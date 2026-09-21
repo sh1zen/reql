@@ -340,6 +340,7 @@ class IncrementalCompilationTests(unittest.TestCase):
         self.assertEqual(result.run.status, "failed")
         self.assertTrue(result.run.errors)
         self.assertIsNone(result.revision)
+        self.assertIsNone(result.retention)
         self.assertEqual(len(self.graph.project_history(self.root)), 1)
         self.assertIsNotNone(new_cache)
         assert new_cache is not None

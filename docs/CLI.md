@@ -170,7 +170,7 @@ integrations. Each CLI agent gets its own private memory store under
 `.reql/agents/` and all agents share a small internal bus in
 `.reql/agent-bus.reql`. Explicit agent selection has highest precedence;
 otherwise a stable activity/thread id deterministically selects the private
-workspace. The legacy `master` workspace is used only when selection is
+workspace. An implicit default workspace is used only when selection is
 unambiguous.
 The canonical graph in `.reql/memory.reql` is the sole source of repository,
 file, symbol, and relationship facts. Agent memory never copies, derives, links,
@@ -312,9 +312,10 @@ reql agent finish "Focused tests passed; serializer fix ready"
 ```
 
 `agent finish` snapshots a final handoff to the shared bus, closes the current
-session, and marks the agent completed so it disappears from the dashboard's
-working roster. It preserves open tasks and durable history for inter-session
-recovery. A later `agent session start` marks that agent active again.
+session, marks the agent completed so it disappears from the dashboard's
+working roster, and removes its private store and sidecars. The compact final
+handoff remains on the bus for `retention.days`. Reuse the identity with
+`agent init` before starting another session.
 
 `agent bus` lists registered agents, bus messages, and handoffs. Its JSON
 output omits handoff payload snapshots by default so old handoffs stay compact;
@@ -325,12 +326,9 @@ the master bus, so the master can make choices from saved open tasks,
 decisions, plans, risks, and essential relationships without opening the
 worker's private store directly.
 
-`agent overview`, `agent publish`, and standalone `agent link-many` are
-deprecated compatibility aliases. They print a warning on stderr and preserve
-their existing result on stdout so scripts can migrate safely. New callers use
-`dashboard --agents`, `dashboard --post`, and `batch --link-many`. Generic
-`agent add` is removed; use typed `agent note add`. Batch JSON likewise uses
-`note.add` rather than `add`.
+Use `dashboard --agents` for detailed agent state, `dashboard --post` for bus
+updates, and `batch --link-many` for multi-target links. Operational notes use
+typed `agent note add`; batch JSON uses `note.add`.
 
 `agent list` keeps relation output focused on agent-created relations and,
 when node filters are present, relations connected to the listed nodes.
@@ -527,6 +525,12 @@ reql export --html --json --out reql-graph-out
 counts, compression ratio, dense-node count, manifest fields, WAL status, and
 logical index sizes. `storage compact` rewrites the current logical graph into a
 new compact storage generation.
+
+Successful `project compile` and `project update` commands automatically prune
+project-owned history, archived records, and usage events older than
+`retention.days`. The current graph and newest successful run, delta, and
+revision are always retained. Cleanup counts appear in JSON output and in human
+output when data was removed.
 
 `storage clear [PATH]` performs a clean build of the current project in a
 temporary store, then atomically replaces the selected `memory.reql` only after

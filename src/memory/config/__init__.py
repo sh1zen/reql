@@ -1,10 +1,10 @@
 """REQL configuration loading."""
 from .loader import (
     CONFIG_FILENAME,
-    LOCAL_CONFIG_FILENAME,
-    PROJECT_CONFIG_FILENAME,
     CONFIG_OVERRIDES_ENV,
     CONFIG_PATH_ENV,
+    LOCAL_CONFIG_FILENAME,
+    PROJECT_CONFIG_FILENAME,
     ConfigError,
     canonical_config_path,
     default_config,
@@ -25,22 +25,27 @@ from .models import (
     CompileConfig,
     DiagnosticsConfig,
     ProjectConfig,
-    REQLConfig,
     ReportingConfig,
+    REQLConfig,
+    RetentionConfig,
     ScanConfig,
     config_from_mapping,
     merge_config,
     normalize_scan_path_pattern,
 )
-from .path_rules import ScanExcludeRule, normalize_scan_exclude_pattern, resolve_scan_exclude_pattern
+from .path_rules import (
+    ScanExcludeRule,
+    normalize_scan_exclude_pattern,
+    resolve_scan_exclude_pattern,
+)
 
 __all__ = [
-    "AnalysisConfig",
     "CONFIG_FILENAME",
-    "LOCAL_CONFIG_FILENAME",
-    "PROJECT_CONFIG_FILENAME",
     "CONFIG_OVERRIDES_ENV",
     "CONFIG_PATH_ENV",
+    "LOCAL_CONFIG_FILENAME",
+    "PROJECT_CONFIG_FILENAME",
+    "AnalysisConfig",
     "CacheConfig",
     "CompileConfig",
     "ConfigError",
@@ -48,6 +53,7 @@ __all__ = [
     "ProjectConfig",
     "REQLConfig",
     "ReportingConfig",
+    "RetentionConfig",
     "ScanConfig",
     "ScanExcludeRule",
     "canonical_config_path",
@@ -59,12 +65,12 @@ __all__ = [
     "load_project_config_data",
     "merge_config",
     "merge_overrides",
-    "normalize_scan_path_pattern",
     "normalize_scan_exclude_pattern",
+    "normalize_scan_path_pattern",
     "parse_config_override_assignment",
     "parse_config_override_assignments",
     "parse_config_overrides",
-    "resolve_scan_exclude_pattern",
     "resolve_config_path",
+    "resolve_scan_exclude_pattern",
     "write_sample_config",
 ]

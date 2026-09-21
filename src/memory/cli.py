@@ -5,11 +5,14 @@ import argparse
 import json
 import os
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from threading import Event
-from typing import Any, Callable
+from typing import Any
+
+from api.memory_graph import MemoryGraph
 
 from .agent.progress import ProgressingAgentWorkspace
 from .artifacts.options import CompilationOptions
@@ -27,14 +30,17 @@ from .config import (
 )
 from .diagnostics import PerformanceLogger
 from .domain.exceptions import StorageError
-from .domain.query_context import DEFAULT_MAX_DEPTH, DEFAULT_MAX_ITEMS, DEFAULT_TOP_K, QueryContextRequest
-from .storage import BlockGraphStore, StoreLease, inspect_store_locks
+from .domain.query_context import (
+    DEFAULT_MAX_DEPTH,
+    DEFAULT_MAX_ITEMS,
+    DEFAULT_TOP_K,
+    QueryContextRequest,
+)
 from .freshness import write_watch_state
-from .storage.maintenance import clear_project_storage
 from .reporting.html_graph import write_graph_html
 from .reporting.project_pipeline import write_pipeline_html, write_pipeline_mermaid
-from api.memory_graph import MemoryGraph
-
+from .storage import BlockGraphStore, StoreLease, inspect_store_locks
+from .storage.maintenance import clear_project_storage
 
 DEFAULT_STORAGE_DIR = ".reql"
 DEFAULT_STORAGE_FILE = "memory.reql"
@@ -140,6 +146,14 @@ def _print_compile_result(result: Any) -> None:
     print(f"Delta: {result.delta.id}")
     if result.revision is not None:
         print(f"Revision: {result.revision.id} ({len(result.revision.changes)} file changes)")
+    retention = result.retention
+    if retention is not None and (retention.records_removed or retention.usage_entries_removed):
+        print(
+            "Retention: "
+            f"records={retention.records_removed}, "
+            f"usage_entries={retention.usage_entries_removed}, "
+            f"bytes_reclaimed={retention.bytes_reclaimed}"
+        )
     _print_compile_summary(result.summary)
     if run.errors:
         print("Errors:")
@@ -573,28 +587,6 @@ def _print_agent_bus(payload: dict[str, Any]) -> None:
         print("  none")
     for handoff in handoffs:
         print(f"  {handoff['updated_at']}\t{handoff.get('agent_id') or ''} -> {handoff.get('target_agent_id') or ''}\t{handoff.get('title') or ''}")
-
-
-def _print_agent_overview(payload: dict[str, Any]) -> None:
-    print("Agent overview:")
-    agents = payload.get("agents") or []
-    if not agents:
-        print("  none")
-    for item in agents:
-        session = item.get("current_session") or {}
-        print(
-            f"  {item.get('agent_id') or ''}\t{item.get('status') or ''}\t"
-            f"open={len(item.get('open_tasks') or [])}\t{session.get('title') or ''}"
-        )
-
-
-def _warn_agent_deprecated(command: str, replacement: str) -> None:
-    """Warn compatibility callers without contaminating structured stdout."""
-
-    print(
-        f"warning: `reql agent {command}` is deprecated; use `reql agent {replacement}`",
-        file=sys.stderr,
-    )
 
 
 def _print_agent_dashboard(payload: dict[str, Any]) -> None:
@@ -1815,11 +1807,6 @@ def build_parser() -> argparse.ArgumentParser:
     agent_link.add_argument("id2")
     agent_link.add_argument("--relation", required=True, help="Relation type")
     agent_link.add_argument("--json", action="store_true", help="Print structured JSON result")
-    agent_link_many = agent_sub.add_parser("link-many", help="Deprecated compatibility alias for batch --link-many")
-    agent_link_many.add_argument("id1")
-    agent_link_many.add_argument("ids", nargs="+", help="One or more target node IDs")
-    agent_link_many.add_argument("--relation", required=True, help="Relation type")
-    agent_link_many.add_argument("--json", action="store_true", help="Print structured JSON result")
     agent_batch = agent_sub.add_parser("batch", help="Apply operational-memory updates from a JSON file or inline options")
     agent_batch.add_argument("file", nargs="?", default=None, help="Optional JSON file path, or '-' to read from stdin")
     agent_batch.add_argument("--note", action="append", default=[], metavar="[ALIAS=]TEXT", help="Add an operational note; may be repeated")
@@ -1853,9 +1840,6 @@ def build_parser() -> argparse.ArgumentParser:
     agent_bus.add_argument("--limit", type=int, default=50, help="Maximum agents, messages, and handoffs")
     agent_bus.add_argument("--include-payloads", action="store_true", help="Include full handoff payload snapshots")
     agent_bus.add_argument("--json", action="store_true", help="Print structured JSON result")
-    agent_overview = agent_sub.add_parser("overview", help="Deprecated compatibility alias; use dashboard --agents")
-    agent_overview.add_argument("--limit", type=int, default=50, help="Maximum registered agents")
-    agent_overview.add_argument("--json", action="store_true", help="Print structured JSON result")
     agent_dashboard = agent_sub.add_parser("dashboard", help="Read compact coordination signals and optionally post one update")
     agent_dashboard.add_argument("--post", default=None, help="Publish a shared update of at most 240 characters before reading")
     agent_dashboard.add_argument("--kind", default="status", help="Kind assigned to --post; defaults to status")
@@ -1866,11 +1850,6 @@ def build_parser() -> argparse.ArgumentParser:
     agent_finish = agent_sub.add_parser("finish", help="Publish final context, close the session, and mark this agent completed")
     agent_finish.add_argument("summary", nargs="?", default=None, help="Compact final outcome stored with the handoff")
     agent_finish.add_argument("--json", action="store_true", help="Print structured JSON result")
-    agent_publish = agent_sub.add_parser("publish", help="Deprecated compatibility alias; use dashboard --post")
-    agent_publish.add_argument("text")
-    agent_publish.add_argument("--kind", default="note", help="Message kind")
-    agent_publish.add_argument("--target", default="all", help="Target agent id, or all")
-    agent_publish.add_argument("--json", action="store_true", help="Print structured JSON result")
     agent_handoff = agent_sub.add_parser("handoff", help="Publish this agent's saved operational context to the master bus")
     agent_handoff.add_argument("summary", nargs="?", default=None)
     agent_handoff.add_argument("--target", default="master", help="Target agent id")
@@ -2343,14 +2322,6 @@ def _main(argv: list[str] | None = None) -> int:
                 else:
                     _print_agent_relations(result)
                 return 0
-            if args.agent_command == "link-many":
-                _warn_agent_deprecated("link-many", "batch --link-many")
-                result = workspace.link_many(args.id1, args.ids, args.relation)
-                if args.json:
-                    _print_json(result)
-                else:
-                    _print_agent_relations(result)
-                return 0
             if args.agent_command == "batch":
                 result = workspace.batch(_agent_batch_operations_from_args(args))
                 if args.json:
@@ -2415,14 +2386,6 @@ def _main(argv: list[str] | None = None) -> int:
                 else:
                     _print_agent_bus(result)
                 return 0
-            if args.agent_command == "overview":
-                _warn_agent_deprecated("overview", "dashboard --agents")
-                result = workspace.overview(limit=args.limit)
-                if args.json:
-                    _print_json(result)
-                else:
-                    _print_agent_overview(result)
-                return 0
             if args.agent_command == "dashboard":
                 result = workspace.dashboard(
                     post=args.post,
@@ -2445,14 +2408,14 @@ def _main(argv: list[str] | None = None) -> int:
                         f"Agent finished: {result['agent_id']}"
                         f"\tclosed_session={result.get('closed_session_id') or 'none'}"
                     )
-                return 0
-            if args.agent_command == "publish":
-                _warn_agent_deprecated("publish", "dashboard --post")
-                result = workspace.publish(args.text, kind=args.kind, target=args.target)
-                if args.json:
-                    _print_json(result)
-                else:
-                    _print_agent_node({"node": result["message"]})
+                    retention = result.get("retention") or {}
+                    if retention.get("files_removed") or retention.get("records_removed"):
+                        print(
+                            "Retention: "
+                            f"files={retention.get('files_removed', 0)}, "
+                            f"records={retention.get('records_removed', 0)}, "
+                            f"bytes_reclaimed={retention.get('bytes_reclaimed', 0)}"
+                        )
                 return 0
             if args.agent_command == "handoff":
                 result = workspace.handoff(args.summary, target=args.target)

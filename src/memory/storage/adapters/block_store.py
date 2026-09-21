@@ -32,7 +32,7 @@ from typing import Any, Iterable, Iterator, Sequence
 from ...domain.constants import ACTIVE_STATUSES
 from ...domain.exceptions import StorageError
 from ...domain.models import MemoryEdge, MemoryNode, copy_memory_payload
-from ...domain.timeutils import utcnow_iso
+from ...domain.timeutils import parse_dt, utcnow_iso
 from ...extraction.normalization import (
     expanded_tokens,
     identifier_expanded_text,
@@ -3352,6 +3352,103 @@ class BlockGraphStore:
 
     def usage_for_node(self, node_id: str) -> dict[str, Any]:
         return dict(self._usage_by_node.get(node_id, {}))
+
+    def prune_usage_events(self, *, cutoff: str, node_ids: set[str]) -> dict[str, int]:
+        """Remove expired journal entries for the selected project nodes."""
+
+        if not self._usage_journal_path.exists() or not node_ids:
+            return {"events_removed": 0, "entries_removed": 0, "bytes_reclaimed": 0}
+        cutoff_dt = parse_dt(cutoff)
+        if cutoff_dt is None:
+            raise ValueError("Usage retention cutoff must be an ISO timestamp")
+
+        usage_lock = _StoreLock(self._usage_journal_path, timeout_seconds=self._lock_timeout_seconds)
+        usage_lock.acquire()
+        temporary_path = self._usage_journal_path.with_name(
+            f".{self._usage_journal_path.name}.prune-{uuid.uuid4().hex}"
+        )
+        retained_items: list[dict[str, Any]] = []
+        events_removed = 0
+        entries_removed = 0
+        before_bytes = self._usage_journal_path.stat().st_size
+        try:
+            lines = self._usage_journal_path.read_text(encoding="utf-8").splitlines()
+            rendered: list[str] = []
+            for line in lines:
+                try:
+                    item = json.loads(line)
+                except json.JSONDecodeError:
+                    rendered.append(line)
+                    continue
+                if not isinstance(item, dict) or item.get("op_type") != "usage_event":
+                    rendered.append(line)
+                    continue
+                try:
+                    created_at = parse_dt(str(item.get("created_at") or ""))
+                except ValueError:
+                    created_at = None
+                payload = item.get("payload")
+                if created_at is None or created_at >= cutoff_dt or not isinstance(payload, dict):
+                    rendered.append(line)
+                    retained_items.append(item)
+                    continue
+                raw_nodes = payload.get("nodes")
+                if not isinstance(raw_nodes, list):
+                    rendered.append(line)
+                    retained_items.append(item)
+                    continue
+                kept_nodes = [
+                    entry
+                    for entry in raw_nodes
+                    if not isinstance(entry, dict) or str(entry.get("id") or "") not in node_ids
+                ]
+                removed = len(raw_nodes) - len(kept_nodes)
+                if not removed:
+                    rendered.append(line)
+                    retained_items.append(item)
+                    continue
+                entries_removed += removed
+                if not kept_nodes:
+                    events_removed += 1
+                    continue
+                retained_payload = dict(payload)
+                retained_payload["nodes"] = kept_nodes
+                retained_item = dict(item)
+                retained_item["payload"] = retained_payload
+                rendered.append(json.dumps(retained_item, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+                retained_items.append(retained_item)
+
+            if entries_removed:
+                content = "\n".join(rendered)
+                if content:
+                    content += "\n"
+                temporary_path.write_text(content, encoding="utf-8")
+                os.replace(temporary_path, self._usage_journal_path)
+                self._rebuild_usage_state(retained_items)
+            after_bytes = self._usage_journal_path.stat().st_size
+        finally:
+            temporary_path.unlink(missing_ok=True)
+            usage_lock.release()
+        return {
+            "events_removed": events_removed,
+            "entries_removed": entries_removed,
+            "bytes_reclaimed": max(0, before_bytes - after_bytes),
+        }
+
+    def _rebuild_usage_state(self, journal_items: Sequence[dict[str, Any]]) -> None:
+        """Rebuild usage aggregates after rewriting the sidecar journal."""
+
+        self._usage_by_node.clear()
+        for item in self._operation_log:
+            if item.get("op_type") == "usage_event":
+                self._apply_usage_event(
+                    dict(item.get("payload") or {}),
+                    created_at=str(item.get("created_at") or ""),
+                )
+        for item in journal_items:
+            payload = item.get("payload")
+            if isinstance(payload, dict):
+                self._apply_usage_event(payload, created_at=str(item.get("created_at") or ""))
 
     def _apply_usage_event(self, payload: dict[str, Any], *, created_at: str | None = None) -> None:
         now = created_at or utcnow_iso()

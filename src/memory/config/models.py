@@ -8,7 +8,7 @@ from .path_rules import normalize_scan_exclude_pattern, resolve_scan_exclude_pat
 
 
 def normalize_scan_path_pattern(pattern: str) -> str:
-    """Return the legacy canonical matching key for a scan include pattern.
+    """Return the canonical matching key for a scan include pattern.
 
     Exclusions use :func:`resolve_scan_exclude_pattern` so their ``./`` anchor
     remains significant.
@@ -109,6 +109,16 @@ class DiagnosticsConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class RetentionConfig:
+    """Retention policy for superseded project and completed agent data."""
+
+    days: int
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"days": self.days}
+
+
+@dataclass(frozen=True, slots=True)
 class REQLConfig:
     project: ProjectConfig
     scan: ScanConfig
@@ -117,6 +127,7 @@ class REQLConfig:
     analysis: AnalysisConfig
     reporting: ReportingConfig
     diagnostics: DiagnosticsConfig
+    retention: RetentionConfig
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -127,6 +138,7 @@ class REQLConfig:
             "analysis": self.analysis.to_dict(),
             "reporting": self.reporting.to_dict(),
             "diagnostics": self.diagnostics.to_dict(),
+            "retention": self.retention.to_dict(),
         }
 
     def with_overrides(self, overrides: Mapping[str, Any] | None = None, **kwargs: Any) -> "REQLConfig":
@@ -141,6 +153,7 @@ SECTION_TYPES = {
     "analysis": AnalysisConfig,
     "reporting": ReportingConfig,
     "diagnostics": DiagnosticsConfig,
+    "retention": RetentionConfig,
 }
 
 def merge_config(config: REQLConfig, overrides: Mapping[str, Any]) -> REQLConfig:
@@ -227,6 +240,7 @@ def config_from_mapping(data: Mapping[str, Any]) -> REQLConfig:
         analysis=_section(AnalysisConfig, data.get("analysis", {}), "analysis"),
         reporting=_section(ReportingConfig, data.get("reporting", {}), "reporting"),
         diagnostics=_section(DiagnosticsConfig, data.get("diagnostics", {}), "diagnostics"),
+        retention=_section(RetentionConfig, data.get("retention", {}), "retention"),
     )
     _validate(cfg)
     return cfg
@@ -351,3 +365,5 @@ def _validate(config: REQLConfig) -> None:
         )
     if config.diagnostics.enabled and not config.diagnostics.path.strip():
         raise ValueError("Config option diagnostics.path must not be empty when diagnostics.enabled is true")
+    if config.retention.days < 0:
+        raise ValueError("Config option retention.days must be zero or greater")

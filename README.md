@@ -148,12 +148,13 @@ session, recent durable memory, currently working agents, relevant bus signals,
 and exact drill-down commands. Posts are capped at 240 characters; durable
 detail stays in tasks, decisions, findings, plans, and handoffs. Every agent
 runs `reql agent finish "<compact outcome>"` when its pass ends so peers see it
-leave the working roster; a later `session start` marks it active again.
+leave the working roster. Finish deletes the private agent store after
+publishing its compact handoff; reuse of the same identity starts with
+`reql agent init`.
 
-`agent overview`, `agent publish`, and standalone `agent link-many` remain
-deprecated compatibility aliases for existing scripts. New integrations use
-`dashboard --agents`, `dashboard --post`, and `batch --link-many`. The former
-generic `agent add` command has been replaced by typed `agent note add`.
+Detailed agent state, bus updates, and multi-target links use
+`dashboard --agents`, `dashboard --post`, and `batch --link-many` respectively.
+Operational notes use the typed `agent note add` command.
 
 `reql agent reset` discards agent-created notes, tasks, decisions, findings,
 plans, risks, sessions, and their relationships. It never reads or modifies
@@ -205,6 +206,12 @@ project tree and discards historical or archived graph state. Use `--storage`,
 `--config`, `--set`, and `--json` for automation. See [docs/CLI.md](docs/CLI.md)
 for the complete command reference, query modes, install behavior, MCP startup,
 config lookup, reports, exports, and maintenance workflows.
+
+Automatic maintenance uses `retention.days` from `reql.conf` (default `30`).
+Successful compile/update operations remove expired project history, archived
+records, and project-owned usage entries while preserving the active graph and
+newest successful history. Agent init/finish removes expired bus coordination
+records, and finish removes the completed agent's private store immediately.
 
 ## Features
 

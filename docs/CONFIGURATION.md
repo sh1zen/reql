@@ -55,6 +55,9 @@ reporting:
 diagnostics:
   enabled: false
   path: ""
+
+retention:
+  days: 30
 ```
 
 ## Behavior
@@ -111,6 +114,10 @@ diagnostics:
   provided.
 - `diagnostics.enabled` controls structured JSONL performance logging.
   `diagnostics.path` is required when diagnostics are enabled.
+- `retention.days` is the non-negative age limit for superseded project
+  history, archived graph records, project-owned usage events, and completed
+  agent-bus records. The default is `30`; `0` makes eligible data removable on
+  the next successful compile/update or agent lifecycle maintenance pass.
 
 REQL never downloads parser dependencies at runtime. Project compile and
 document processing are deterministic local operations.

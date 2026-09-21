@@ -6,7 +6,13 @@ from pathlib import Path
 
 from memory.artifacts.scanner import ProjectScanner
 from memory.cli import _append_config_exclude_patterns
-from memory.config import ConfigError, load_effective_config, resolve_scan_exclude_pattern
+from memory.config import (
+    ConfigError,
+    default_config,
+    load_effective_config,
+    merge_config,
+    resolve_scan_exclude_pattern,
+)
 
 
 class ScanExcludeRuleTests(unittest.TestCase):
@@ -213,6 +219,19 @@ class ProjectScannerExclusionTests(unittest.TestCase):
 
 
 class ConfigExclusionValidationTests(unittest.TestCase):
+    def test_retention_defaults_and_overrides_are_validated(self) -> None:
+        config = default_config()
+
+        self.assertEqual(config.retention.days, 30)
+        self.assertEqual(merge_config(config, {"retention.days": 0}).retention.days, 0)
+        with self.assertRaisesRegex(
+            ValueError,
+            "retention.days must be zero or greater",
+        ):
+            merge_config(config, {"retention.days": -1})
+        with self.assertRaisesRegex(ValueError, "retention.days must be an integer"):
+            merge_config(config, {"retention.days": "30"})
+
     def test_config_merge_deduplicates_equivalent_rules_but_keeps_anchor(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             config_path = Path(td) / "reql.conf"

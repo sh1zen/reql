@@ -81,3 +81,6 @@ reporting:
 diagnostics:
   enabled: false
   path: ""
+
+retention:
+  days: 30

@@ -194,9 +194,7 @@ agent commands may connect only records owned by that same private agent store.
 The canonical project graph remains the sole owner of repository identity,
 files, symbols, source spans, dependencies, and code relationships. Coding
 agents obtain those facts through the normal project query APIs, never through
-their operational memory. Existing agent stores are migrated lazily by removing
-legacy canonical copies and any relationships that referenced them while
-preserving all agent-owned records and relationships among those records.
+their operational memory.
 
 `reql agent dashboard` is a bounded read projection over the selected private
 store and shared bus. It may publish one short bus checkpoint before reading,
@@ -205,13 +203,16 @@ and completed agent identities, carries one previous-session summary for
 inter-session continuity, and points deeper reads back to the authoritative
 private item, session map, handoff payload, or canonical project query.
 `reql agent finish` publishes the final handoff, closes the current session,
-and changes the bus identity from active to completed without deleting saved
-tasks or history; starting another session reactivates it.
+changes the bus identity from active to completed, and deletes the private
+agent store and sidecars. The compact bus handoff remains available for
+`retention.days`; reusing the identity requires `agent init`. Init and finish
+also remove completed private stores and prune expired bus records without
+touching active or unregistered stores.
 
 The canonical CLI writes typed notes through `agent note add` and `note.add`
-batch operations. `dashboard --agents` owns explicit cross-store inspection.
-Legacy `overview`, `publish`, and standalone `link-many` entry points remain
-thin compatibility aliases and do not define separate service behavior.
+batch operations. `dashboard --agents` owns explicit cross-store inspection,
+`dashboard --post` owns bus updates, and `batch --link-many` owns multi-target
+links.
 
 ## Maintenance
 
@@ -224,6 +225,11 @@ activation and usage signals
 
 Salience ranks project and source graph records from structural, retrieval, and
 usage signals.
+
+After each successful compile/update, project-scoped retention removes expired
+run, delta, revision, archived graph, and usage-journal data. It preserves the
+active graph and newest successful history set, skips failed compiles, and
+compacts storage only when graph records were removed.
 
 ## Analysis
 

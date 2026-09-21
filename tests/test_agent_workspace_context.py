@@ -1,18 +1,18 @@
 from __future__ import annotations
 
-import json
-from contextlib import redirect_stderr, redirect_stdout
-from io import StringIO
-from pathlib import Path
 import os
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
+from pathlib import Path
 from unittest.mock import patch
 
 from api import MemoryGraph
 from memory.agent.workspace import AgentWorkspace
-from memory.cli import _main, _print_agent_dashboard, _print_agent_map, build_parser
-from memory.domain.models import MemoryEdge, MemoryNode
+from memory.cli import _print_agent_dashboard, _print_agent_map, build_parser
+from memory.config import default_config, merge_config
+from memory.domain.models import MemoryNode
 
 
 class AgentWorkspaceContextTests(unittest.TestCase):
@@ -170,7 +170,9 @@ class AgentWorkspaceContextTests(unittest.TestCase):
         self.assertIn("session", rendered)
         self.assertIn("dashboard", rendered)
         self.assertIn("note", rendered)
-        self.assertIn("Deprecated compatibility alias", rendered)
+        self.assertNotIn("overview", rendered)
+        self.assertNotIn("publish", rendered)
+        self.assertNotIn("link-many", rendered)
 
         parsed = build_parser().parse_args(["agent", "note", "add", "typed note"])
         self.assertEqual(parsed.agent_command, "note")
@@ -198,8 +200,8 @@ class AgentWorkspaceContextTests(unittest.TestCase):
             peer.init()
             peer.start_session("Parser review")
             peer.add_task("Inspect parser ownership")
-            peer.publish("parser owner found", target=workspace.agent_id)
-            peer.publish("private peer message", target="someone-else")
+            peer.dashboard(post="parser owner found", target=workspace.agent_id)
+            peer.dashboard(post="private peer message", target="someone-else")
 
             payload = workspace.dashboard(post="implementation started", kind="stage", limit=3)
             detailed = workspace.dashboard(limit=3, include_agent_details=True)
@@ -231,9 +233,72 @@ class AgentWorkspaceContextTests(unittest.TestCase):
             after_finish = workspace.dashboard(limit=3)
             self.assertNotIn("peer", {item["agent_id"] for item in after_finish["working_agents"]})
             self.assertIn("peer", {item["agent_id"] for item in after_finish["finished_agents"]})
+            self.assertFalse(peer.paths.agent_storage.exists())
+            peer.init()
             peer.start_session("Follow-up review")
             after_restart = workspace.dashboard(limit=3)
             self.assertIn("peer", {item["agent_id"] for item in after_restart["working_agents"]})
+
+    def test_finish_deletes_private_store_but_preserves_compact_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            workspace, _ = self._workspace(root)
+            workspace.start_session("Disposable work")
+            workspace.add_task("Unfinished task")
+            store = workspace.paths.agent_storage
+            wal = store.with_name(f"{store.name}.wal")
+
+            result = workspace.finish("work complete")
+            bus = workspace.bus(include_payloads=True)
+            detailed = workspace.dashboard(include_agent_details=True)
+
+            self.assertFalse(store.exists())
+            self.assertFalse(wal.exists())
+            self.assertGreaterEqual(result["retention"]["files_removed"], 1)
+            self.assertIn("work complete", {item["content"] for item in bus["handoffs"]})
+            finished = next(
+                item for item in detailed["agent_details"] if item["agent_id"] == workspace.agent_id
+            )
+            self.assertEqual(finished["status"], "completed")
+            self.assertEqual(finished["open_tasks"], [])
+
+    def test_init_reconciles_completed_stores_without_touching_active_or_unknown_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            standard = root / "memory.reql"
+            bus = root / "bus.reql"
+            completed = AgentWorkspace(standard, agent_id="completed", bus_storage=bus)
+            active = AgentWorkspace(standard, agent_id="active", bus_storage=bus)
+            completed.init()
+            active.init()
+            completed._register_agent(status="completed")
+            unknown = completed.paths.agent_storage.parent / "unknown.reql"
+            unknown.write_bytes(b"unregistered")
+
+            cleaner = AgentWorkspace(standard, agent_id="cleaner", bus_storage=bus)
+            cleaner.init()
+
+            self.assertFalse(completed.paths.agent_storage.exists())
+            self.assertTrue(active.paths.agent_storage.exists())
+            self.assertTrue(unknown.exists())
+
+    def test_zero_day_retention_prunes_completed_bus_records_on_next_init(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            standard = root / "memory.reql"
+            bus = root / "bus.reql"
+            completed = AgentWorkspace(standard, agent_id="completed", bus_storage=bus)
+            completed.init()
+            completed.finish("short-lived handoff")
+            immediate = merge_config(default_config(), {"retention.days": 0})
+
+            cleaner = AgentWorkspace(standard, agent_id="cleaner", bus_storage=bus, config=immediate)
+            cleanup = cleaner.init()["retention"]
+            current_bus = cleaner.bus(include_payloads=True)
+
+            self.assertGreater(cleanup["records_removed"], 0)
+            self.assertNotIn("completed", {item["agent_id"] for item in current_bus["agents"]})
+            self.assertNotIn("short-lived handoff", {item["content"] for item in current_bus["handoffs"]})
 
     def test_dashboard_rejects_long_posts_to_keep_shared_state_compact(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -250,23 +315,6 @@ class AgentWorkspaceContextTests(unittest.TestCase):
             self.assertEqual(result["results"][0]["node"]["type"], "note")
             with self.assertRaisesRegex(ValueError, "Unsupported batch operation: add"):
                 workspace.batch([{"op": "add", "text": "Legacy note"}])
-
-    def test_deprecated_alias_warns_without_contaminating_json_stdout(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            storage = str(Path(temporary_directory) / "memory.reql")
-            common = ["--storage", storage, "agent", "--activity", "compat-test", "--no-progress"]
-            with redirect_stdout(StringIO()), redirect_stderr(StringIO()):
-                self.assertEqual(_main([*common, "init", "--json"]), 0)
-
-            output = StringIO()
-            errors = StringIO()
-            with redirect_stdout(output), redirect_stderr(errors):
-                result = _main([*common, "publish", "compatibility message", "--json"])
-
-            self.assertEqual(result, 0)
-            self.assertEqual(json.loads(output.getvalue())["message"]["content"], "compatibility message")
-            self.assertIn("deprecated", errors.getvalue())
-            self.assertNotIn("warning", output.getvalue())
 
     def test_activity_identity_is_stable_and_initialization_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -305,44 +353,7 @@ class AgentWorkspaceContextTests(unittest.TestCase):
             self.assertFalse(standard.exists())
             self.assertNotIn("standard_storage", result)
 
-    def test_init_migrates_legacy_canonical_copies_out_of_agent_memory(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory)
-            workspace, artifact_id = self._workspace(root)
-            task = workspace.add_task("Preserve me")["node"]
-            agent_graph = MemoryGraph.open(workspace.paths.agent_storage)
-            try:
-                agent_graph.add_node(
-                    MemoryNode(
-                        id=artifact_id,
-                        type="file",
-                        label="src/workspace.py",
-                        properties={"source": "standard", "standard_type": "SourceArtifact"},
-                    )
-                )
-                agent_graph.add_edge(
-                    MemoryEdge(
-                        id="agent-edge:legacy-code-link",
-                        from_id=task["id"],
-                        to_id=artifact_id,
-                        type="touches",
-                        properties={"source": "agent"},
-                    )
-                )
-            finally:
-                agent_graph.close()
-
-            result = workspace.init()
-
-            self.assertTrue(result["already_initialized"])
-            self.assertEqual(result["removed_canonical_items"], 1)
-            self.assertEqual(workspace.show(task["id"])["node"]["title"], "Preserve me")
-            with self.assertRaisesRegex(ValueError, "Agent item not found"):
-                workspace.show(artifact_id)
-            with self.assertRaisesRegex(ValueError, "Link target not found in agent memory"):
-                workspace.link(task["id"], artifact_id, "touches")
-
-    def test_parallel_activities_are_isolated_and_visible_in_overview(self) -> None:
+    def test_parallel_activities_are_isolated_and_visible_in_dashboard(self) -> None:
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             standard = root / "memory.reql"
@@ -358,9 +369,12 @@ class AgentWorkspaceContextTests(unittest.TestCase):
             self.assertNotEqual(left.agent_id, right.agent_id)
             self.assertEqual([item["title"] for item in left.map()["open_tasks"]], ["Left only"])
             self.assertEqual([item["title"] for item in right.map()["open_tasks"]], ["Right only"])
-            overview = left.overview()
-            self.assertEqual(overview["format"], "reql-agent-overview-v1")
-            self.assertEqual({item["agent_id"] for item in overview["agents"]}, {left.agent_id, right.agent_id})
+            dashboard = left.dashboard(include_agent_details=True)
+            self.assertEqual(dashboard["format"], "reql-agent-dashboard-v1")
+            self.assertEqual(
+                {item["agent_id"] for item in dashboard["agent_details"]},
+                {left.agent_id, right.agent_id},
+            )
 
             with (
                 patch.dict(os.environ, {"REQL_AGENT_ACTIVITY_ID": "", "CODEX_THREAD_ID": ""}),

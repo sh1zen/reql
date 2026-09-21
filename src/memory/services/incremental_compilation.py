@@ -6,30 +6,49 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..diagnostics import PerformanceLogger
-from ..artifacts.cache import ArtifactCache, ArtifactCacheEntry, DirtySet, artifact_cache_path
-from ..artifacts.compile_summary import CompilationSummary, build_compilation_summary, capture_symbol_state
+from ..artifacts.cache import (
+    ArtifactCache,
+    ArtifactCacheEntry,
+    DirtySet,
+    artifact_cache_path,
+)
+from ..artifacts.compile_summary import (
+    CompilationSummary,
+    build_compilation_summary,
+    capture_symbol_state,
+)
 from ..artifacts.compiler import (
-    ArtifactContentChangedError,
     ArtifactCompiler,
+    ArtifactContentChangedError,
     archive_artifact_fragments,
     link_document_fragments_to_code,
     refresh_project_css_surface_findings,
 )
 from ..artifacts.context_scope import artifact_context_scope
 from ..artifacts.delta import CompilationRun, DeltaRepository, GraphDelta
-from ..artifacts.fingerprint import DEFAULT_CHUNKING_VERSION, DEFAULT_PARSER_VERSION, normalize_path, project_id
+from ..artifacts.fingerprint import (
+    DEFAULT_CHUNKING_VERSION,
+    DEFAULT_PARSER_VERSION,
+    normalize_path,
+    project_id,
+)
 from ..artifacts.models import ArtifactCompilationResult, ScanResult, SourceArtifact
-from ..artifacts.options import CompilationOptions, RawCompilationOptions, normalize_compilation_options
+from ..artifacts.options import (
+    CompilationOptions,
+    RawCompilationOptions,
+    normalize_compilation_options,
+)
 from ..artifacts.project import ProjectRegistry
 from ..artifacts.revision import ProjectRevision, RevisionRepository
 from ..artifacts.scanner import DEFAULT_MAX_FILE_SIZE_BYTES, ProjectScanner
 from ..artifacts.structural_links import refresh_project_structural_links
-from ..domain.ids import stable_id
+from ..diagnostics import PerformanceLogger
 from ..domain.exceptions import StorageError
+from ..domain.ids import stable_id
 from ..domain.models import MemoryEdge, MemoryNode
 from ..domain.timeutils import utcnow_iso
 from ..storage.graph_store import GraphStore
+from ..storage.retention import RetentionCleanupResult, prune_project_data
 
 ORPHAN_DIRECTORY_MIN_FILES = 2
 ORPHAN_DIRECTORY_FINDING_TYPE = "possibly_orphan_directory"
@@ -73,6 +92,7 @@ class CompileProjectResult:
     delta: GraphDelta
     revision: ProjectRevision | None = None
     summary: CompilationSummary = field(default_factory=CompilationSummary)
+    retention: RetentionCleanupResult | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -82,6 +102,7 @@ class CompileProjectResult:
             "delta": self.delta.to_dict(),
             "revision": self.revision.to_dict(include_manifest=False) if self.revision else None,
             "summary": self.summary.to_dict(),
+            "retention": self.retention.to_dict() if self.retention else None,
         }
 
 
@@ -96,10 +117,12 @@ class IncrementalCompilationService:
         parser_version: str = DEFAULT_PARSER_VERSION,
         chunking_version: str = DEFAULT_CHUNKING_VERSION,
         compile_options: RawCompilationOptions = None,
+        retention_days: int = 30,
         profile_logger: PerformanceLogger | None = None,
     ) -> None:
         self.store = store
         self.profile_logger = profile_logger
+        self.retention_days = retention_days
         self.project_registry = ProjectRegistry(store)
         self.default_options = normalize_compilation_options(compile_options)
         self.compiler = compiler or ArtifactCompiler(options=self.default_options)
@@ -214,6 +237,18 @@ class IncrementalCompilationService:
             delta, revision, pending_disk_entries = self._apply_compile_transaction(scan, dirty, compiler, cache, cache_enabled, recovered_artifact_ids, artifacts_by_id, aggregate, run, profile)
         if cache_enabled and pending_disk_entries:
             cache.persist_disk_entries(pending_disk_entries)
+        retention = None
+        if run.status == "completed":
+            with (
+                profile.span("compile.retention", project_id=scan.project.id, days=self.retention_days)
+                if profile
+                else nullcontext()
+            ):
+                retention = prune_project_data(
+                    self.store,
+                    project_id=scan.project.id,
+                    retention_days=self.retention_days,
+                )
         checkpoint = self._checkpoint_store_if_needed(profile)
 
         for node_id in aggregate.affected_node_ids:
@@ -236,7 +271,15 @@ class IncrementalCompilationService:
             delta=delta,
             previous_symbol_state=previous_symbol_state,
         )
-        return CompileProjectResult(scan=scan, dirty_set=dirty, run=run, delta=delta, revision=revision, summary=summary)
+        return CompileProjectResult(
+            scan=scan,
+            dirty_set=dirty,
+            run=run,
+            delta=delta,
+            revision=revision,
+            summary=summary,
+            retention=retention,
+        )
 
     def _checkpoint_store_if_needed(self, profile: PerformanceLogger | None) -> dict[str, Any]:
         checkpoint = getattr(self.store, "checkpoint_if_needed", None)
