@@ -38,7 +38,8 @@ PROJECT_SKILL_SOURCE = SkillSource(
         "verification, and final graph refresh without requiring LLM calls."
     ),
     summary=(
-        "Use the local deterministic graph for bounded repository context; load detailed guidance only when its trigger occurs."
+        "Begin repository reasoning from the local deterministic graph, keep its returned working set in focus, "
+        "and load detailed guidance only when its trigger occurs."
     ),
     command_examples=(
         CommandExample("project status .", "check whether this project has a compiled REQL graph"),
@@ -52,16 +53,23 @@ PROJECT_SKILL_SOURCE = SkillSource(
             "Run `{command_name} project status .`; if the graph is missing or stale, stop and use the matching route below."
         ),
         (
+            "For nontrivial, resumed, or coordinated work, run `{command_name} agent dashboard`; use its compact intra/inter-session signals and follow only relevant drill-downs."
+        ),
+        (
             "On an active graph, run `{command_name} query_context --query \"<user terms>\"` with `--code`, `--docs`, or `--test` only when needed."
         ),
         (
-            "Read only returned files, owners, line ranges, and tests; on `Confidence: insufficient`, use one targeted `rg` with exact user terms."
+            "Treat returned files, owners, line ranges, and tests as the working set. On `Confidence: insufficient`, "
+            "refine the query or inspect related graph evidence before opening only the unresolved locations."
         ),
         (
             "Edit the existing owner, preserve public contracts, and run the repository's documented tests."
         ),
         (
             "After changing files, run `{command_name} project watch-status . --json`; if it reports `running`, wait for the watcher to refresh the graph, otherwise run `{command_name} project compile .` before the final response."
+        ),
+        (
+            "Before ending any initialized Agent Workspace pass, run `{command_name} agent finish \"<compact outcome>\"` so other sessions stop treating this agent as active."
         ),
     ),
     rule_points=(
@@ -70,19 +78,21 @@ PROJECT_SKILL_SOURCE = SkillSource(
             "bootstrap with `project compile .` only when the project is missing."
         ),
         (
-            "Query the active graph with terms from the user's request before raw exploration. Use returned paths and spans for targeted "
-            "reads; do not duplicate graph context with broad repository scans."
+            "Query the active graph with terms from the user's request and let its paths, owners, spans, and associated tests define the "
+            "working set. Deepen or refine graph queries when evidence is missing; inspect source only at the remaining exact locations."
         ),
         (
-            "Edit the existing owner, run documented tests, then let an existing watcher refresh the graph or run one `project compile .`. "
-            "Do not start watch mode unless continuous monitoring was requested."
+            "Only after the current task changes project files, run documented tests, then let an existing watcher refresh the graph or "
+            "run one `project compile .`. Skip both `watch-status` and compile for read-only tasks. Do not start watch mode unless "
+            "continuous monitoring was requested."
         ),
         (
             "In the final handoff, report versioned files, updated symbols, associated tests, and test results. Keep any required personal "
             "`config.json` action separate and never edit that file unless requested."
         ),
         (
-            "Use Agent Workspace only for complex work needing durable planning or handoff. Keep canonical project facts in the standard graph."
+            "For nontrivial, resumed, or coordinated work, use `agent dashboard` as the compact entry point, persist durable pipeline "
+            "state in Agent Workspace, and follow dashboard drill-downs when more context is needed. Keep canonical project facts in the standard graph."
         ),
         "Load only the generated `references/` file relevant to the current special case; do not preload or restate all references.",
     ),
@@ -198,11 +208,11 @@ def _project_skill_resources(
     usage = _command_usage(command_name=command_name, command_path=command_path, fallback_command=fallback_command)
     openai_yaml = """display_name: REQL Project
 short_description: Use REQL graph context and agent memory.
-default_prompt: Use REQL to inspect this project, compile it if needed, answer from bounded graph context, and persist working-memory tasks, decisions, and findings when useful.
+default_prompt: Use REQL to inspect this project, use agent dashboard for compact intra/inter-session coordination on nontrivial or resumed work, compile only to bootstrap a missing graph or after the current task changes project files, keep discovery within the graph-defined working set, persist durable pipeline state when useful, and run agent finish at the end of the work pass.
 """
     bootstrap = f"""# REQL reference: bootstrap and project state
 
-Load this when checking whether a workspace already has REQL graph context, when first compiling a project, or when deciding whether raw file exploration is still needed.
+Load this when checking whether a workspace already has REQL graph context, when first compiling a project, or when deciding how to establish a bounded working set.
 
 ## Command resolution
 
@@ -210,13 +220,13 @@ Load this when checking whether a workspace already has REQL graph context, when
 
 ## Fast path: existing graph
 
-Run this before broad repository exploration:
+Start repository discovery here:
 
 ```bash
 {command_name} project status .
 ```
 
-If status succeeds, treat `.reql/memory.reql` as the repository context index. Do not rebuild just because the user asked a natural-language codebase question. Query the graph first, then read exact files only when edits, debugging, or tests require them.
+If status succeeds, treat `.reql/memory.reql` as the repository context index. Do not rebuild just because the user asked a natural-language codebase question. Query the graph until it identifies the relevant paths and spans, then read exact files only when edits, debugging, or tests require them.
 
 ## First-time bootstrap
 
@@ -226,13 +236,13 @@ If status reports `Project not found`, run a one-shot compile from the runtime w
 {command_name} project compile .
 ```
 
-Do this before broad `rg`, recursive listings, custom scanners, or manually reading many files. The one-shot bootstrap is allowed without asking again because the installed workflow selected REQL project mode. If compile fails, report the error briefly and continue with targeted raw file reads as a fallback.
+The one-shot bootstrap is allowed without asking again because the installed workflow selected REQL project mode. If compile fails, report the error briefly and continue from the smallest source locations implied by the request.
 
-## Raw tool limits
+## Graph-defined working set
 
-Use REQL to decide where to look before using raw repository tools. Avoid workspace-wide `rg`, recursive directory listings, `find`, `grep -R`, custom scanners, or ad hoc crawlers while REQL can provide candidate files, symbols, owners, or line ranges.
+Use REQL results to establish the working set: candidate files, symbols, owners, source fragments, line ranges, and associated tests. When the first result is incomplete, refine the terms or follow the graph with `query_explore`, `query_graph`, `query_memories`, or `inspect`.
 
-Raw tools are appropriate after REQL has identified specific paths or spans, when the user names an exact file/path, or when tests/debugging require local verification. Keep those commands scoped to the candidate files or nearby directories, and stop expanding once you have enough evidence to choose the owner file or edit location.
+Once the graph identifies specific paths or spans, inspect only those locations and the nearby callers needed for edits, debugging, or tests. Stop discovery as soon as the owner file, edit location, contracts, and test targets are supported by evidence.
 
 ## Exclusions
 
@@ -320,7 +330,7 @@ REQL is not an LLM. It uses tokenization, lexical matching, graph links, and act
 
 ## Dependency Exploration
 
-Use `query_explore` to reduce broad manual scanning when you already know the task target but need the surrounding dependency chain:
+Use `query_explore` when you already know the task target but need the surrounding dependency chain:
 
 ```bash
 {command_name} query_explore --query "<terms from user request>" --view owners --view code
@@ -337,13 +347,13 @@ Prefer `owners` to find implementation homes, `callers` for impact, `public_surf
 
 Use graph output as evidence, not as permission to invent missing links. Cite node ids, source files, source fragments, or REQL rows when making factual claims. If the graph lacks enough evidence, say what is missing and read the specific files identified by REQL or by the user's exact target.
 
-Prefer graph queries over broad repository scans, but still run targeted tests and inspect exact files before editing code.
+Let graph queries establish and refine the working set, while still running targeted tests and inspecting exact files before editing code.
 
-## Raw tool limits
+## Graph-led source inspection
 
-Do not use workspace-wide `rg`, recursive directory listings, `find`, `grep -R`, custom scanners, or ad hoc crawlers as the first way to understand the repository. Start with `query_context`, `query_explore`, `query_memories`, `query_graph`, `inspect`, or bounded raw REQL statements.
+Start with `query_context`, `query_explore`, `query_memories`, `query_graph`, `inspect`, or bounded raw REQL statements. Continue within the graph when it can answer the next discovery question or identify the next exact source location.
 
-After REQL returns candidate paths, symbols, owners, source fragments, or line ranges, raw tools may be used for targeted verification: file-scoped `rg`, nearby line reads, exact user-named files, focused caller/import checks, and tests/debugging. If `query_context` reports `Confidence: insufficient`, one targeted `rg` using the user's exact symbol, path, or error terms is allowed immediately. If a raw search starts expanding across unrelated directories, stop and refine the REQL query instead.
+After REQL returns candidate paths, symbols, owners, source fragments, or line ranges, inspect those exact locations for verification and implementation. If `query_context` reports `Confidence: insufficient`, refine the user's terms, select a narrower graph view, or inspect the most relevant node; use direct source lookup only for a specific gap the graph leaves unresolved.
 
 ## Code-Scoped Workflow
 
@@ -358,7 +368,7 @@ When the task asks for an implementation, bug fix, refactor, or behavior change:
 7. If the context still lacks enough code, retrieve exact locations with `{command_name} inspect --node-id NODE_ID --json` or `{command_name} query "RETRIEVE '<terms from user request>' LIMIT 8 RETURN id,type,text,score,relative_path,line_start,line_end"`.
 8. Read only the files and line ranges identified by rendered context, linked `SourceFragment` evidence, or raw REQL rows.
 9. Modify existing owner symbols first. Do not add wrappers, override layers, new parallel services, or duplicate configuration until REQL shows that no suitable owner exists.
-10. If the context is too broad or irrelevant, refine the query with concrete nouns from the request and rerun `query_context`, `query_explore`, or `query_graph` before broad raw search.
+10. If the context is too broad or irrelevant, refine the query with concrete nouns from the request and rerun `query_context`, `query_explore`, or `query_graph` until it yields a bounded working set or exposes a specific evidence gap.
 
 ## Unused-Code Cleanup
 
@@ -555,7 +565,7 @@ def _agent_workspace_resource(
     usage = _command_usage(command_name=command_name, command_path=command_path, fallback_command=fallback_command)
     agent_workspace = f"""# REQL reference: Agent Workspace
 
-Load this when using `reql agent` to persist coding-agent working memory, recover context after compaction, link operational tasks to graph nodes, or export/reset session-scoped memory.
+Load this when using `reql agent` to persist coding-agent decisions, tasks, plans, risks, sessions, and work history, or to recover/export/reset that operational memory.
 
 ## Command resolution
 
@@ -563,19 +573,20 @@ Load this when using `reql agent` to persist coding-agent working memory, recove
 
 ## Purpose
 
-`{command_name} agent` writes to a private project-local graph for the current agent. CLI-created worker memories live under `.reql/agents/AGENT_ID.reql`; the Python API follows the bus current agent when one exists, and otherwise falls back to the compatible master workspace at `.reql/agent.reql`. The standard project graph remains `.reql/memory.reql` and is not modified by agent notes, tasks, decisions, findings, plans, risks, or links.
+`{command_name} agent` writes private operational memory selected by explicit agent id or a stable activity/thread id. Worker memories live under `.reql/agents/AGENT_ID.reql`; ambiguous activity-less selection is rejected instead of following a global bus pointer. The canonical project graph remains `.reql/memory.reql` and is the only source of repository, file, symbol, and code-relation facts. Agent memory never copies or synchronizes those records.
 
-All agents share an internal bus at `.reql/agent-bus.reql`. The bus stores registered agents, short shared messages, and handoffs. Use it to coordinate workers without merging their private working graphs.
+All agents share an internal bus at `.reql/agent-bus.reql`. The bus stores registered agents, short shared messages, and handoffs. Use it to coordinate workers without merging their private operational memories.
 
-Use the standard graph for stable project facts. Use Agent Workspace mode as the planning layer when a project is too large for the coding-agent context window. It is also useful on small tasks when requirements, files, choices, and implementation steps need explicit links.
+Use normal REQL query commands for project facts. Use Agent Workspace mode only as the planning and work-history layer when requirements, choices, and implementation steps need durable memory.
+
+`agent dashboard` is the compact attention index for intra-session and inter-session coordination. It shows active work, the latest previous-session summary, recent durable memory, currently working agents, relevant bus signals, and exact `drill` commands. Read it at the start of nontrivial, resumed, or coordinated work, then follow a drill command only when that item affects the current task.
 
 Store only durable operational memory:
 
-- files and symbols read during this session;
 - decisions and why they were made;
 - findings, assumptions, risks, and blockers;
 - tasks, plans, completed work, and follow-up work;
-- links between tasks, decisions, findings, code notes, files, symbols, and standard graph nodes.
+- relationships among agent-owned tasks, decisions, findings, notes, plans, and risks.
 
 ## Bootstrap
 
@@ -585,39 +596,33 @@ Check state:
 {command_name} agent status
 ```
 
-Initialize from the current standard graph:
+Initialize private operational memory:
 
 ```bash
 {command_name} agent init
+{command_name} agent dashboard
 ```
 
-`agent init` returns an `agent_id`, registers that private memory on the shared bus, and makes it current for later `agent` commands in the same project. A simple single-agent run does not need extra flags. Parallel workers can reuse their id explicitly:
+`agent init` is idempotent and registers the selected private memory on the shared bus. `REQL_AGENT_ID`/`--agent` has highest precedence; otherwise `REQL_AGENT_ACTIVITY_ID`, `CODEX_THREAD_ID`, or `--activity` derives a stable project-scoped id. Request detailed cross-store worker state only when the compact roster is insufficient:
 
 ```bash
-{command_name} agent --agent AGENT_ID status
+{command_name} agent dashboard --agents
 ```
 
-If the standard graph does not exist or is stale, use the `reql-agent` skill first:
-
-```bash
-{command_name} project status .
-{command_name} project compile .
-```
-
-After `{command_name} project compile .` adds new files, run `{command_name} agent sync` before linking Agent Workspace items to the new standard nodes.
+Initialization does not open, copy, or depend on the canonical project graph.
 
 ## Required Agent Workflow
 
-Keep entries short and factual. Prefer one useful sentence over repeated status prose.
+Keep entries short and factual. Prefer one useful sentence over repeated status prose. Publish only meaningful stage transitions, blockers, changed decisions, verification outcomes, and handoffs.
 
 ### 1. Plan
 
 Add information, choices, constraints, assumptions, risks, and blockers:
 
 ```bash
-{command_name} agent bus
+{command_name} agent dashboard
 {command_name} agent session start "Focused implementation pass"
-{command_name} agent add "Read src/memory/cli.py; argparse owns command routing"
+{command_name} agent note add "Read src/memory/cli.py; argparse owns command routing"
 {command_name} agent decision add "Keep .reql/agent.reql separate from .reql/memory.reql"
 {command_name} agent finding add "agent list should not dump standard relations"
 ```
@@ -630,40 +635,27 @@ Create the task list and link tasks to plan elements:
 {command_name} agent task add "Patch context recovery output"
 {command_name} agent link AGENT_TASK_ID AGENT_DECISION_ID --relation implements
 {command_name} agent link AGENT_TASK_ID AGENT_FINDING_ID --relation depends_on
-{command_name} agent link-many AGENT_TASK_ID STANDARD_FILE_ID STANDARD_SYMBOL_ID --relation touches
 {command_name} agent batch --task task="Patch context recovery" --decision decision="Use one workspace lock" --link '$task' implements '$decision'
+{command_name} agent batch --link-many AGENT_TASK_ID depends_on AGENT_DECISION_ID,AGENT_RISK_ID
 ```
 
-Use task descriptions as executable work items, not summaries. Each task should point to the plan item, constraint, file, or symbol that explains it.
+Use task descriptions as executable work items, not summaries. Each task should point to the agent-owned plan item, constraint, decision, finding, or risk that explains it.
 When several items or links are known at once, prefer `{command_name} agent batch --json FILE` or inline `agent batch --task ... --link ...` so the Agent Workspace takes one lock.
 Do not run `agent map` before or after ordinary edits. The current model already knows the plan, task state, and files it just changed; printing the map there only repeats active context.
 
-### 3. Code Linking
-
-After REQL returns file or symbol ids, link planned code targets to tasks. If `{command_name} project compile .` created new file or symbol nodes, run `{command_name} agent sync` before linking those new standard nodes. Use this to assemble the implementation from the task graph before writing:
-
-```bash
-{command_name} agent sync
-{command_name} agent link AGENT_TASK_ID STANDARD_FILE_OR_SYMBOL_ID --relation touches
-{command_name} agent link-task --task TASK_ID --file test-agent/context_savings.py
-{command_name} agent add "Code note: update _agent_workspace_resource to describe plan/task/review/link/write flow"
-{command_name} agent link AGENT_TASK_ID AGENT_NOTE_ID --relation implements
-{command_name} agent link-many AGENT_TASK_ID STANDARD_FILE_ID STANDARD_SYMBOL_ID --relation touches
-```
-
-Code notes are for short target-specific intent, not long code dumps. The actual code belongs in project files.
-
-### 4. Write
+### 3. Write
 
 Edit the project, then update task state:
 
 ```bash
 {command_name} agent task done AGENT_TASK_ID
+{command_name} agent dashboard --post "verify: focused tests passed" --kind stage
 ```
 
 Add new decisions or findings only when they change remaining work.
+Use dashboard posts as terse shared pipeline checkpoints such as `scope:`, `implement:`, `verify:`, or `blocked:`. Posts are limited to 240 characters; put durable detail in `note add`, `decision add`, `finding add`, tasks, or a handoff.
 
-### 5. Handoff To Master
+### 4. Handoff To Master
 
 When a worker has saved the facts the master needs, publish a handoff:
 
@@ -672,18 +664,30 @@ When a worker has saved the facts the master needs, publish a handoff:
 {command_name} agent bus --json
 ```
 
-The handoff snapshots the current saved working state: open tasks, decisions, files, symbols, and essential relations. The master can read it from the bus and decide the next step without opening the worker's private store directly.
+The handoff snapshots the current saved operational state: open tasks, decisions, plans, risks, and essential relationships. The master can read it from the bus and decide the next step without opening the worker's private store directly.
 
-## Link Agent Items
+### 5. Finish
 
-Use ids returned by `query_context`, `query_graph`, `query_memories`, `inspect`, `agent list`, or `agent search`. After compile with new files, run sync before linking new standard nodes:
+Every agent must leave the working roster when its pass ends, including single-agent and intra-session work:
 
 ```bash
-{command_name} agent sync
-{command_name} agent link AGENT_TASK_ID STANDARD_NODE_ID --relation touches
+{command_name} agent finish "Focused tests passed; dashboard command ready"
+```
+
+`agent finish` snapshots a final handoff, closes the current session, and marks the bus identity completed. It preserves open tasks and durable memory for a later session. Starting a new session marks the agent active again.
+
+## Dashboard Drill-down
+
+Treat dashboard output as a compact attention index, not a complete context dump. When it prints a `drill` line, follow that command only if the referenced task, session, handoff, or code question affects the current work. `agent show` expands one item, `agent map --session current` recovers the current plan, `agent bus --include-payloads` opens handoffs, and `query_context` retrieves canonical code facts.
+
+## Relate Agent Items
+
+Use only ids returned by `agent list`, `agent search`, or earlier `agent` write commands:
+
+```bash
 {command_name} agent link AGENT_TASK_ID AGENT_DECISION_ID --relation implements
-{command_name} agent link AGENT_FINDING_ID STANDARD_SYMBOL_ID --relation explains
-{command_name} agent link-many AGENT_TASK_ID STANDARD_FILE_ID STANDARD_SYMBOL_ID --relation touches
+{command_name} agent link AGENT_FINDING_ID AGENT_DECISION_ID --relation explains
+{command_name} agent batch --link-many AGENT_TASK_ID depends_on AGENT_DECISION_ID,AGENT_RISK_ID
 ```
 
 Supported relation types:
@@ -708,14 +712,14 @@ Use the map only to recover after context loss, thread compaction, a handoff, or
 {command_name} agent map --json
 ```
 
-The map is intentionally operational and compact: open tasks, decisions, files directly touched by agent relations, symbols, and essential agent-created relations. It should not dump findings, fragments, metadata, or every derived standard file unless metadata is explicitly requested.
+The map is intentionally operational and compact. Its context contains durable agent learning and bounded current/previous-session summaries. It never contains project, file, symbol, or canonical graph records.
 
 Search and inspect:
 
 ```bash
 {command_name} agent list --type task --status open --json
-{command_name} agent search "reset working graph" --json
-{command_name} agent search "reset working graph" --json --metadata
+{command_name} agent search "reset behavior" --json
+{command_name} agent search "reset behavior" --json --metadata
 {command_name} agent show AGENT_TASK_ID --json
 {command_name} agent bus --json
 ```
@@ -738,11 +742,11 @@ Reset only when intentionally discarding session-scoped working memory:
 {command_name} agent reset
 ```
 
-Reset recreates `.reql/agent.reql` from the current standard graph and deletes agent-created notes/tasks/decisions/findings/links. It does not modify `.reql/memory.reql`.
+Reset deletes agent-created notes, tasks, decisions, findings, plans, risks, sessions, and their relationships. It neither reads nor modifies `.reql/memory.reql`.
 
 ## Concurrency
 
-Do not run multiple `reql agent` write commands in parallel. If a command reports that the Agent Workspace is busy, retry after the other command finishes. Read commands retry briefly; write commands fail fast with a clear busy message to avoid hidden hangs.
+Different agent ids write independent stores in parallel. Commands targeting the same private store serialize through its lock; `dashboard --agents` is a best-effort detailed view across those independent memories.
 
 Installed for: {platform_name} ({scope}).
 """
@@ -781,7 +785,7 @@ This generated section is shared by supported coding assistants: {supported_clie
 def cursor_rule(*, command_name: str, command_path: Path, fallback_command: str, section_start: str, section_end: str) -> str:
     body = _cursor_body(command_name=command_name, command_path=command_path, fallback_command=fallback_command)
     return f"""---
-description: Use REQL deterministic memory before broad repository exploration
+description: Use REQL deterministic memory to establish bounded repository context
 alwaysApply: true
 ---
 
@@ -847,7 +851,7 @@ def shared_rule_body(
     return f"""{section_start}
 # REQL
 
-Use REQL deterministic memory when {client_name} needs repository context before broad source exploration.
+Use REQL deterministic memory to establish the working set when {client_name} needs repository context.
 
 {body}
 {section_end}
@@ -860,7 +864,7 @@ def _scope(project: bool) -> str:
 
 def _embedded_rule_points() -> tuple[str, ...]:
     return (
-        "When the user types `/reql`, use the generated `reql-agent` skill or this concise REQL rule before broad repository exploration.",
+        "When the user types `/reql`, use the generated `reql-agent` skill or this concise REQL rule to establish the repository working set.",
         *PROJECT_SKILL_SOURCE.rule_points,
         PROJECT_SKILL_SOURCE.deterministic_requirement,
     )

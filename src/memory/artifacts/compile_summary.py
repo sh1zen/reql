@@ -188,9 +188,9 @@ def _semantic_value(value: object) -> object:
 
 
 def _node_statuses(delta: GraphDelta) -> dict[str, str]:
-    statuses = {node_id: "added" for node_id in delta.added_nodes}
-    statuses.update({node_id: "updated" for node_id in delta.updated_nodes})
-    statuses.update({node_id: "archived" for node_id in delta.archived_nodes})
+    statuses = dict.fromkeys(delta.added_nodes, "added")
+    statuses.update(dict.fromkeys(delta.updated_nodes, "updated"))
+    statuses.update(dict.fromkeys(delta.archived_nodes, "archived"))
     return statuses
 
 
@@ -298,4 +298,4 @@ def _normalize_path(path: str) -> str:
 
 def _is_test_path(path: str) -> bool:
     normalized = _normalize_path(path)
-    return normalized.startswith("tests/") or normalized.startswith("test/")
+    return normalized.startswith(("tests/", "test/"))

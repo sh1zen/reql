@@ -33,13 +33,10 @@ class QueryResult:
         if not self.rows:
             return " | ".join(self.columns) + "\n" + " | ".join("-" * len(c) for c in self.columns) + "\n(0 rows)"
 
-        matrix: list[list[str]] = []
-        for row in self.rows:
-            rendered: list[str] = []
-            for col in self.columns:
-                value = row.get(col)
-                rendered.append(_compact(value, max_width=max_width))
-            matrix.append(rendered)
+        matrix = [
+            [_compact(row.get(column), max_width=max_width) for column in self.columns]
+            for row in self.rows
+        ]
         widths = [len(col) for col in self.columns]
         for rendered in matrix:
             for i, value in enumerate(rendered):
@@ -47,8 +44,7 @@ class QueryResult:
         header = " | ".join(col.ljust(widths[i]) for i, col in enumerate(self.columns))
         sep = " | ".join("-" * widths[i] for i in range(len(widths)))
         lines = [header, sep]
-        for rendered in matrix:
-            lines.append(" | ".join(rendered[i].ljust(widths[i]) for i in range(len(widths))))
+        lines.extend(" | ".join(rendered[i].ljust(widths[i]) for i in range(len(widths))) for rendered in matrix)
         lines.append(f"({len(self.rows)} rows)")
         return "\n".join(lines)
 

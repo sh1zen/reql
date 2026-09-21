@@ -98,9 +98,12 @@ def _parse_rule_region(
                 )
                 key = (context, rule_selector, declaration.property_name)
                 previous = latest.get(key)
-                if previous is not None and (item.important or not previous.important):
-                    if previous not in analysis.overridden_declarations:
-                        analysis.overridden_declarations.append(previous)
+                if (
+                    previous is not None
+                    and (item.important or not previous.important)
+                    and previous not in analysis.overridden_declarations
+                ):
+                    analysis.overridden_declarations.append(previous)
                 latest[key] = item
         cursor = closing + 1
 

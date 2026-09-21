@@ -324,6 +324,111 @@ class CodeGraphCompilationTests(unittest.TestCase):
             finally:
                 graph.close()
 
+    def test_field_query_returns_end_to_end_data_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "project"
+            package = root / "pipeline"
+            tests_dir = root / "tests"
+            package.mkdir(parents=True)
+            tests_dir.mkdir()
+            files = {
+                package / "prompts.py": 'FIELD_PROMPT = "Explain Field.type"\n',
+                package / "wire_model.py": (
+                    "from dataclasses import dataclass\n\n"
+                    "@dataclass\n"
+                    "class WireField:\n"
+                    "    type: str\n"
+                ),
+                package / "validation.py": (
+                    "from .wire_model import WireField\n\n"
+                    "def validate_field(field: WireField) -> str:\n"
+                    "    return field.type.strip()\n"
+                ),
+                package / "persisted_model.py": (
+                    "from dataclasses import dataclass\n\n"
+                    "@dataclass\n"
+                    "class PersistedField:\n"
+                    "    type: str\n"
+                ),
+                package / "graph_projection.py": (
+                    "from .persisted_model import PersistedField\n\n"
+                    "def project_graph(field: PersistedField) -> dict[str, str]:\n"
+                    "    return {\"type\": field.type}\n"
+                ),
+                package / "reconciliation.py": (
+                    "from dataclasses import dataclass\n\n"
+                    "@dataclass\n"
+                    "class ReconciledField:\n"
+                    "    type: str\n\n"
+                    "def reconcile(field: ReconciledField) -> str:\n"
+                    "    return field.type\n"
+                ),
+                package / "openapi_compiler.py": (
+                    "from .reconciliation import ReconciledField\n\n"
+                    "def compile_openapi(field: ReconciledField) -> dict[str, str]:\n"
+                    "    return {\"type\": field.type}\n"
+                ),
+                tests_dir / "field_fixture.py": 'EXPECTED_TRACE = "Field.type"\n',
+            }
+            for path, content in files.items():
+                path.write_text(content, encoding="utf-8")
+
+            graph = MemoryGraph.open(Path(td) / "memory.reql")
+            try:
+                result = graph.compile_project(root)
+                self.assertFalse(result.run.errors)
+                payload = graph.query_context_payload(
+                    "Field.type",
+                    top_k=30,
+                    max_depth=3,
+                    max_items=30,
+                )["payload"]
+
+                stages = {row["stage"] for row in payload["data_trace"]}
+                expected_stages = [
+                    "prompt",
+                    "wire model",
+                    "validation",
+                    "persisted model",
+                    "graph projection",
+                    "reconciliation",
+                    "OpenAPI compiler",
+                    "test/fixture",
+                ]
+                self.assertTrue(
+                    set(expected_stages).issubset(stages),
+                    payload["data_trace"],
+                )
+                unique_stages = list(dict.fromkeys(row["stage"] for row in payload["data_trace"]))
+                self.assertEqual([stage for stage in unique_stages if stage in expected_stages], expected_stages)
+                rendered = graph.query_context("Field.type", top_k=30, max_items=30)
+                self.assertIn("End-to-end data trace", rendered)
+
+                nodes = {node.id: node for node in graph.store.all_nodes()}
+                typed_reads = [
+                    edge
+                    for edge in graph.store.get_edges(type_="READS", limit=200)
+                    if edge.properties.get("relation") == "typed_field_reference"
+                ]
+                self.assertTrue(
+                    any(
+                        nodes[edge.from_id].properties.get("qualified_name") == "pipeline.validation.validate_field"
+                        and nodes[edge.to_id].properties.get("qualified_name") == "pipeline.wire_model.WireField.type"
+                        for edge in typed_reads
+                    )
+                )
+
+                explored = graph.query_explore(
+                    "Field.type",
+                    views=["serialization_paths"],
+                    top_k=30,
+                    max_depth=3,
+                    limit=60,
+                )
+                self.assertTrue(any(row.get("depth", 0) > 1 for row in explored["sections"]["serialization_paths"]))
+            finally:
+                graph.close()
+
     def test_compile_links_php_rendered_views_and_surface_assets(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "project"

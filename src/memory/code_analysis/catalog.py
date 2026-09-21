@@ -71,11 +71,7 @@ def normalize_language(language: str | None) -> str | None:
         return None
     value = language.casefold().strip().lstrip(".")
     for key, spec in CODE_LANGUAGE_CATALOG.items():
-        if value == key:
-            return key
-        if value == spec["display"].casefold():
-            return key
-        if value in {alias.casefold() for alias in spec.get("aliases", ())}:
+        if value == key or value == spec["display"].casefold() or value in {alias.casefold() for alias in spec.get("aliases", ())}:
             return key
     return None
 
@@ -85,19 +81,15 @@ def display_language_for_path(path: str | Path) -> str | None:
     suffix = candidate.suffix.casefold()
     basename = candidate.name.casefold()
     for spec in CODE_LANGUAGE_CATALOG.values():
-        if suffix in spec.get("extensions", ()):
-            return spec["display"]
-        if basename in spec.get("basenames", ()):
+        if suffix in spec.get("extensions", ()) or basename in spec.get("basenames", ()):
             return spec["display"]
     return None
 
 
 def detect_code_language(artifact: Any) -> str | None:
-    detected = normalize_language(getattr(artifact, "language", None))
-    if detected:
-        return detected
-    path = getattr(artifact, "path", "")
-    return normalize_language(display_language_for_path(Path(path)))
+    return normalize_language(getattr(artifact, "language", None)) or normalize_language(
+        display_language_for_path(getattr(artifact, "path", ""))
+    )
 
 
 def language_key(language: str | None) -> str:
@@ -162,5 +154,4 @@ def _language_pack_keys(language: str) -> tuple[str, ...]:
     aliases = LANGUAGE_PACK_ALIASES.get(language, ())
     display = CODE_LANGUAGE_CATALOG.get(language, {}).get("display", "")
     normalized_display = display.casefold().replace("#", "sharp").replace("+", "p").replace(" ", "_")
-    candidates = [language, *aliases, normalized_display]
-    return tuple(item for index, item in enumerate(candidates) if item and item not in candidates[:index])
+    return tuple(dict.fromkeys(item for item in (language, *aliases, normalized_display) if item))

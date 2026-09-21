@@ -56,6 +56,17 @@ def _ensure_readable_storage_payload(path: Path) -> None:
         raise StorageError(f"Cannot open missing REQL storage in read-only mode: {path}")
 
 
+def _storage_snapshot_signature(path: Path) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
+    def signature(target: Path) -> tuple[int, int] | None:
+        try:
+            stat = target.stat()
+        except FileNotFoundError:
+            return None
+        return stat.st_size, stat.st_mtime_ns
+
+    return signature(path), signature(path.with_name(f"{path.name}.wal"))
+
+
 class MemoryGraph:
     """Stable public facade over the memory subsystem.
 
@@ -109,22 +120,45 @@ class MemoryGraph:
         read_only: bool = False,
         snapshot: bool = False,
         defer_lexical_index: bool = False,
+        lock_timeout_seconds: float | None = None,
     ) -> MemoryGraphT:
         storage_path = Path(path).expanduser()
         if read_only:
             _ensure_readable_storage_payload(storage_path)
-        store = BlockGraphStore(
-            storage_path,
-            read_only=read_only,
-            snapshot=snapshot,
-            defer_lexical_index=defer_lexical_index,
-        )
+        effective_snapshot = snapshot
+        options: dict[str, Any] = {
+            "read_only": read_only,
+            "snapshot": effective_snapshot,
+            "defer_lexical_index": defer_lexical_index,
+        }
+        if lock_timeout_seconds is not None:
+            options["lock_timeout_seconds"] = lock_timeout_seconds
+        elif read_only and not snapshot:
+            options["lock_timeout_seconds"] = 0.05
+        store = None
+        for _ in range(3 if read_only else 1):
+            before = _storage_snapshot_signature(storage_path) if effective_snapshot else None
+            try:
+                candidate = BlockGraphStore(storage_path, **options)
+            except StorageError as exc:
+                if not read_only or effective_snapshot or "locked" not in str(exc).casefold():
+                    raise
+                effective_snapshot = True
+                options["snapshot"] = True
+                before = _storage_snapshot_signature(storage_path)
+                candidate = BlockGraphStore(storage_path, **options)
+            after = _storage_snapshot_signature(storage_path) if effective_snapshot else None
+            if not effective_snapshot or before == after:
+                store = candidate
+                break
+            candidate.close()
+        if store is None:
+            raise StorageError(f"REQL snapshot changed repeatedly while opening {storage_path}; retry the read")
         try:
             return cls(store, extractor=extractor, config=config, profile_logger=profile_logger)
         except Exception:
             store.close()
             raise
-
     def enable_profile_log(self, path: str | Path, *, command: str | None = None) -> PerformanceLogger:
         logger = PerformanceLogger(path, command=command)
         self.profile_logger = logger
@@ -143,7 +177,6 @@ class MemoryGraph:
         self,
         text: str,
         *,
-
         top_k: int = 20,
         max_depth: int = 3,
         min_activation: float = 0.03,
@@ -168,7 +201,6 @@ class MemoryGraph:
         self,
         text: str,
         *,
-
         top_k: int = 20,
         max_depth: int = 3,
         max_items: int = 18,
@@ -189,7 +221,6 @@ class MemoryGraph:
         self,
         text: str,
         *,
-
         top_k: int = 12,
         max_depth: int = 2,
         max_nodes: int = 80,
@@ -243,7 +274,6 @@ class MemoryGraph:
         self,
         text: str,
         *,
-
         top_k: int = DEFAULT_TOP_K,
         max_depth: int = DEFAULT_MAX_DEPTH,
         max_items: int = DEFAULT_MAX_ITEMS,
@@ -275,7 +305,6 @@ class MemoryGraph:
         self,
         text: str,
         *,
-
         top_k: int = DEFAULT_TOP_K,
         max_depth: int = DEFAULT_MAX_DEPTH,
         max_items: int = DEFAULT_MAX_ITEMS,
@@ -284,7 +313,7 @@ class MemoryGraph:
         include_archived: bool = False,
     ) -> dict[str, Any]:
         """Return the versioned structured query-context envelope."""
-        result = self.query_context_result(
+        return self.query_context_result(
             QueryContextRequest.from_raw(
                 text=text,
                 mode=mode,
@@ -294,14 +323,12 @@ class MemoryGraph:
                 max_items=max_items,
                 include_archived=include_archived,
             )
-        )
-        return result.to_dict()
+        ).to_dict()
 
     def query_memories(
         self,
         text: str,
         *,
-
         top_k: int = 12,
         max_depth: int = 2,
         limit: int = 12,
@@ -328,7 +355,6 @@ class MemoryGraph:
         self,
         text: str,
         *,
-
         top_k: int = 12,
         max_depth: int = 2,
         limit: int = 12,
@@ -355,7 +381,6 @@ class MemoryGraph:
         self,
         seed_node_ids: list[str],
         *,
-
         max_depth: int = 3,
         min_activation: float = 0.03,
     ) -> ActivationResult:
@@ -439,7 +464,6 @@ class MemoryGraph:
         self,
         path: str | Path,
         *,
-
         max_file_size_bytes: int = 10 * 1024 * 1024,
         include_patterns: list[str] | None = None,
         exclude_patterns: list[str] | None = None,
@@ -462,7 +486,6 @@ class MemoryGraph:
         self,
         path: str | Path,
         *,
-
         max_file_size_bytes: int = 10 * 1024 * 1024,
         include_patterns: list[str] | None = None,
         exclude_patterns: list[str] | None = None,
@@ -486,7 +509,6 @@ class MemoryGraph:
         self,
         path: str | Path,
         *,
-
         max_file_size_bytes: int = 10 * 1024 * 1024,
         include_patterns: list[str] | None = None,
         exclude_patterns: list[str] | None = None,
@@ -516,7 +538,6 @@ class MemoryGraph:
         self,
         path: str | Path,
         *,
-
         max_file_size_bytes: int = 10 * 1024 * 1024,
         include_patterns: list[str] | None = None,
         exclude_patterns: list[str] | None = None,
@@ -540,7 +561,6 @@ class MemoryGraph:
         self,
         path: str | Path,
         *,
-
         max_file_size_bytes: int = 10 * 1024 * 1024,
         include_patterns: list[str] | None = None,
         exclude_patterns: list[str] | None = None,
@@ -570,7 +590,6 @@ class MemoryGraph:
 
     def detect_communities(
         self,
-
         project_id: str | None = None,
         options: dict[str, Any] | None = None,
         limit: int | None = None,
@@ -579,7 +598,6 @@ class MemoryGraph:
 
     def analyze_hubs(
         self,
-
         project_id: str | None = None,
         limit: int = 20,
         node_types: set[str] | None = None,
@@ -641,7 +659,6 @@ class MemoryGraph:
         self,
         node_id: str,
         *,
-
         limit: int = 30,
     ) -> dict[str, Any]:
         """Return a node, its local graph context, and source/location hints."""

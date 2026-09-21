@@ -45,10 +45,7 @@ class ScanExcludeRule:
         if len(candidate) < len(self.segments):
             return False
         compared = candidate if self.anchored else candidate[-len(self.segments) :]
-        for actual, expected in zip(compared, self.segments):
-            if actual != expected:
-                return False
-        return True
+        return compared == self.segments
 
 
 def resolve_scan_exclude_pattern(pattern: str) -> ScanExcludeRule:
@@ -74,8 +71,7 @@ def resolve_scan_exclude_pattern(pattern: str) -> ScanExcludeRule:
         raise _invalid_pattern(pattern, "absolute paths are not allowed")
     if len(raw_path) >= 2 and raw_path[1] == ":":
         raise _invalid_pattern(pattern, "drive-qualified paths are not allowed")
-    if raw_path.endswith("/"):
-        raw_path = raw_path[:-1]
+    raw_path = raw_path.removesuffix("/")
     if not raw_path:
         raise _invalid_pattern(pattern, "a file or directory name is required")
 

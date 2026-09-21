@@ -21,16 +21,14 @@ def strip_accents(value: str) -> str:
 def normalize_text(value: str) -> str:
     value = value.strip().replace("\u2019", "'").replace("\u2018", "'")
     value = value.replace("\u201c", '"').replace("\u201d", '"')
-    value = re.sub(r"\s+", " ", value)
-    return value
+    return re.sub(r"\s+", " ", value)
 
 
 def canonicalize(value: str) -> str:
     value = normalize_text(value).lower()
     value = strip_accents(value)
     value = re.sub(r"[^a-z0-9_\-\s]", " ", value)
-    value = re.sub(r"\s+", " ", value).strip()
-    return value
+    return re.sub(r"\s+", " ", value).strip()
 
 
 def token_signal_score(token: str) -> float:

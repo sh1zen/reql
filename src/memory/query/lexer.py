@@ -157,10 +157,10 @@ def tokenize_reql(source: str) -> list[Token]:
             tokens.append(Token("SYMBOL", ch, i))
             i += 1
             continue
-        if _is_ident_start(ch):
+        if ch.isalpha() or ch == "_":
             start = i
             i += 1
-            while i < length and _is_ident_part(source[i]):
+            while i < length and (source[i].isalnum() or source[i] in {"_", "-", "$"}):
                 i += 1
             value = source[start:i]
             upper = value.upper()
@@ -172,11 +172,3 @@ def tokenize_reql(source: str) -> list[Token]:
         raise REQLSyntaxError(f"Unexpected character {ch!r} at position {i}")
     tokens.append(Token("EOF", "", length))
     return tokens
-
-
-def _is_ident_start(ch: str) -> bool:
-    return ch.isalpha() or ch == "_"
-
-
-def _is_ident_part(ch: str) -> bool:
-    return ch.isalnum() or ch in {"_", "-", "$"}

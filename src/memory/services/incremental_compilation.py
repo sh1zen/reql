@@ -10,6 +10,7 @@ from ..diagnostics import PerformanceLogger
 from ..artifacts.cache import ArtifactCache, ArtifactCacheEntry, DirtySet, artifact_cache_path
 from ..artifacts.compile_summary import CompilationSummary, build_compilation_summary, capture_symbol_state
 from ..artifacts.compiler import (
+    ArtifactContentChangedError,
     ArtifactCompiler,
     archive_artifact_fragments,
     link_document_fragments_to_code,
@@ -25,6 +26,7 @@ from ..artifacts.revision import ProjectRevision, RevisionRepository
 from ..artifacts.scanner import DEFAULT_MAX_FILE_SIZE_BYTES, ProjectScanner
 from ..artifacts.structural_links import refresh_project_structural_links
 from ..domain.ids import stable_id
+from ..domain.exceptions import StorageError
 from ..domain.models import MemoryEdge, MemoryNode
 from ..domain.timeutils import utcnow_iso
 from ..storage.graph_store import GraphStore
@@ -125,16 +127,24 @@ class IncrementalCompilationService:
         profile = self.profile_logger
         compile_start = profile.span("compile.total", path=Path(path).expanduser().resolve(strict=False)) if profile else nullcontext()
         with compile_start:
-            return self._compile_path(
-                path,
-
-                max_file_size_bytes=max_file_size_bytes,
-                include_patterns=include_patterns,
-                exclude_patterns=exclude_patterns,
-                config_path=config_path,
-                cache_enabled=cache_enabled,
-                parsing_options=parsing_options,
-            )
+            for attempt in range(3):
+                try:
+                    return self._compile_path(
+                        path,
+                        max_file_size_bytes=max_file_size_bytes,
+                        include_patterns=include_patterns,
+                        exclude_patterns=exclude_patterns,
+                        config_path=config_path,
+                        cache_enabled=cache_enabled,
+                        parsing_options=parsing_options,
+                    )
+                except ArtifactContentChangedError as exc:
+                    if attempt == 2:
+                        raise StorageError(
+                            "Project files changed during three consecutive compile attempts; "
+                            "the previous committed graph and cache were preserved. Retry when writes settle."
+                        ) from exc
+            raise AssertionError("unreachable compile retry state")
 
     def _compile_path(
         self,
@@ -200,9 +210,10 @@ class IncrementalCompilationService:
                 files_deleted=run.files_deleted,
             )
 
-        with (profile.span("compile.transaction", changed=run.files_changed, deleted=run.files_deleted) if profile else nullcontext()):
-            with self.store.transaction():
-                delta, revision = self._apply_compile_transaction(scan, dirty, compiler, cache, cache_enabled, recovered_artifact_ids, artifacts_by_id, aggregate, run, profile)
+        with (profile.span("compile.transaction", changed=run.files_changed, deleted=run.files_deleted) if profile else nullcontext()), self.store.transaction():
+            delta, revision, pending_disk_entries = self._apply_compile_transaction(scan, dirty, compiler, cache, cache_enabled, recovered_artifact_ids, artifacts_by_id, aggregate, run, profile)
+        if cache_enabled and pending_disk_entries:
+            cache.persist_disk_entries(pending_disk_entries)
         checkpoint = self._checkpoint_store_if_needed(profile)
 
         for node_id in aggregate.affected_node_ids:
@@ -258,7 +269,7 @@ class IncrementalCompilationService:
         aggregate: ArtifactCompilationResult,
         run: CompilationRun,
         profile: PerformanceLogger | None,
-    ) -> tuple[GraphDelta, ProjectRevision | None]:
+    ) -> tuple[GraphDelta, ProjectRevision | None, list[ArtifactCacheEntry]]:
         pending_disk_entries: list[ArtifactCacheEntry] = []
         for artifact_id in sorted(recovered_artifact_ids):
             artifact = artifacts_by_id[artifact_id]
@@ -270,8 +281,10 @@ class IncrementalCompilationService:
         for artifact_id in sorted(dirty.changed_artifact_ids):
             artifact = artifacts_by_id[artifact_id]
             try:
-                with (profile.span("compile.artifact", artifact_id=artifact.id, relative_path=artifact.relative_path, size_bytes=artifact.size_bytes, artifact_type=artifact.artifact_type, language=artifact.language or "") if profile else nullcontext()):
+                with (profile.span("compile.artifact", artifact_id=artifact.id, relative_path=artifact.relative_path, size_bytes=artifact.size_bytes, artifact_type=artifact.artifact_type, language=artifact.language or "") if profile else nullcontext()), self.store.transaction():
                     result = compiler.compile_artifact(self.store, artifact)
+            except ArtifactContentChangedError:
+                raise
             except Exception as exc:  # keep prior graph/cache intact for this artifact
                 run.errors.append(f"{artifact.relative_path}: {exc}")
                 if profile:
@@ -297,10 +310,6 @@ class IncrementalCompilationService:
                     archived_edges=len(result.archived_edges),
                     errors=len(result.errors),
                 )
-
-        if cache_enabled and pending_disk_entries:
-            with (profile.span("compile.cache_flush", entries=len(pending_disk_entries)) if profile else nullcontext()):
-                cache.persist_disk_entries(pending_disk_entries)
 
         if dirty.changed_artifact_ids and not run.errors:
             with (profile.span("compile.refresh_structural_links", changed=len(dirty.changed_artifact_ids)) if profile else nullcontext()):
@@ -384,7 +393,7 @@ class IncrementalCompilationService:
                 run_id=run.id,
                 artifacts=scan.artifacts,
             )
-        return delta, revision
+        return delta, revision, pending_disk_entries
 
     def _archive_deleted_artifact_node(self, node_id: str) -> None:
         node = self.store.get_node(node_id, clone=False)
@@ -673,12 +682,11 @@ class IncrementalCompilationService:
         changed_artifacts = [artifacts_by_id[artifact_id] for artifact_id in changed_artifact_ids if artifact_id in artifacts_by_id]
         if any(artifact.artifact_type == "code" for artifact in changed_artifacts):
             return None
-        document_ids = {
+        return {
             artifact.id
             for artifact in changed_artifacts
             if artifact.artifact_type in {"markdown", "text", "config", "data", "unknown"} and compiler.document_ingest_enabled(artifact)
         }
-        return document_ids
 
     @staticmethod
     def _document_ingest_enabled(compiler: ArtifactCompiler) -> bool:
@@ -795,9 +803,7 @@ def _skip_orphan_directory_candidate(directory: str) -> bool:
     parts = [part for part in directory.split("/") if part]
     if not parts:
         return True
-    if len(parts) == 1 and parts[0] in ORPHAN_DIRECTORY_COMMON_ROOTS:
-        return True
-    return False
+    return len(parts) == 1 and parts[0] in ORPHAN_DIRECTORY_COMMON_ROOTS
 
 
 def _orphan_directory_confidence(directory: str) -> float:

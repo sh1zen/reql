@@ -12,9 +12,11 @@ from .query_context import (
     ContextPayload,
     ContextResult,
     ContextScope,
+    GraphFreshness,
     QueryContextRequest,
     QueryMode,
     RetrievalBudget,
+    SourceRevision,
 )
 
 __all__ = [
@@ -29,7 +31,9 @@ __all__ = [
     "ContextPayload",
     "ContextResult",
     "ContextScope",
+    "GraphFreshness",
     "QueryContextRequest",
     "QueryMode",
     "RetrievalBudget",
+    "SourceRevision",
 ]

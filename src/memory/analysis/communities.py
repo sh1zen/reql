@@ -29,7 +29,6 @@ class CommunityDetector:
     def detect(
         self,
         *,
-
         project_id: str | None = None,
         limit: int | None = None,
         options: dict[str, Any] | None = None,
@@ -51,7 +50,7 @@ class CommunityDetector:
                 if not scores:
                     continue
                 best_score = max(scores.values())
-                best = sorted(label for label, score in scores.items() if score == best_score)[0]
+                best = min(label for label, score in scores.items() if score == best_score)
                 if best != labels[node_id]:
                     labels[node_id] = best
                     changed = True
@@ -71,14 +70,13 @@ class CommunityDetector:
         nodes_by_id = {node.id: node for node in nodes}
         for index, member_ids in enumerate(communities, start=1):
             community_id = stable_id("community", project_id or "global", ",".join(member_ids))
-            member_nodes = [nodes_by_id[node_id] for node_id in member_ids if node_id in nodes_by_id]
+            member_nodes = [nodes_by_id[node_id] for node_id in member_ids]
             label = _community_label(member_nodes, index)
             density = _density(member_ids, adjacency)
-            salience = sum(node.salience for node in member_nodes) / max(len(member_ids), 1)
+            salience = sum(node.salience for node in member_nodes) / len(member_ids)
             now = utcnow_iso()
             community_node = MemoryNode(
                 id=community_id,
-
                 type="Community",
                 label=label,
                 canonical_key=community_id,
@@ -105,7 +103,6 @@ class CommunityDetector:
                 self.store.upsert_edge(
                     MemoryEdge(
                         id=stable_id("edge", node_id, "BELONGS_TO_COMMUNITY", community_node.id),
-
                         from_id=node_id,
                         to_id=community_node.id,
                         type="BELONGS_TO_COMMUNITY",

@@ -20,6 +20,7 @@ from .incremental_compilation import CompileProjectResult, IncrementalCompilatio
 
 
 SleepFn = Callable[[float], None]
+ChangeFn = Callable[[], None]
 
 
 @dataclass(slots=True)
@@ -227,10 +228,17 @@ class ProjectWatchService:
 
 
 class _WatchdogChangeHandler(FileSystemEventHandler):
-    def __init__(self, changed: Event, *, ignored_paths: tuple[Path, ...] = ()) -> None:
+    def __init__(
+        self,
+        changed: Event,
+        *,
+        ignored_paths: tuple[Path, ...] = (),
+        on_change: ChangeFn | None = None,
+    ) -> None:
         super().__init__()
         self.changed = changed
         self.ignored_paths = tuple(path.expanduser().resolve(strict=False) for path in ignored_paths)
+        self.on_change = on_change
 
     def on_any_event(self, event: object) -> None:
         event_paths = [
@@ -241,6 +249,8 @@ class _WatchdogChangeHandler(FileSystemEventHandler):
         if event_paths and all(self._is_ignored(path) for path in event_paths):
             return
         self.changed.set()
+        if self.on_change is not None:
+            self.on_change()
 
     def _is_ignored(self, path: Path) -> bool:
         return any(path == ignored or path.is_relative_to(ignored) for ignored in self.ignored_paths)

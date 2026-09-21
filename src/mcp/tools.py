@@ -7,28 +7,61 @@ server.
 """
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from threading import Event
+from typing import Any
 
-from memory.config import ConfigError, REQLConfig, load_effective_config, resolve_config_path
+from api.memory_graph import MemoryGraph
 from memory.artifacts.options import CompilationOptions
+from memory.config import (
+    ConfigError,
+    REQLConfig,
+    load_effective_config,
+    resolve_config_path,
+)
+from memory.domain.exceptions import REQLError, StorageError
 from memory.domain.query_context import (
     DEFAULT_MAX_DEPTH as DEFAULT_CONTEXT_MAX_DEPTH,
+)
+from memory.domain.query_context import (
     DEFAULT_MAX_ITEMS as DEFAULT_CONTEXT_MAX_ITEMS,
+)
+from memory.domain.query_context import (
     DEFAULT_TOP_K as DEFAULT_CONTEXT_TOP_K,
+)
+from memory.domain.query_context import (
     MAX_DEPTH as MAX_CONTEXT_DEPTH,
+)
+from memory.domain.query_context import (
     MAX_ITEMS as MAX_QUERY_CONTEXT_ITEMS,
+)
+from memory.domain.query_context import (
     MAX_TOP_K as MAX_QUERY_CONTEXT_TOP_K,
+)
+from memory.domain.query_context import (
     MIN_DEPTH as MIN_CONTEXT_DEPTH,
+)
+from memory.domain.query_context import (
     MIN_ITEMS as MIN_QUERY_CONTEXT_ITEMS,
+)
+from memory.domain.query_context import (
     MIN_TOP_K as MIN_QUERY_CONTEXT_TOP_K,
+)
+from memory.domain.query_context import (
     QueryContextRequest,
 )
-from memory.domain.exceptions import REQLError
+from memory.domain.timeutils import utcnow_iso
+from memory.freshness import write_watch_state
 from memory.security import SecurityError, sanitize_agent_text, validate_mcp_path
-from api.memory_graph import MemoryGraph
+from memory.services.project_watch import (
+    Observer,
+    ProjectWatchEvent,
+    _WatchdogChangeHandler,
+)
+from memory.storage import StoreLease
 
 MAX_TOP_K = 50
 MAX_DEPTH = 5
@@ -121,7 +154,7 @@ def query_context(
     """Return a bounded deterministic context block for a task/query."""
     config = _load_tool_config(config_path, config_overrides)
     query = _required_text(query, "query")
-    selected_scopes = list(_optional_string_list(scopes, "scopes") or [])
+    selected_scopes = _optional_string_list(scopes, "scopes") or []
     for enabled, scope in ((code, "code"), (docs, "docs"), (test, "test")):
         if enabled and scope not in selected_scopes:
             selected_scopes.append(scope)
@@ -379,33 +412,79 @@ def reql_watch_project(
     iterations = _bounded_int(max_iterations, "max_iterations", minimum=1, maximum=100)
     interval = _bounded_float(interval_seconds, "interval_seconds", minimum=0.0, maximum=3600.0)
     debounce = _bounded_float(debounce_seconds, "debounce_seconds", minimum=0.0, maximum=60.0)
-    with _open_graph(storage_path, config) as graph:
-        events = [
-            _watch_event_payload(event)
-            for event in graph.watch_project(
-                path,
-                max_file_size_bytes=config.scan.max_file_size_bytes,
-                include_patterns=config.scan.include,
-                exclude_patterns=config.scan.exclude,
-                config_path=resolve_config_path(config_path, start_dir=path),
-                cache_enabled=config.cache.enabled if cache_enabled is None else bool(cache_enabled),
-                parsing_options=CompilationOptions.from_config(config),
-                interval_seconds=interval,
-                debounce_seconds=debounce,
-                max_iterations=iterations,
-            )
-        ]
-        compiled = [event for event in events if event["compiled"]]
-        errors = [error for event in events for error in event["errors"]]
-        return {
-            "summary": {
-                "path": path,
-                "polls": len(events),
-                "compiled_polls": len(compiled),
-                "errors": errors,
-            },
-            "events": events,
-        }
+    if Observer is None:
+        raise MCPToolError("watchdog is required for monitor mode; install the watchdog package")
+    storage = Path(storage_path)
+    root = Path(path)
+    changed = Event()
+
+    def mark_stale() -> None:
+        write_watch_state(storage, status="stale", pending_paths=1)
+
+    observer = Observer()
+    observer.schedule(
+        _WatchdogChangeHandler(changed, ignored_paths=(root / ".reql",), on_change=mark_stale),
+        str(root),
+        recursive=True,
+    )
+    events: list[dict[str, Any]] = []
+    lease_target = storage.with_name(f"{storage.name}.watch")
+    with StoreLease(lease_target, timeout_seconds=0.0):
+        observer.start()
+        try:
+            for iteration in range(1, iterations + 1):
+                if iteration > 1:
+                    changed.wait(interval)
+                    if changed.is_set() and debounce:
+                        changed.clear()
+                        changed.wait(debounce)
+                    changed.clear()
+                write_watch_state(storage, status="refreshing", pending_paths=1)
+                with _open_graph(str(storage), config) as graph:
+                    result = graph.compile_project(
+                        root,
+                        max_file_size_bytes=config.scan.max_file_size_bytes,
+                        include_patterns=config.scan.include,
+                        exclude_patterns=config.scan.exclude,
+                        config_path=resolve_config_path(config_path, start_dir=path),
+                        cache_enabled=config.cache.enabled if cache_enabled is None else bool(cache_enabled),
+                        parsing_options=CompilationOptions.from_config(config),
+                    )
+                    committed = result.revision or graph.revisions.latest(result.scan.project.id)
+                write_watch_state(
+                    storage,
+                    status="stale" if result.run.errors or changed.is_set() else "current",
+                    pending_paths=(len(result.dirty_set.changed_artifact_ids) or 1) if result.run.errors or changed.is_set() else 0,
+                    source_revision_id=committed.id if committed else None,
+                )
+                events.append(
+                    _watch_event_payload(
+                        ProjectWatchEvent(
+                            iteration=iteration,
+                            checked_at=utcnow_iso(),
+                            project_path=str(root.resolve(strict=False)),
+                            total_artifacts=len(result.scan.artifacts),
+                            dirty_artifacts=len(result.dirty_set.changed_artifact_ids),
+                            deleted_artifacts=len(result.dirty_set.deleted_artifact_ids),
+                            compiled=bool(result.dirty_set.changed_artifact_ids or result.dirty_set.deleted_artifact_ids),
+                            result=result,
+                            errors=tuple(result.run.errors),
+                        )
+                    )
+                )
+        finally:
+            observer.stop()
+            observer.join(timeout=5)
+    errors = [error for event in events for error in event["errors"]]
+    return {
+        "summary": {
+            "path": path,
+            "polls": len(events),
+            "compiled_polls": sum(event["compiled"] for event in events),
+            "errors": errors,
+        },
+        "events": events,
+    }
 
 
 def _watch_event_payload(event: Any) -> dict[str, Any]:
@@ -701,10 +780,6 @@ def _load_tool_config(
         raise MCPToolError(str(exc)) from exc
 
 
-def _graph_scope(config: REQLConfig) -> str:
-    return "default"
-
-
 def _reql_statement_requires_write(statement: str) -> bool:
     first = statement.strip().split(None, 1)[0].rstrip(";").upper() if statement.strip() else ""
     return first in MUTATING_REQL_COMMANDS
@@ -713,7 +788,17 @@ def _reql_statement_requires_write(statement: str) -> bool:
 @contextmanager
 def _open_graph(storage_path: str, config: REQLConfig, *, read_only: bool = False) -> Iterator[MemoryGraph]:
     storage_path = str(validate_mcp_path(_required_path_text(storage_path, "storage_path"), name="storage_path"))
-    graph = MemoryGraph.open(Path(storage_path), config=config, read_only=read_only)
+    try:
+        graph = MemoryGraph.open(
+            Path(storage_path),
+            config=config,
+            read_only=read_only,
+            lock_timeout_seconds=0.05 if read_only else None,
+        )
+    except StorageError as exc:
+        if not read_only or "locked" not in str(exc).casefold():
+            raise
+        graph = MemoryGraph.open(Path(storage_path), config=config, read_only=True, snapshot=True)
     try:
         yield graph
     finally:

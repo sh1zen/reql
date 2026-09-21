@@ -329,12 +329,7 @@ def _clean_type_text(raw: str) -> str | None:
 
 
 def _params(source: bytes, node: Any | None) -> list[str]:
-    names: list[str] = []
-    for child in _named_children(node):
-        name = _param_name(source, child)
-        if name:
-            names.append(name)
-    return names
+    return [name for child in _named_children(node) if (name := _param_name(source, child))]
 
 
 def _param_name(source: bytes, node: Any) -> str | None:
@@ -398,9 +393,7 @@ _SYMBOL_NAME_STOP_WORDS = {
 
 def _valid_symbol_name(name: str) -> bool:
     value = name.strip()
-    if not value or value.casefold() in _SYMBOL_NAME_STOP_WORDS:
-        return False
-    return any(char.isalpha() or char == "_" for char in value)
+    return bool(value) and value.casefold() not in _SYMBOL_NAME_STOP_WORDS and any(char.isalpha() or char == "_" for char in value)
 
 
 def _module_name(relative_path: str) -> str:

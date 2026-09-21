@@ -145,7 +145,7 @@ def classify_path(path: str | Path, sample: bytes) -> Classification:
             return Classification("code", "Ruby", False)
         if "php" in shebang:
             return Classification("code", "PHP", False)
-    if head.startswith("{") or head.startswith("["):
+    if head.startswith(("{", "[")):
         return Classification("data", "JSON", False)
     if head.startswith("# "):
         return Classification("markdown", "Markdown", False)
@@ -187,10 +187,7 @@ def is_unsupported_media_file(path: str | Path, sample: bytes) -> bool:
     if suffix in UNSUPPORTED_MEDIA_EXTENSIONS:
         return True
     return (
-        sample.startswith(b"\x89PNG\r\n\x1a\n")
-        or sample.startswith(b"\xff\xd8\xff")
-        or sample.startswith(b"GIF87a")
-        or sample.startswith(b"GIF89a")
+        sample.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a"))
         or sample.startswith(b"RIFF") and sample[8:12] == b"WEBP"
         or len(sample) >= 12 and sample[4:8] == b"ftyp"
     )

@@ -134,8 +134,10 @@ trace metadata, deterministic graph revision fingerprinting, and canonical
 envelope serialization. Providers do not call retrieval components directly.
 
 `query_context_result` exposes the typed result. Python structured output, CLI
-JSON, and MCP all serialize it as the same envelope with `schema_version`,
-`graph_revision`, `confidence`, and a nested `payload`.
+JSON, and MCP serialize schema-v2 envelopes with the query-specific
+`graph_revision`, committed `source_revision`, explicit freshness metadata,
+`confidence`, and a nested `payload`. A locked reader may use a validated
+complete checkpoint/WAL snapshot rather than waiting for an active writer.
 
 Agent context is built with `reql query_context --query ...`, dependency slices
 from `reql query_explore --query ...`, or the structured
@@ -181,6 +183,35 @@ their relation and workflow ids; strongly connected components are marked as
 feedback cycles. `MemoryGraph.project_pipeline` returns the versioned typed
 payload without persisting nodes or metrics. The CLI renders that payload as
 Mermaid or as an embedded-data `vis-network` HTML file.
+
+## Agent Operational Memory
+
+`reql agent` is a separate operational-memory boundary for decisions, tasks,
+plans, findings, risks, sessions, and handoffs. It does not derive from, copy,
+query, or synchronize canonical project nodes. Relationships created through
+agent commands may connect only records owned by that same private agent store.
+
+The canonical project graph remains the sole owner of repository identity,
+files, symbols, source spans, dependencies, and code relationships. Coding
+agents obtain those facts through the normal project query APIs, never through
+their operational memory. Existing agent stores are migrated lazily by removing
+legacy canonical copies and any relationships that referenced them while
+preserving all agent-owned records and relationships among those records.
+
+`reql agent dashboard` is a bounded read projection over the selected private
+store and shared bus. It may publish one short bus checkpoint before reading,
+but never persists a second dashboard model. The projection separates active
+and completed agent identities, carries one previous-session summary for
+inter-session continuity, and points deeper reads back to the authoritative
+private item, session map, handoff payload, or canonical project query.
+`reql agent finish` publishes the final handoff, closes the current session,
+and changes the bus identity from active to completed without deleting saved
+tasks or history; starting another session reactivates it.
+
+The canonical CLI writes typed notes through `agent note add` and `note.add`
+batch operations. `dashboard --agents` owns explicit cross-store inspection.
+Legacy `overview`, `publish`, and standalone `link-many` entry points remain
+thin compatibility aliases and do not define separate service behavior.
 
 ## Maintenance
 

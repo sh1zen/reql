@@ -83,7 +83,7 @@ class GraphExpansionMixin:
                 next_depth = depth + 1
                 metrics = metrics_for(neighbor)
                 neighbor_tokens = set(metrics.overlap_tokens)
-                combined_tokens = set(path_tokens) | neighbor_tokens
+                combined_tokens = path_tokens | neighbor_tokens
                 previous_depth = seen_depth.get(neighbor.id)
                 existing = candidates.get(neighbor.id)
                 if (
@@ -141,9 +141,7 @@ class GraphExpansionMixin:
         scopes = self._normalize_query_context_scopes(query.context_scopes)
         if scopes and not self._node_matches_query_context_scope(node, scopes):
             return False
-        if not query.include_archived and node.status in INACTIVE_STATUSES:
-            return False
-        return True
+        return query.include_archived or node.status not in INACTIVE_STATUSES
 
     def _add_path_candidate(
         self,
@@ -172,10 +170,8 @@ class GraphExpansionMixin:
             + type_bonus
             - depth_penalty
         )
-        if node.type in SOURCE_NODE_TYPES and edge_ids:
-            score = clamp(score - 0.08)
-        elif node.type in SOURCE_NODE_TYPES:
-            score = clamp(score - 0.16)
+        if node.type in SOURCE_NODE_TYPES:
+            score = clamp(score - (0.08 if edge_ids else 0.16))
         if len(query_profile.informative_tokens) >= 4 and metrics.match_score < 0.10 and path_coverage < 0.35:
             return
         existing = candidates.get(node.id)

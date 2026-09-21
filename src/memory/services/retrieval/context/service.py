@@ -318,6 +318,7 @@ class ContextServiceMixin:
                 "working_set": code_payload.get("working_set", [])[: min(max_items, limit)],
                 "read_plan": code_payload.get("read_plan", [])[: min(max_items, limit)],
                 "change_chain": code_payload.get("change_chain", [])[: min(max_items, limit)],
+                "data_trace": code_payload.get("data_trace", [])[: min(max_items, limit)],
                 "targeted_reads": code_payload.get("targeted_reads", [])[: min(max_items, limit)],
                 "snippets": code_payload.get("snippets", [])[: min(max_items, limit)],
                 "symbols": code_payload.get("symbols", [])[: min(max_items, limit)],
@@ -350,9 +351,8 @@ class ContextServiceMixin:
         query_scopes: Sequence[str] | None = None,
     ) -> str:
         """Return the compact deterministic context block for a query."""
-        scoped_query = replace(query, context_scopes=set(query_scopes) if query_scopes else query.context_scopes)
         return self.compose_context(
-            self.retrieve(scoped_query),
+            self.retrieve(replace(query, context_scopes=set(query_scopes) if query_scopes else query.context_scopes)),
             max_items=max_items,
             query_mode=query_mode,
             query_scopes=query_scopes,
@@ -602,13 +602,11 @@ class ContextServiceMixin:
         lines = ["# REQL Query Graph", "", f"Query: {query_text}", ""]
         if seed_nodes:
             lines.append("## Seed nodes")
-            for node in seed_nodes[:max_items]:
-                lines.append(f"- {node.id} [{node.type}] {self._node_label(node)}")
+            lines.extend(f"- {node.id} [{node.type}] {self._node_label(node)}" for node in seed_nodes[:max_items])
             lines.append("")
         if ranked_nodes:
             lines.append("## Ranked relevance")
-            for item in ranked_nodes[:max_items]:
-                lines.append(f"- {item.score:.2f} {item.node.id} [{item.node.type}] {self._node_label(item.node)}")
+            lines.extend(f"- {item.score:.2f} {item.node.id} [{item.node.type}] {self._node_label(item.node)}" for item in ranked_nodes[:max_items])
             lines.append("")
         if edges:
             node_by_id = {node.id: node for node in nodes}

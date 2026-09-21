@@ -1,6 +1,7 @@
 """Code-context working set, source-span, and change-plan projection."""
 from __future__ import annotations
 
+import re
 from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Sequence
@@ -17,6 +18,7 @@ from ...common import (
     QUERY_CONTEXT_SCOPES,
     SOURCE_EDGE_TYPES,
     SOURCE_NODE_TYPES,
+    SERIALIZATION_EDGE_TYPES,
     TECHNICAL_NODE_TYPES,
     _code_context_query_tokens,
     _expanded_tokens,
@@ -83,6 +85,7 @@ class CodeContextProjectionMixin:
             impact=impact,
             max_items=max_items,
         )
+        data_trace = self._code_data_trace_payload(subgraph, max_items=max_items)
         followups = (
             self._code_follow_up_payload(subgraph, path_rows, max_items=max_items)
             if self._code_context_needs_followups(
@@ -104,6 +107,7 @@ class CodeContextProjectionMixin:
             ) if query_mode == "cleanup" else {},
             "read_plan": read_plan,
             "change_chain": change_chain,
+            "data_trace": data_trace,
             "owner_candidates": owner_candidates,
             "cleanup_candidates": cleanup_candidates,
             "working_set": self._code_working_set_payload(
@@ -127,6 +131,145 @@ class CodeContextProjectionMixin:
             },
             "trace_id": subgraph.trace_id,
         }
+
+    def _code_data_trace_payload(self, subgraph: MemorySubgraph, *, max_items: int) -> list[dict[str, Any]]:
+        """Project a dotted field query into an ordered, cross-layer source chain."""
+
+        matches = re.findall(
+            r"(?<![A-Za-z0-9_])([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_])",
+            subgraph.query.text,
+        )
+        if not matches:
+            return []
+        family, field_name = matches[-1]
+        family_folded = family.casefold()
+        field_folded = field_name.casefold()
+        ordered_nodes: OrderedDict[str, MemoryNode] = OrderedDict(
+            (node.id, node)
+            for node in [*(item.node for item in subgraph.ranked_nodes), *subgraph.nodes]
+        )
+        trace_query = MemoryQuery(
+            text=subgraph.query.text,
+            top_k=max(20, max_items * 2),
+            max_depth=0,
+            include_archived=subgraph.query.include_archived,
+            context_scopes=subgraph.query.context_scopes,
+            store_trace=False,
+        )
+        scopes = set(subgraph.query.context_scopes or {"code", "test"}) & {"code", "test"}
+        for node, _score in self._scoped_lexical_search(
+            trace_query,
+            self._query_profile(subgraph.query.text),
+            lexical_node_types=("SourceFragment",),
+            scopes=scopes or {"code", "test"},
+            top_k=trace_query.top_k,
+        ):
+            ordered_nodes.setdefault(node.id, node)
+        selected: set[str] = set()
+        field_ids: set[str] = set()
+        exact = f"{family}.{field_name}".casefold()
+        for node in ordered_nodes.values():
+            if node.type == "SourceFragment" and exact in str(node.text or "").casefold():
+                selected.add(node.id)
+                continue
+            if node.type != "Variable" or str(node.properties.get("name") or "").casefold() != field_folded:
+                continue
+            parent = str(node.properties.get("parent_qualified_name") or "").rsplit(".", 1)[-1].casefold()
+            if family_folded in parent:
+                selected.add(node.id)
+                field_ids.add(node.id)
+
+        if not field_ids:
+            return []
+
+        relation_by_node: dict[str, str] = {}
+        frontier = set(selected)
+        visited = set(selected)
+        for _ in range(max(1, int(subgraph.query.max_depth))):
+            if not frontier:
+                break
+            next_frontier: set[str] = set()
+            for edge in self.store.incident_edges(
+                sorted(frontier),
+                edge_types=SERIALIZATION_EDGE_TYPES,
+                limit=max(1000, max_items * 100),
+            ):
+                other_id = edge.to_id if edge.from_id in frontier else edge.from_id if edge.to_id in frontier else ""
+                if not other_id:
+                    continue
+                node = ordered_nodes.get(other_id) or self.store.get_node(other_id)
+                if node is None or (node.type not in CODE_CONTEXT_NODE_TYPES and node.type not in SOURCE_NODE_TYPES):
+                    continue
+                ordered_nodes.setdefault(node.id, node)
+                relation_by_node.setdefault(node.id, edge.type)
+                if other_id not in visited:
+                    visited.add(other_id)
+                    next_frontier.add(other_id)
+            frontier = next_frontier
+        selected.update(visited)
+
+        rows: list[dict[str, Any]] = []
+        seen_locations: set[tuple[str, int | None, str]] = set()
+        for node_id in selected:
+            node = ordered_nodes.get(node_id)
+            if node is None:
+                continue
+            path = self._node_relative_path(node)
+            if not path:
+                continue
+            line_start = self._optional_int(node.properties.get("line_start") or node.properties.get("start_line"))
+            line_end = self._optional_int(node.properties.get("line_end") or node.properties.get("end_line"))
+            stage, stage_order = self._data_trace_stage(path, self._node_label(node))
+            key = (path, line_start, stage)
+            if key in seen_locations:
+                continue
+            seen_locations.add(key)
+            rows.append(
+                {
+                    "stage": stage,
+                    "path": path,
+                    "line_start": line_start,
+                    "line_end": line_end,
+                    "node_id": node.id,
+                    "type": node.type,
+                    "label": self._node_label(node),
+                    "relation": relation_by_node.get(node.id),
+                    "_order": stage_order,
+                }
+            )
+        rows.sort(key=lambda row: (int(row["_order"]), str(row["path"]), int(row["line_start"] or 0), str(row["label"])))
+        for row in rows:
+            row.pop("_order", None)
+        return rows[:max_items] if len({row["stage"] for row in rows}) >= 2 else []
+
+    @staticmethod
+    def _optional_int(value: object) -> int | None:
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _data_trace_stage(path: str, label: str) -> tuple[str, int]:
+        normalized_path = path.replace("\\", "/").casefold()
+        value = f"{normalized_path} {label.casefold()}"
+        if normalized_path.startswith(("tests/", "test/")) or "fixture" in value:
+            return "test/fixture", 70
+        if "prompt" in value:
+            return "prompt", 0
+        if "wire" in value or "transport" in value or "dto" in value:
+            return "wire model", 10
+        if "validat" in value or "normaliz" in value:
+            return "validation", 20
+        if "persist" in value or "record" in value or "storage" in value:
+            return "persisted model", 30
+        if "graph" in value and ("project" in value or "projection" in value):
+            return "graph projection", 40
+        if "reconcil" in value or "merge" in value:
+            return "reconciliation", 50
+        if "openapi" in value or "swagger" in value:
+            return "OpenAPI compiler", 60
+        return "data flow", 35
 
     def _code_read_plan_payload(
         self,
@@ -217,8 +360,10 @@ class CodeContextProjectionMixin:
                 impact_item = dict(item)
                 impact_item["impact_kind"] = key
                 impact_items.append(impact_item)
-        for note in list(impact.get("notes") or [])[:limit]:
-            impact_items.append({"impact_kind": "note", "reason": note})
+        impact_items.extend(
+            {"impact_kind": "note", "reason": note}
+            for note in list(impact.get("notes") or [])[:limit]
+        )
         if impact_items:
             chain.append(
                 {
@@ -238,9 +383,10 @@ class CodeContextProjectionMixin:
         rows = self._code_working_set_rows(ranked, list(subgraph.nodes), query_text=subgraph.query.text, max_items=max_items)
         if not rows:
             return False
-        if all(self._is_test_context_path(str(row.get("path") or "")) for row in rows) and self._has_direct_general_evidence(subgraph):
-            return False
-        return True
+        return not (
+            all(self._is_test_context_path(str(row.get("path") or "")) for row in rows)
+            and self._has_direct_general_evidence(subgraph)
+        )
 
     def _has_direct_general_evidence(self, subgraph: MemorySubgraph) -> bool:
         query_tokens = set(_expanded_tokens(subgraph.query.text))
@@ -367,9 +513,7 @@ class CodeContextProjectionMixin:
         seen: set[str] = set()
         ranked_by_id = {item.node.id: item for item in ranked}
         ordered_nodes: list[MemoryNode] = [item.node for item in ranked]
-        for node in subgraph.nodes:
-            if node.id not in ranked_by_id:
-                ordered_nodes.append(node)
+        ordered_nodes.extend(node for node in subgraph.nodes if node.id not in ranked_by_id)
         for node in ordered_nodes:
             if node.id in seen or not self._is_owner_symbol_node(node):
                 continue
@@ -418,14 +562,12 @@ class CodeContextProjectionMixin:
     def _is_actionable_owner_overlap(overlap: int, query_tokens: set[str]) -> bool:
         if overlap <= 0:
             return False
-        if len(query_tokens) >= 4:
-            return overlap >= 2
-        return True
+        return len(query_tokens) < 4 or overlap >= 2
 
     @staticmethod
     def _is_secondary_code_path(path: str) -> bool:
         normalized = path.replace("\\", "/").casefold()
-        return normalized.startswith("tests/") or normalized.startswith("docs/") or normalized == "readme.md" or "/docs/" in normalized
+        return normalized.startswith(("tests/", "docs/")) or normalized == "readme.md" or "/docs/" in normalized
 
     def _is_application_surface_node(self, node: MemoryNode) -> bool:
         path = self._node_relative_path(node) or ""
@@ -514,9 +656,7 @@ class CodeContextProjectionMixin:
                 line_start = None
                 line_end = None
             role = "read"
-            if query_mode == "informative":
-                role = "read"
-            elif query_mode == "cleanup" and row["edit_candidate"]:
+            if query_mode == "cleanup" and row["edit_candidate"]:
                 role = "cleanup"
             payload.append(
                 {

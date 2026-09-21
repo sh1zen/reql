@@ -209,7 +209,7 @@ def _is_table_start(lines: list[str], index: int) -> bool:
     if "|" not in header or "|" not in separator:
         return False
     cells = [cell.strip() for cell in separator.strip("|").split("|")]
-    return bool(cells) and all(re.fullmatch(r":?-{3,}:?", cell or "") for cell in cells)
+    return all(re.fullmatch(r":?-{3,}:?", cell or "") for cell in cells)
 
 
 def _table_columns(header: str) -> int:
@@ -220,7 +220,7 @@ def _section_path(title: str, stack: list[tuple[int, str, str]], heading_text: s
     names = [item[1] for item in stack]
     if not names or names[0] != title:
         names.insert(0, title)
-    if not names or names[-1] != heading_text:
+    if names[-1] != heading_text:
         names.append(heading_text)
     return " > ".join(name for name in names if name)
 

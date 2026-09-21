@@ -4,14 +4,16 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tests.config_helpers import open_graph_with_documents as _open_graph_with_documents
 from memory.artifacts.cache import artifact_cache_path
 from memory.artifacts.compile_summary import _node_matches_terms
-from memory.artifacts.compiler import ArtifactCompiler
+from memory.artifacts.compiler import ArtifactCompiler, ArtifactContentChangedError
 from memory.artifacts.models import SourceArtifact
 from memory.domain.models import MemoryNode
 from memory.services.incremental_compilation import IncrementalCompilationService
+from memory.domain.exceptions import StorageError
 
 
 class FailingCompiler(ArtifactCompiler):
@@ -50,6 +52,31 @@ class IncrementalCompilationTests(unittest.TestCase):
         self.assertGreaterEqual(len(self._nodes("SourceFragment")), 2)
         self.assertEqual(payload["format"], "reql-artifact-cache-v1")
         self.assertEqual(set(project_cache["entries"]), {artifact.id for artifact in result.scan.artifacts})
+
+    def test_compile_retries_torn_source_and_preserves_committed_revision(self) -> None:
+        first = self.graph.compile_project(self.root)
+        assert first.revision is not None
+        previous_revision = first.revision.id
+        (self.root / "a.py").write_text("print('new')\n", encoding="utf-8")
+
+        with (
+            patch.object(
+                ArtifactCompiler,
+                "_read_verified_content",
+                side_effect=ArtifactContentChangedError("source changed during compilation"),
+            ),
+            self.assertRaisesRegex(StorageError, "three consecutive compile attempts"),
+        ):
+            self.graph.compile_project(self.root)
+
+        self.assertEqual(self.graph.project_history(self.root)[0].id, previous_revision)
+        cache = json.loads(artifact_cache_path(self.root).read_text(encoding="utf-8"))
+        entry = next(
+            value
+            for value in cache["projects"][first.scan.project.id]["entries"].values()
+            if value["relative_path"] == "a.py"
+        )
+        self.assertEqual(entry["sha256"], next(item.sha256 for item in first.scan.artifacts if item.relative_path == "a.py"))
 
     def test_compile_summary_handles_nodes_without_optional_text(self) -> None:
         node = MemoryNode(

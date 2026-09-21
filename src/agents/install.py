@@ -102,10 +102,7 @@ def resolve_platforms(
 
     resolved: list[str] = []
     for name in raw:
-        if name == "all":
-            candidates = all_platforms
-        else:
-            candidates = (name,)
+        candidates = all_platforms if name == "all" else (name,)
         for candidate in candidates:
             if candidate not in PLATFORMS_CONFIG:
                 supported_list = ", ".join(PLATFORMS_CONFIG)
@@ -324,7 +321,7 @@ def uninstall_agent_files(
 
     for name in selected:
         for kind, path, _content in _planned_files(name, project=project, project_dir=root, home_dir=home):
-            if kind in {"instructions"}:
+            if kind == "instructions":
                 status = _remove_section_file(path, dry_run=dry_run, stop=root if project else home)
             else:
                 status = _remove_owned_file(path, dry_run=dry_run, stop=root if project else home)
@@ -540,7 +537,7 @@ def _first_writable_user_command_dir() -> Path | None:
             resolved = directory.resolve(strict=False)
         except OSError:
             continue
-        if not _is_relative_to(resolved, home):
+        if not resolved.is_relative_to(home):
             continue
         if _is_windows_apps_dir(resolved):
             continue
@@ -571,14 +568,6 @@ def _command_file_names() -> tuple[str, ...]:
 def _is_windows_apps_dir(path: Path) -> bool:
     parts = {part.casefold() for part in path.parts}
     return host_platform.system() == "Windows" and "windowsapps" in parts
-
-
-def _is_relative_to(path: Path, base: Path) -> bool:
-    try:
-        path.relative_to(base)
-        return True
-    except ValueError:
-        return False
 
 
 def _launcher_fallback_command() -> str:
@@ -899,63 +888,27 @@ def _skill_files(
 ) -> list[tuple[str, Path, str]]:
     files = [
         ("skill", base / "skills" / skill_dir / "SKILL.md", content)
-        for skill_dir, content in _skill_markdowns(
-            platform_name,
+        for skill_dir, content in _skill_generator().skill_markdowns(
+            platform_name=platform_name,
             project=project,
             command_name=command_name,
             command_path=command_path,
             fallback_command=fallback_command,
         )
     ]
-    files.extend(
-        ("skill-resource", base / "skills" / skill_dir / relative_path, content)
-        for skill_dir, relative_path, content in _skill_resources(
-            platform_name,
-            project=project,
-            command_name=command_name,
-            command_path=command_path,
-            fallback_command=fallback_command,
+    resources = getattr(_skill_generator(), "skill_resources", None)
+    if resources is not None:
+        files.extend(
+            ("skill-resource", base / "skills" / skill_dir / relative_path, content)
+            for skill_dir, relative_path, content in resources(
+                platform_name=platform_name,
+                project=project,
+                command_name=command_name,
+                command_path=command_path,
+                fallback_command=fallback_command,
+            )
         )
-    )
     return files
-
-
-def _skill_markdowns(
-    platform_name: str,
-    *,
-    project: bool,
-    command_name: str,
-    command_path: Path,
-    fallback_command: str,
-) -> tuple[tuple[str, str], ...]:
-    return _skill_generator().skill_markdowns(
-        platform_name=platform_name,
-        project=project,
-        command_name=command_name,
-        command_path=command_path,
-        fallback_command=fallback_command,
-    )
-
-
-def _skill_resources(
-    platform_name: str,
-    *,
-    project: bool,
-    command_name: str,
-    command_path: Path,
-    fallback_command: str,
-) -> tuple[tuple[str, str, str], ...]:
-    generator = _skill_generator()
-    resources = getattr(generator, "skill_resources", None)
-    if resources is None:
-        return ()
-    return resources(
-        platform_name=platform_name,
-        project=project,
-        command_name=command_name,
-        command_path=command_path,
-        fallback_command=fallback_command,
-    )
 
 
 def _skill_generator() -> ModuleType:

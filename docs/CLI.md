@@ -26,18 +26,17 @@ reql query_graph --query "payment service" --max-depth 2 --json
 reql query_memories --query "payment service" --limit 8 --json
 reql inspect --node-id NODE_ID --json
 
-# Coding-agent working memory, kept separate from the standard graph
+# Coding-agent operational memory, with no copied project graph data
 reql agent init
-reql agent bus
-reql agent sync
+reql agent dashboard
 reql agent session start "Serializer cleanup"
 # Optional explicit activity scope (Codex uses CODEX_THREAD_ID automatically)
 reql agent --agent AGENT_ID --activity TASK_ID session start "Serializer cleanup"
-reql agent add "Read the payment service serializer"
+reql agent note add "Read the payment service serializer"
 reql agent task add "Patch serializer error handling"
 reql agent decision add "Reuse the existing graph store"
-reql agent link TASK_ID NODE_ID --relation touches
-reql agent link-many TASK_ID NODE_ID OTHER_NODE_ID --relation implements
+reql agent link TASK_ID DECISION_ID --relation implements
+reql agent batch --link-many TASK_ID depends_on DECISION_ID,RISK_ID
 reql agent batch --json agent-ops.json
 reql agent handoff "Serializer cleanup ready for review"
 reql agent export --json
@@ -166,28 +165,27 @@ dedicated execution paths without duplicating graph access classification.
 
 ## Agent Workspace
 
-`reql agent` is the working-memory layer used by REQL-aware coding-agent
-integrations. It creates project-local Agent Workspaces, also called Agent
-Working Graphs. Each CLI agent gets its own private working graph under
+`reql agent` is the operational-memory layer used by REQL-aware coding-agent
+integrations. Each CLI agent gets its own private memory store under
 `.reql/agents/` and all agents share a small internal bus in
-`.reql/agent-bus.reql`. The Python API follows the bus current agent when one
-exists. Without a bus selection it uses the default `master` workspace at
-`.reql/agent.reql`.
-The standard graph remains the stable project memory in `.reql/memory.reql`;
-`reql agent init` and `reql agent reset` derive reference nodes and relations
-from that graph without modifying it.
+`.reql/agent-bus.reql`. Explicit agent selection has highest precedence;
+otherwise a stable activity/thread id deterministically selects the private
+workspace. The legacy `master` workspace is used only when selection is
+unambiguous.
+The canonical graph in `.reql/memory.reql` is the sole source of repository,
+file, symbol, and relationship facts. Agent memory never copies, derives, links,
+or synchronizes canonical graph records.
 
 When assistant instructions or a REQL skill are installed, these commands are
 normally invoked by the coding agent as part of its repository workflow. They
-let the agent keep plans, findings, decisions, open tasks, risks, file links,
-and handoff summaries outside the model context window while still grounding
-that work in the deterministic project graph:
+let the agent keep plans, findings, decisions, open tasks, risks, sessions, and
+handoff summaries outside the model context window:
 
 ```bash
 reql project compile .
 reql agent init
-reql agent bus
-reql agent sync
+reql agent dashboard
+reql agent dashboard --post "scope: serializer owner identified" --kind stage
 reql agent status
 reql agent session start "Focused implementation pass"
 ```
@@ -197,37 +195,42 @@ open tasks. A completed or otherwise idle session is shown as the last idle
 session, which keeps old session titles visible for recovery without making
 them look like the current working focus.
 
-`reql agent init` returns an `agent_id`, records it on the internal bus, and
-makes it the current agent for later commands in the same project. In a normal
-single-agent integration, the installed instructions keep using
-`reql agent ...` with no extra flags. For parallel workers, pass
-`reql agent --agent AGENT_ID ...` or set `REQL_AGENT_ID=AGENT_ID` so each worker
-writes to its own private memory while still reading shared bus messages and
-handoffs.
+`reql agent init` is idempotent: it never recreates an existing workspace.
+`REQL_AGENT_ID`/`--agent` wins over activity-derived selection. Parallel
+integrations normally need no manual flag because `REQL_AGENT_ACTIVITY_ID`,
+`CODEX_THREAD_ID`, or `--activity` produces a stable project-scoped agent id.
+Ambiguous activity-less selection fails clearly instead of following a global
+bus pointer. `reql agent dashboard` returns `reql-agent-dashboard-v1` as the
+routine attention index for intra-session, inter-session, and parallel work.
+It includes the current and latest previous session, active tasks, recent
+durable memory, currently working and recently finished agents, relevant bus
+signals, and exact commands for deeper inspection. `--post TEXT` publishes one
+checkpoint before the read and is limited to 240 characters. `dashboard
+--agents` adds detailed cross-store state for each registered agent, including
+its current session, open tasks, and recent decisions. Because it opens private
+stores, this explicit option may wait on busy agents.
 
-Current sessions are also scoped by activity, so two tasks may safely reuse the
-same `agent_id` without replacing each other's current session during `sync`.
+Current sessions remain scoped by activity.
 REQL uses `REQL_AGENT_ACTIVITY_ID` first and `CODEX_THREAD_ID` second when
 available; other clients can pass `--activity ACTIVITY_ID` explicitly. Without
 an activity id, the agent has one current session.
 
-The agent saves observations while analyzing code:
+The agent saves observations while working:
 
 ```bash
-reql agent add "Read src/memory/cli.py; argparse owns the command surface"
-reql agent finding add "agent commands should run before opening the main graph writer"
-reql agent decision add "Store the working graph in .reql/agent.reql"
+reql agent note add "Reviewed command routing and recorded the outcome"
+reql agent finding add "The current plan needs a compatibility test"
+reql agent decision add "Keep operational memory isolated per activity"
 ```
 
-The agent creates a task graph and links work to standard graph references. IDs
-printed by retrieval, `inspect`, or `agent list` can be used directly:
+The agent may relate its own tasks, decisions, findings, notes, plans, and risks.
+Only IDs printed by `agent list`, `agent search`, or an earlier agent command
+are accepted:
 
 ```bash
 reql agent task add "Implement agent reset"
-reql agent link TASK_ID artifact:app --relation touches
-reql agent link-task --task TASK_ID --file src/memory/cli.py
 reql agent link TASK_ID DECISION_ID --relation implements
-reql agent link-many TASK_ID artifact:app function:target --relation touches
+reql agent batch --link-many TASK_ID depends_on DECISION_ID,RISK_ID
 ```
 
 `agent session start "TITLE"` starts a new current working session and closes
@@ -246,18 +249,12 @@ reql agent map --since 2026-06-29T12:00:00+00:00
 `agent map --session current` limits recovery to the current session. You can
 also pass a session id to recover an earlier session.
 
-`agent link-task --task TASK_ID --file PATH` resolves a compiled file by
-readable path and links it to the explicitly selected open task. Requiring the
-task id prevents a code target from being attached to an unrelated recent task.
-When a path has both `File` and `SourceArtifact` graph nodes, `link-task`
-chooses the `File` node and only reports ambiguity for same-priority matches.
-
 Use `agent batch` when several notes, decisions, tasks, findings, or links
 should be written together under one Agent Workspace lock:
 
 ```bash
 reql agent batch --json agent-ops.json
-reql agent batch --task task="Patch CLI" --decision decision="Batch agent writes" --link '$task' implements '$decision' --touches '$task' artifact:app,function:target --json
+reql agent batch --task task="Patch CLI" --decision decision="Batch agent writes" --link '$task' implements '$decision' --json
 ```
 
 `agent-ops.json` may be a JSON array or an object with an `operations` array:
@@ -267,58 +264,88 @@ reql agent batch --task task="Patch CLI" --decision decision="Batch agent writes
   "operations": [
     {"op": "task.add", "description": "Patch CLI", "as": "task"},
     {"op": "decision.add", "text": "Batch agent writes", "as": "decision"},
-    {"op": "link", "from": "$task", "to": "$decision", "relation": "implements"},
-    {"op": "link-many", "from": "$task", "to": ["artifact:app", "function:target"], "relation": "touches"}
+    {"op": "link", "from": "$task", "to": "$decision", "relation": "implements"}
   ]
 }
 ```
 
 Aliases declared with `as` can be referenced later in the same batch as
-`$alias`. Supported operations are `add`, `task.add`, `task.done`,
+`$alias`. Supported operations are `note.add`, `task.add`, `task.done`,
 `decision.add`, `finding.add`, `link`, and `link-many`.
 
 For small planning batches, inline options avoid creating a temporary JSON
 file. `--note`, `--task`, `--decision`, and `--finding` accept either `TEXT` or
 `ALIAS=TEXT`; `--link FROM RELATION TO` creates one relation; `--link-many FROM
-RELATION TARGETS` and `--touches FROM TARGETS` accept comma-separated targets.
+RELATION TARGETS` accepts comma-separated agent-owned targets.
 Aliases from inline additions are referenced as `$alias` by later links.
 
-List, search, inspect, and export the working graph:
+List, search, inspect, and export operational memory:
 
 ```bash
 reql agent list --type task --status open
-reql agent search "reset working graph" --json
-reql agent search "reset working graph" --json --metadata
+reql agent search "reset behavior" --json
+reql agent search "reset behavior" --json --metadata
 reql agent show TASK_ID --json
 reql agent export --json
 reql agent export --json --metadata
 ```
 
 Agents read or write the shared bus to coordinate without merging their private
-working graphs:
+memories:
 
 ```bash
 reql agent bus
-reql agent publish "Parser worker found the CLI owner" --target master
+reql agent dashboard --post "Parser worker found the CLI owner" --target master
 reql agent handoff "Parser worker done; review payload in bus"
 ```
+
+Prefer `agent dashboard` for routine pipeline checkpoints and attention
+routing. Publish terse `scope:`, `implement:`, `verify:`, or `blocked:` stage
+transitions, then follow a printed `drill` command only when that item affects
+the current task. Use `agent bus` for full bus listings and `dashboard
+--agents` for a wider worker inventory.
+
+Every coding agent must run this when its work pass ends:
+
+```bash
+reql agent finish "Focused tests passed; serializer fix ready"
+```
+
+`agent finish` snapshots a final handoff to the shared bus, closes the current
+session, and marks the agent completed so it disappears from the dashboard's
+working roster. It preserves open tasks and durable history for inter-session
+recovery. A later `agent session start` marks that agent active again.
 
 `agent bus` lists registered agents, bus messages, and handoffs. Its JSON
 output omits handoff payload snapshots by default so old handoffs stay compact;
 pass `agent bus --include-payloads --json` only when you need the full saved
-working-map payloads. `agent publish` stores a short shared message. `agent
+working-map payloads. `dashboard --post` stores a short shared message. `agent
 handoff` snapshots this agent's current compact working map and publishes it to
 the master bus, so the master can make choices from saved open tasks,
-decisions, touched files, symbols, and essential relations without opening the
+decisions, plans, risks, and essential relationships without opening the
 worker's private store directly.
+
+`agent overview`, `agent publish`, and standalone `agent link-many` are
+deprecated compatibility aliases. They print a warning on stderr and preserve
+their existing result on stdout so scripts can migrate safely. New callers use
+`dashboard --agents`, `dashboard --post`, and `batch --link-many`. Generic
+`agent add` is removed; use typed `agent note add`. Batch JSON likewise uses
+`note.add` rather than `add`.
 
 `agent list` keeps relation output focused on agent-created relations and,
 when node filters are present, relations connected to the listed nodes.
-For recovery only, `agent map` reports a compact operational working set: open tasks, agent
-decisions, files, symbols, and essential relations. The `files` section
-contains actual file artifacts or inferred file payloads. It intentionally
-skips findings, fragments, timestamps, storage paths, and raw metadata unless a
-command explicitly requests metadata.
+For recovery only, `agent map` separates two kinds of context:
+
+- `Agent memory` contains bounded decisions, findings, notes, risks, and plans,
+  with their originating session ids;
+- `Current session` and `Previous sessions` contain compact activity summaries,
+  counts, and up to six highlights instead of replaying raw session history.
+
+The JSON form exposes these domains under `context.learned` and
+`context.sessions`, identified by `context_format: reql-agent-context-v3`.
+Compact top-level `open_tasks`, `decisions`, and `relations` remain available.
+Timestamps and raw operational metadata remain
+omitted unless a command explicitly requests metadata.
 Use `agent map --task TASK_ID` to recover one task and agent items connected
 to it by agent-created relations. Use `agent map --session current` to recover
 the current working session without remembering a task id. Use `agent map
@@ -336,28 +363,20 @@ as late but final, so a slow storage open is not mistaken for an unfinished
 operation. JSON remains isolated on stdout. Use `reql agent --no-progress
 COMMAND ...` when a caller requires silent stderr.
 
-During recovery, use `agent map --metadata` only when timestamps, source fields,
-storage paths, or stored metadata are necessary. `agent search --metadata` and
+During recovery, use `agent map --metadata` only when timestamps or stored
+operational metadata are necessary. `agent search --metadata` and
 `agent export --metadata` expose the equivalent detailed fields for their own
 workflows.
 
-After `reql project compile .` updates the standard graph, refresh the Agent
-Workspace references without deleting agent-created notes, tasks, decisions,
-findings, plans, risks, or links:
-
-```bash
-reql agent sync
-```
-
 Reset discards agent-created notes, tasks, decisions, findings, plans, risks,
-and links, then re-derives the workspace from the current standard graph:
+sessions, and relationships without reading or changing the canonical graph:
 
 ```bash
 reql agent reset
 ```
 
-Supported agent node types are `note`, `task`, `decision`, `finding`, `file`,
-`symbol`, `risk`, and `plan`. Supported agent relation types are `depends_on`,
+Supported agent item types are `note`, `task`, `decision`, `finding`, `risk`,
+`plan`, and `session`. Supported agent relationship types are `depends_on`,
 `blocks`, `implements`, `touches`, `explains`, `derived_from`, `related_to`,
 `replaces`, and `conflicts_with`. Commands that return structured output support
 `--json`; list/search support filters such as `--type`, `--status`,
@@ -461,6 +480,17 @@ commands. JSON output also includes `read_plan` and `change_chain` so another
 agent can follow the intended intervention path without opening whole files or
 patching around missing project context.
 
+Dotted field queries such as `Field.type` also return an end-to-end
+`data_trace`. REQL seeds these queries from both symbols and code-body source
+fragments, resolves typed parameter field reads across imported models, and
+orders matching locations into recognizable layers such as prompts, wire
+models, validation, persisted models, graph projections, reconciliation,
+OpenAPI compilation, and tests or fixtures. The rendered context shows the
+same records under `End-to-end data trace`. The `serialization_paths` explore
+view follows `READS`, `WRITES`, `RETURNS`, `RAISES`, `REFERENCES`, and source
+evidence for the requested depth instead of stopping after the first adjacent
+edge.
+
 Query/retrieval commands write usage events to an append-only journal rather
 than rewriting canonical graph records. `project status`, `query_context`, and
 non-mutating `query` statements open a consistent read-only index snapshot, so
@@ -559,7 +589,8 @@ By default, installs write project-local files such as
 `.agents/skills/reql-agent/SKILL.md`, and agent-specific skill/rule
 directories. `reql-agent` covers compile/query/report/update workflows for the
 standard project graph and Agent Workspace commands such as `reql agent init`,
-`agent task add`, `agent link`, recovery via `agent map`, `agent export --json`, and
+routine coordination through `agent dashboard`, `agent task add`, `agent link`,
+recovery via `agent map`, cleanup via `agent finish`, `agent export --json`, and
 `agent reset`. Pass `--project-dir` to target another project root. Pass
 `--user` to write to matching assistant profiles under the home directory.
 
@@ -751,8 +782,9 @@ Compile mode applies built-in default ignore rules for dependency, VCS, cache,
 build-output, and local database paths, then applies configured
 include/exclude patterns and file-size limits.
 
-`project watch-status [PATH]` checks the watcher lock directly without opening
-the graph, so it remains usable while monitor mode owns the write lock. It
+`project watch-status [PATH]` checks a dedicated watcher lease without opening
+the graph. Monitor mode opens the canonical graph only for a compile batch and
+releases it while idle, so readers and agents remain responsive. It
 reports `running`, `stopped`, `stale`, or `unknown`, plus PID, process liveness,
 start time, duration, and command when available. Add `--json` for automation;
 when monitor mode uses an explicit global `--storage`, pass the same option to
@@ -767,6 +799,9 @@ compile/rebuild loops. It keeps running until interrupted. Use
 `--watch-interval` as the bounded wait timeout for scripted runs,
 `--watch-debounce` to coalesce event bursts, and `--watch-iterations` for
 bounded automation, or pass an explicit path when the workspace is elsewhere.
+Only one watcher lease may be active for a project. Files are hash-verified
+against the scan used for compilation; a changing tree is rescanned up to three
+times without publishing a mismatched revision or cache entry.
 
 Markdown, plain text, and PDF artifacts are parsed when their
 `compile.documents.<format>` toggle is `true`.

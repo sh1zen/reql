@@ -54,8 +54,6 @@ def make_fragment(
         index,
         start_line=start_line,
         end_line=end_line,
-        start_offset=start_offset,
-        end_offset=end_offset,
         page_number=page_number,
         section_path=section_path,
     )
@@ -98,6 +96,4 @@ def line_offsets(text: str) -> list[int]:
     for line in text.splitlines(keepends=True):
         offsets.append(current)
         current += len(line)
-    if not offsets:
-        offsets.append(0)
-    return offsets
+    return offsets or [0]

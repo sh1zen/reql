@@ -992,9 +992,9 @@ def render_graph_html(payload: dict[str, Any]) -> str:
 
 
 def _safe_json(payload: dict[str, Any]) -> str:
-    text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     return (
-        text.replace("&", "\\u0026")
+        json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        .replace("&", "\\u0026")
         .replace("<", "\\u003c")
         .replace(">", "\\u003e")
         .replace("\u2028", "\\u2028")
@@ -1197,7 +1197,7 @@ def _compact_property_value(value: Any) -> Any:
     if isinstance(value, list):
         return [_compact_property_value(item) for item in value[:8]]
     if isinstance(value, tuple):
-        return [_compact_property_value(item) for item in list(value)[:8]]
+        return [_compact_property_value(item) for item in value[:8]]
     if isinstance(value, dict):
         return {
             _compact_text(key, max_chars=80): _compact_property_value(item)

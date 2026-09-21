@@ -10,8 +10,12 @@ from ..domain.query_context import (
     CONTEXT_RESULT_SCHEMA_VERSION,
     Confidence,
     ContextResult,
+    GraphFreshness,
     QueryContextRequest,
+    SourceRevision,
 )
+from ..artifacts.revision import RevisionRepository
+from ..freshness import read_watch_state
 from .retrieval import RetrievalEngine
 
 
@@ -48,17 +52,48 @@ class QueryContextService:
                 "seed_node_ids": list(subgraph.seed_node_ids),
             }
         )
+        source_revision, freshness = _source_revision_and_freshness(subgraph, self.retrieval.store)
         return ContextResult(
             schema_version=CONTEXT_RESULT_SCHEMA_VERSION,
             graph_revision=_context_graph_revision(subgraph),
             confidence=Confidence.from_payload(confidence_payload),
             payload=payload,
+            source_revision=source_revision,
+            freshness=freshness,
         )
 
     def render(self, result: ContextResult) -> str:
         payload = dict(result.payload)
         payload["confidence"] = result.confidence.to_dict()
-        return self.retrieval.render_context_payload(payload)
+        rendered = self.retrieval.render_context_payload(payload)
+        source = result.source_revision.id if result.source_revision else "unknown"
+        return (
+            f"Graph freshness: {result.freshness.status}; source_revision={source}; "
+            f"snapshot_used={str(result.freshness.snapshot_used).lower()}\n\n{rendered}"
+        )
+
+
+def _source_revision_and_freshness(subgraph: MemorySubgraph, store: Any) -> tuple[SourceRevision | None, GraphFreshness]:
+    project_ids = {
+        str(node.properties.get("project_id") or (node.id if node.type == "Project" else ""))
+        for node in subgraph.nodes
+    }
+    project_ids.discard("")
+    revisions = RevisionRepository(store)
+    latest = next((revision for project_id in sorted(project_ids) if (revision := revisions.latest(project_id))), None)
+    source = SourceRevision(latest.id, latest.sequence, latest.tree_hash) if latest else None
+    storage_path = getattr(store, "path", None)
+    state = read_watch_state(storage_path) if storage_path is not None else {}
+    raw_status = str(state.get("status") or "unknown")
+    status = raw_status if raw_status in {"current", "refreshing", "stale", "unknown"} else "unknown"
+    if status == "current" and latest is not None and state.get("source_revision_id") != latest.id:
+        status = "stale"
+    return source, GraphFreshness(
+        status=status,  # type: ignore[arg-type]
+        snapshot_used=bool(getattr(store, "snapshot", False)),
+        pending_paths=max(0, int(state.get("pending_paths") or 0)),
+        checked_at=str(state.get("checked_at")) if state.get("checked_at") else None,
+    )
 
 
 def _context_graph_revision(subgraph: MemorySubgraph) -> str:
@@ -119,8 +154,7 @@ def _canonical_json_value(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_canonical_json_value(item) for item in value]
     if isinstance(value, (set, frozenset)):
-        normalized = [_canonical_json_value(item) for item in value]
-        return sorted(normalized, key=lambda item: json.dumps(item, ensure_ascii=True, sort_keys=True, default=str))
+        return sorted([_canonical_json_value(item) for item in value], key=lambda item: json.dumps(item, ensure_ascii=True, sort_keys=True, default=str))
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     return str(value)

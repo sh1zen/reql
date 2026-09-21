@@ -28,7 +28,7 @@ class ActivationEngine:
         if not seed_node_ids:
             return ActivationResult(active_nodes=[], fired_edges=[], activation_by_node={})
 
-        blocked = set(options.blocked_edge_types or set()) | self.BLOCKED_BY_DEFAULT
+        blocked = set(options.blocked_edge_types or ()) | self.BLOCKED_BY_DEFAULT
         activation: dict[str, float] = defaultdict(float)
         best_depth: dict[str, int] = {}
         fired_edges: dict[str, MemoryEdge] = {}
@@ -36,9 +36,7 @@ class ActivationEngine:
 
         for seed_id in seed_node_ids:
             node = self.store.get_node(seed_id)
-            if node is None:
-                continue
-            if node.status in INACTIVE_STATUSES:
+            if node is None or node.status in INACTIVE_STATUSES:
                 continue
             value = clamp(max(options.seed_boost, node.base_activation, node.activation * options.persistence))
             activation[seed_id] = max(activation[seed_id], value)
@@ -57,7 +55,6 @@ class ActivationEngine:
 
             neighbors = self.store.neighbors(
                 current_id,
-
                 direction="both" if options.traverse_incoming else "out",
                 edge_types=options.allowed_edge_types,
                 min_weight=0.01,
@@ -72,12 +69,10 @@ class ActivationEngine:
                     continue
                 depth_factor = options.depth_decay ** (depth + 1)
                 status_factor = 0.35 if neighbor.status in {"latent", "candidate"} else 1.0
-                inhibition_factor = 1.0
                 signal = current_value * edge.weight * edge.confidence * depth_factor * status_factor
                 if edge.polarity < 0 or edge.type in {"INHIBITS", "SUPPRESSES", "BLOCKS", "WEAKENS"}:
-                    signal *= -1.0
-                    inhibition_factor = 0.75
-                new_value = clamp(activation[neighbor.id] + signal * inhibition_factor)
+                    signal *= -0.75
+                new_value = clamp(activation[neighbor.id] + signal)
                 if new_value <= activation[neighbor.id] + 1e-9:
                     continue
                 activation[neighbor.id] = new_value

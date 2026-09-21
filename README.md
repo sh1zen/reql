@@ -10,8 +10,8 @@ separate manual workflow. After the assistant instructions or skill are
 installed for Codex, Claude, Gemini, Cursor, or another agent environment, the
 agent uses REQL while it works: it compiles or refreshes the repository graph,
 retrieves compact source-backed context, records task-local notes and
-decisions, links work back to files and symbols, and reconstructs that working
-set after context loss.
+decisions, and reconstructs operational history and plans after context loss.
+Repository facts remain exclusively in the canonical project graph.
 
 **Token and reasoning budget:** REQL helps coding agents spend fewer tokens on
 repository discovery and more tokens on the actual change. Bounded retrieval
@@ -107,14 +107,14 @@ it implements, reviews, or documents a repository:
 
 ```bash
 reql agent init
-reql agent bus
+reql agent dashboard
+reql agent dashboard --post "verify: focused tests passed" --kind stage
 reql agent session start "Focused implementation pass"
-reql agent add "Read src/memory/cli.py and found the argparse command surface"
-reql agent task add "Implement reset for the working graph"
+reql agent note add "Read src/memory/cli.py and found the argparse command surface"
+reql agent task add "Implement the reset behavior"
 reql agent decision add "Keep agent memory in .reql/agent.reql"
-reql agent link TASK_ID artifact:app --relation touches
-reql agent link-task --task TASK_ID --file test-agent/context_savings.py
-reql agent link-many TASK_ID artifact:app function:target --relation implements
+reql agent link TASK_ID DECISION_ID --relation implements
+reql agent batch --link-many TASK_ID depends_on DECISION_ID,RISK_ID
 reql agent batch --json agent-ops.json
 reql agent batch --task task="Patch CLI" --decision decision="Use one workspace lock" --link '$task' implements '$decision'
 reql agent handoff "Implementation notes ready for master review"
@@ -122,25 +122,51 @@ reql agent export --json
 reql agent export --json --metadata
 ```
 
-`reql agent init` returns an `agent_id` and makes that private agent memory the
-current one for later `reql agent ...` commands. Parallel agents can use
-`reql agent --agent AGENT_ID ...` or `REQL_AGENT_ID=AGENT_ID`; all agents can
+`reql agent init` is idempotent and selects private memory from the stable
+activity or thread id supplied by the integration. Explicit
+`reql agent --agent AGENT_ID ...` or `REQL_AGENT_ID=AGENT_ID` takes precedence; all agents can
 read `reql agent bus`, publish shared messages, and use `reql agent handoff` to
 return a compact saved working-map snapshot to the master. `agent bus --json`
 omits handoff payload snapshots by default; pass `--include-payloads` only when
 the full saved handoff maps are needed. Use `agent map` only to recover context
 after compaction, a handoff, context loss, or a long pause; do not print it
 before and after routine edits. `agent map`, `agent search`, and `agent export`
-omit metadata by default. Pass `--metadata` only when timestamps, storage paths,
-source fields, or the full workspace graph are needed.
+omit metadata by default. Pass `--metadata` only when timestamps or stored
+operational metadata are needed.
 
-Sessions inside one agent memory are isolated by `REQL_AGENT_ACTIVITY_ID` or
-`CODEX_THREAD_ID` when either is present. A client can also pass
-`reql agent --activity ACTIVITY_ID ...`, preventing concurrent tasks that reuse
-an agent id from changing each other's current session during synchronization.
+`REQL_AGENT_ACTIVITY_ID`, `CODEX_THREAD_ID`, or `--activity` deterministically
+selects a project-scoped private workspace as well as its current session. If
+several agents are registered and no stable identity is available, REQL rejects
+the ambiguous invocation instead of using another agent's workspace. Use
+`reql agent dashboard --agents` only when detailed cross-store agent state is
+needed beyond the dashboard's compact active/finished roster.
 
-`reql agent reset` discards agent-created working notes and re-derives the
-workspace from the current standard graph without modifying `.reql/memory.reql`.
+`reql agent dashboard` is the routine compact coordination surface for
+intra-session, inter-session, and parallel work. It can publish one shared
+pipeline checkpoint with `--post`, then returns active work, the latest prior
+session, recent durable memory, currently working agents, relevant bus signals,
+and exact drill-down commands. Posts are capped at 240 characters; durable
+detail stays in tasks, decisions, findings, plans, and handoffs. Every agent
+runs `reql agent finish "<compact outcome>"` when its pass ends so peers see it
+leave the working roster; a later `session start` marks it active again.
+
+`agent overview`, `agent publish`, and standalone `agent link-many` remain
+deprecated compatibility aliases for existing scripts. New integrations use
+`dashboard --agents`, `dashboard --post`, and `batch --link-many`. The former
+generic `agent add` command has been replaced by typed `agent note add`.
+
+`reql agent reset` discards agent-created notes, tasks, decisions, findings,
+plans, risks, sessions, and their relationships. It never reads or modifies
+the canonical project graph.
+
+Recovery maps contain only durable knowledge recorded by the agent and compact
+summaries of the current and five most recent previous sessions. JSON consumers
+read these from `context.learned` and `context.sessions`.
+
+Context results use schema version 2. Alongside the query-specific
+`graph_revision`, they report the committed `source_revision` and freshness
+state (`current`, `refreshing`, `stale`, or `unknown`). Read commands fall back
+to a validated committed snapshot while a writer is active.
 
 From a source checkout, `python cli.py ...` exposes the same command surface
 without requiring an editable install:
@@ -187,8 +213,9 @@ config lookup, reports, exports, and maintenance workflows.
 - Compact `query_context`, `query_explore`, `query_graph`, and `query_memories`
   outputs for coding-agent workflows, including owner symbols, bounded source
   ranges, and associated test targets.
-- Separate `reql agent` working graph for agent notes, tasks, decisions,
-  findings, plans, risks, and links without contaminating the standard graph.
+- Separate `reql agent` operational memory for notes, tasks, decisions,
+  findings, plans, risks, sessions, and handoffs. It contains no copied project,
+  file, symbol, or canonical graph records.
 - Local block-file persistence with fixed-size pages, compressed records,
   reader/writer lock diagnostics, safe stale-lock recovery, read-only snapshots,
   transactions, compaction, and atomic clean rebuilds.

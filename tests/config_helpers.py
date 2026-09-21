@@ -12,6 +12,6 @@ def open_graph_with_documents(path: str | Path) -> MemoryGraph:
     config = default_config()
     config = merge_config(
         config,
-        {"compile": {"documents": {format_name: True for format_name in config.compile.documents}}},
+        {"compile": {"documents": dict.fromkeys(config.compile.documents, True)}},
     )
     return MemoryGraph.open(path, config=config)

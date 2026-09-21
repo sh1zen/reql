@@ -10,16 +10,16 @@ By default it opens a guided terminal menu. Use ``cli.py`` or the installed
 from __future__ import annotations
 
 import argparse
-from datetime import datetime
 import json
 import shlex
 import sys
 import traceback
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from textwrap import wrap
-from typing import Any, Callable
-
+from typing import Any
 
 ROOT = Path(__file__).resolve().parent
 SRC = ROOT / "src"
@@ -28,8 +28,8 @@ DEFAULT_STORAGE = STORAGE_DIR / "memory.reql"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from memory.reporting.html_graph import write_graph_html  # noqa: E402
-from api import MemoryGraph  # noqa: E402
+from api import MemoryGraph
+from memory.reporting.html_graph import write_graph_html
 
 
 @dataclass(slots=True)
@@ -191,7 +191,7 @@ class GuidedMenu:
 
     def run(self) -> int:
         while True:
-            _clear_screen_hint()
+            print()
             self._header()
             actions = [
                 MenuAction("1", "Guided new memory", "Create a memory, initialize storage, and add the first content.", self.new_memory),
@@ -363,7 +363,6 @@ class GuidedMenu:
             print("Deletion cancelled.")
             return 0
 
-        delete_paths = [path]
         active_deleted = _resolve(path) == _resolve(self.launcher.storage_path)
         if active_deleted:
             fallback = _fallback_memory_after_delete(path)
@@ -371,10 +370,9 @@ class GuidedMenu:
             self.launcher.graph.store.initialize()
             print(f"The deleted memory was active. Session moved to: {fallback}")
 
-        for item in delete_paths:
-            if item.exists():
-                item.unlink()
-                print(f"Deleted: {item}")
+        if path.exists():
+            path.unlink()
+            print(f"Deleted: {path}")
         return 0
 
     def session(self) -> int:
@@ -462,7 +460,7 @@ class GuidedMenu:
     def project_watch(self) -> int:
         path = _prompt("Project path", ".")
         interval = _prompt_int("Interval seconds", 2)
-        return self.launcher._watch(f"{_quote(path)} --interval {interval}")
+        return self.launcher._watch(f"{shlex.quote(path)} --interval {interval}")
 
     def _compile_project_path(self, path: str) -> int:
         result = self.launcher.graph.compile_project(path, user_id=self.launcher.user_id)
@@ -598,12 +596,12 @@ class GuidedMenu:
 
     def export_json(self) -> int:
         path = _prompt("File JSON", "graph.json")
-        return self.launcher._export(_quote(path))
+        return self.launcher._export(shlex.quote(path))
 
     def export_html(self) -> int:
         path = _prompt("HTML file or directory", "graph.html")
         json_flag = " --json" if _confirm("Also write graph.json?", False) else ""
-        return self.launcher._export(f"{_quote(path)} --html{json_flag}")
+        return self.launcher._export(f"{shlex.quote(path)} --html{json_flag}")
 
     def mcp_wizard(self) -> int:
         print("The REQL MCP server supports local stdio and HTTP with an API key for network sharing.")
@@ -693,10 +691,6 @@ def _discover_memories() -> list[Path]:
     return sorted(path for path in STORAGE_DIR.glob("*.reql") if path.is_file())
 
 
-def _memory_sidecars(path: Path) -> list[Path]:
-    return []
-
-
 def _is_managed_memory(path: Path) -> bool:
     try:
         resolved = path.resolve()
@@ -726,11 +720,6 @@ def _format_bytes(size: int) -> str:
         if value < 1024 or unit == "GB":
             return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
         value /= 1024
-    return f"{value:.1f} GB"
-
-
-def _clear_screen_hint() -> None:
-    print()
 
 
 def _print_menu_action(item: MenuAction) -> None:
@@ -769,13 +758,8 @@ def _pause() -> None:
     input("\nPress Enter to continue...")
 
 
-def _quote(value: str) -> str:
-    return shlex.quote(value)
-
-
 def _slug(value: str) -> str:
-    chars = [char.lower() if char.isalnum() else "-" for char in value.strip()]
-    slug = "".join(chars).strip("-")
+    slug = "".join(char.lower() if char.isalnum() else "-" for char in value.strip()).strip("-")
     while "--" in slug:
         slug = slug.replace("--", "-")
     return slug or "memory"

@@ -6,7 +6,7 @@ from enum import Enum
 from typing import Any, Iterable, Literal
 
 
-CONTEXT_RESULT_SCHEMA_VERSION = 1
+CONTEXT_RESULT_SCHEMA_VERSION = 2
 DEFAULT_TOP_K = 20
 DEFAULT_MAX_DEPTH = 3
 DEFAULT_MAX_ITEMS = 20
@@ -141,6 +141,36 @@ class Confidence:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceRevision:
+    """Committed project revision represented by a context result."""
+
+    id: str
+    sequence: int
+    tree_hash: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"id": self.id, "sequence": self.sequence, "tree_hash": self.tree_hash}
+
+
+@dataclass(frozen=True, slots=True)
+class GraphFreshness:
+    """Availability and source-lag metadata for a committed graph read."""
+
+    status: Literal["current", "refreshing", "stale", "unknown"] = "unknown"
+    snapshot_used: bool = False
+    pending_paths: int = 0
+    checked_at: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "status": self.status,
+            "snapshot_used": self.snapshot_used,
+            "pending_paths": self.pending_paths,
+            "checked_at": self.checked_at,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class ContextResult:
     """Versioned typed result returned by the shared application service."""
 
@@ -148,12 +178,16 @@ class ContextResult:
     graph_revision: str
     confidence: Confidence
     payload: ContextPayload
+    source_revision: SourceRevision | None = None
+    freshness: GraphFreshness = field(default_factory=GraphFreshness)
 
     def to_dict(self) -> dict[str, Any]:
         """Return the versioned envelope used by typed consumers."""
         return {
             "schema_version": self.schema_version,
             "graph_revision": self.graph_revision,
+            "source_revision": self.source_revision.to_dict() if self.source_revision else None,
+            "freshness": self.freshness.to_dict(),
             "confidence": self.confidence.to_dict(),
             "payload": dict(self.payload),
         }

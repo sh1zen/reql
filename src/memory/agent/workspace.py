@@ -4,7 +4,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import os
-import posixpath
 import time
 from typing import Any, Iterable
 from uuid import uuid4
@@ -15,7 +14,7 @@ from memory.domain.exceptions import StorageError
 from memory.domain.ids import stable_id
 from memory.domain.models import MemoryEdge, MemoryNode
 from memory.domain.timeutils import parse_dt, utcnow_iso
-from memory.storage import BlockGraphStore
+from memory.storage import BlockGraphStore, StoreLease
 
 
 AGENT_STORAGE_FILE = "agent.reql"
@@ -29,7 +28,11 @@ AGENT_LOCK_TIMEOUT_SECONDS = 2.0
 AGENT_READ_LOCK_TIMEOUT_SECONDS = 10.0
 AGENT_LOCK_RETRY_ATTEMPTS = 3
 AGENT_LOCK_RETRY_DELAY_SECONDS = 0.25
-AGENT_NODE_TYPES = {"note", "task", "decision", "finding", "file", "symbol", "risk", "plan", "session"}
+DASHBOARD_DEFAULT_LIMIT = 5
+DASHBOARD_MAX_LIMIT = 20
+DASHBOARD_POST_MAX_CHARS = 240
+AGENT_NODE_TYPES = {"note", "task", "decision", "finding", "risk", "plan", "session"}
+LEARNED_NODE_TYPES = ("decision", "finding", "note", "risk", "plan")
 AGENT_RELATIONS = {
     "depends_on",
     "blocks",
@@ -49,23 +52,6 @@ def _agent_lock_wait_budget(*, read_only: bool) -> float:
     return max(0.0, AGENT_LOCK_RETRY_ATTEMPTS * lock_timeout + retry_delays)
 
 
-SYMBOL_TYPES = {
-    "Class",
-    "Function",
-    "Method",
-    "Interface",
-    "Struct",
-    "Enum",
-    "Trait",
-    "Module",
-    "Variable",
-    "Constant",
-}
-FILE_TYPES = {"SourceArtifact", "Artifact", "Document", "File"}
-FRAGMENT_TYPES = {"SourceFragment"}
-STATIC_FINDING_TYPES = {"StaticAnalysisFinding"}
-
-
 @dataclass(frozen=True, slots=True)
 class AgentWorkspacePaths:
     standard_storage: Path
@@ -74,11 +60,7 @@ class AgentWorkspacePaths:
 
 
 class AgentWorkspace:
-    """Service facade for a separate agent working graph.
-
-    The standard REQL graph is only read during derivation. All agent-created
-    operational memory is persisted in ``agent_storage``.
-    """
+    """Service facade for isolated operational memory owned by one agent."""
 
     def __init__(
         self,
@@ -96,8 +78,14 @@ class AgentWorkspace:
             if bus_storage is not None
             else self.default_bus_storage(standard_path)
         )
-        self.agent_id = self._normalize_agent_id(
-            agent_id or self._read_current_agent_id(resolved_bus_storage) or DEFAULT_AGENT_ID
+        self.activity_id = self._normalize_activity_id(
+            activity_id or os.environ.get("REQL_AGENT_ACTIVITY_ID") or os.environ.get("CODEX_THREAD_ID")
+        )
+        self.agent_id, self.selection_source, self.concurrency_safe = self._resolve_agent_identity(
+            standard_path,
+            resolved_bus_storage,
+            agent_id,
+            self.activity_id,
         )
         self.paths = AgentWorkspacePaths(
             standard_storage=standard_path,
@@ -105,9 +93,6 @@ class AgentWorkspace:
             if agent_storage is not None
             else self.agent_storage_for(standard_path, self.agent_id),
             bus_storage=resolved_bus_storage,
-        )
-        self.activity_id = self._normalize_activity_id(
-            activity_id or os.environ.get("REQL_AGENT_ACTIVITY_ID") or os.environ.get("CODEX_THREAD_ID")
         )
         self.config = config
 
@@ -137,7 +122,11 @@ class AgentWorkspace:
         return self.paths.agent_storage.exists() and self.paths.agent_storage.stat().st_size > 0
 
     def init(self) -> dict[str, Any]:
-        result = self._recreate()
+        init_lease = self.paths.agent_storage.with_name(f"{self.paths.agent_storage.name}.init")
+        with StoreLease(init_lease, timeout_seconds=AGENT_READ_LOCK_TIMEOUT_SECONDS):
+            already_initialized = self.exists()
+            result = self._migrate_operational_store() if already_initialized else self._recreate(remove_existing=False)
+        result["already_initialized"] = already_initialized
         self._register_agent(status="active")
         return result
 
@@ -146,38 +135,68 @@ class AgentWorkspace:
         self._register_agent(status="active")
         return result
 
-    def sync(self) -> dict[str, Any]:
+    def _migrate_operational_store(self) -> dict[str, Any]:
+        """Remove legacy canonical graph copies while preserving agent-owned memory."""
+
         if not self.exists():
             raise ValueError("Agent workspace is not initialized. Run `reql agent init` first.")
-        standard = MemoryGraph.open(self.paths.standard_storage, config=self.config, read_only=True)
         agent = self._open_agent()
         try:
-            standard_nodes = standard.store.all_nodes()
-            standard_edges = standard.store.all_edges()
-            derived_nodes, derived_edges = self._derive_standard_graph(standard_nodes, standard_edges)
-            derived_nodes_by_id = {node.id: node for node in derived_nodes}
-            derived_edges_by_id = {edge.id: edge for edge in derived_edges}
-            synced_at = utcnow_iso()
+            existing_nodes = agent.store.all_nodes()
+            existing_edges = agent.store.all_edges()
+            canonical_ids = {
+                node.id for node in existing_nodes if node.properties.get("source") == "standard"
+            }
+            removed_edge_ids = {
+                edge.id
+                for edge in existing_edges
+                if edge.properties.get("source") == "standard"
+                or edge.from_id in canonical_ids
+                or edge.to_id in canonical_ids
+            }
             workspace = agent.get_node(WORKSPACE_NODE_ID)
-            initialized_at = (
-                workspace.properties.get("initialized_at")
-                if workspace is not None
-                else synced_at
-            )
+            if (
+                workspace is not None
+                and workspace.properties.get("format") == "reql-agent-memory-v1"
+                and not canonical_ids
+                and not removed_edge_ids
+            ):
+                return {
+                    "initialized": True,
+                    "agent_id": self.agent_id,
+                    "activity_id": self.activity_id,
+                    "selection_source": self.selection_source,
+                    "concurrency_safe": self.concurrency_safe,
+                    "agent_storage": str(self.paths.agent_storage),
+                    "bus_storage": str(self.paths.bus_storage),
+                    "initialized_at": workspace.properties.get("initialized_at"),
+                    "removed_canonical_items": 0,
+                    "removed_canonical_relationships": 0,
+                    "preserved_agent_nodes": sum(
+                        1 for node in existing_nodes if node.id != WORKSPACE_NODE_ID
+                    ),
+                    "preserved_agent_relations": len(existing_edges),
+                }
+            migrated_at = utcnow_iso()
+            initialized_at = workspace.properties.get("initialized_at") if workspace is not None else migrated_at
             workspace_props = dict(workspace.properties) if workspace is not None else {}
+            for key in (
+                "standard_storage",
+                "synced_at",
+                "derived_node_count",
+                "derived_relation_count",
+            ):
+                workspace_props.pop(key, None)
             workspace_props.setdefault("current_session_ids", {})
             workspace_props.update(
                 {
-                    "format": "reql-agent-workspace-v1",
+                    "format": "reql-agent-memory-v1",
                     "source": "system",
                     "agent_id": self.agent_id,
-                    "standard_storage": str(self.paths.standard_storage),
                     "agent_storage": str(self.paths.agent_storage),
                     "bus_storage": str(self.paths.bus_storage),
                     "initialized_at": initialized_at,
-                    "synced_at": synced_at,
-                    "derived_node_count": len(derived_nodes),
-                    "derived_relation_count": len(derived_edges),
+                    "migrated_at": migrated_at,
                 }
             )
             workspace_node = MemoryNode(
@@ -188,79 +207,42 @@ class AgentWorkspace:
                 canonical_key=WORKSPACE_NODE_ID,
                 properties=workspace_props,
                 status="active",
-                created_at=workspace.created_at if workspace is not None else synced_at,
-                updated_at=synced_at,
+                created_at=workspace.created_at if workspace is not None else migrated_at,
+                updated_at=migrated_at,
             )
-
-            existing_nodes = agent.store.all_nodes()
-            existing_edges = agent.store.all_edges()
-            existing_derived_nodes = {
-                node.id: node
-                for node in existing_nodes
-                if node.id != WORKSPACE_NODE_ID and node.properties.get("source") == "standard"
-            }
-            existing_derived_edges = {
-                edge.id: edge
-                for edge in existing_edges
-                if edge.properties.get("source") == "standard"
-            }
-            stale_node_ids = sorted(set(existing_derived_nodes).difference(derived_nodes_by_id))
-            stale_edge_ids = sorted(set(existing_derived_edges).difference(derived_edges_by_id))
-            changed_node_ids = sorted(
-                node_id
-                for node_id, node in derived_nodes_by_id.items()
-                if node_id in existing_derived_nodes and not self._derived_nodes_equivalent(existing_derived_nodes[node_id], node)
-            )
-            changed_edge_ids = sorted(
-                edge_id
-                for edge_id, edge in derived_edges_by_id.items()
-                if edge_id in existing_derived_edges and not self._derived_edges_equivalent(existing_derived_edges[edge_id], edge)
-            )
-            new_node_ids = sorted(set(derived_nodes_by_id).difference(existing_derived_nodes))
-            new_edge_ids = sorted(set(derived_edges_by_id).difference(existing_derived_edges))
-            nodes_to_upsert = [derived_nodes_by_id[node_id] for node_id in [*new_node_ids, *changed_node_ids]]
-            edges_to_upsert = [derived_edges_by_id[edge_id] for edge_id in [*new_edge_ids, *changed_edge_ids]]
             preserved_agent_nodes = sum(
                 1
                 for node in existing_nodes
                 if node.id != WORKSPACE_NODE_ID and node.properties.get("source") != "standard"
             )
-            preserved_agent_edges = sum(1 for edge in existing_edges if edge.properties.get("source") != "standard")
+            preserved_agent_edges = sum(
+                1
+                for edge in existing_edges
+                if edge.properties.get("source") != "standard" and edge.id not in removed_edge_ids
+            )
 
             with agent.store.transaction():
-                for edge_id in stale_edge_ids:
+                for edge_id in sorted(removed_edge_ids):
                     agent.store.remove_edge(edge_id)
-                for edge_id in changed_edge_ids:
-                    agent.store.remove_edge(edge_id)
-                for node_id in stale_node_ids:
+                for node_id in sorted(canonical_ids):
                     agent.store.remove_node(node_id)
-                for node_id in changed_node_ids:
-                    agent.store.remove_node(node_id)
-                agent.store.batch_upsert_nodes([workspace_node, *nodes_to_upsert])
-                agent.store.batch_upsert_edges(edges_to_upsert)
+                agent.store.batch_upsert_nodes([workspace_node])
             return {
-                "synced": True,
+                "initialized": True,
                 "agent_id": self.agent_id,
                 "activity_id": self.activity_id,
-                "standard_storage": str(self.paths.standard_storage),
+                "selection_source": self.selection_source,
+                "concurrency_safe": self.concurrency_safe,
                 "agent_storage": str(self.paths.agent_storage),
                 "bus_storage": str(self.paths.bus_storage),
                 "initialized_at": initialized_at,
-                "synced_at": synced_at,
-                "derived_nodes": len(derived_nodes),
-                "derived_relations": len(derived_edges),
-                "removed_derived_nodes": len(stale_node_ids),
-                "removed_derived_relations": len(stale_edge_ids),
-                "new_derived_nodes": len(new_node_ids),
-                "new_derived_relations": len(new_edge_ids),
-                "updated_derived_nodes": len(changed_node_ids),
-                "updated_derived_relations": len(changed_edge_ids),
+                "removed_canonical_items": len(canonical_ids),
+                "removed_canonical_relationships": len(removed_edge_ids),
                 "preserved_agent_nodes": preserved_agent_nodes,
                 "preserved_agent_relations": preserved_agent_edges,
             }
         finally:
             agent.close()
-            standard.close()
 
     def status(self) -> dict[str, Any]:
         if not self.exists():
@@ -268,21 +250,21 @@ class AgentWorkspace:
                 "exists": False,
                 "agent_id": self.agent_id,
                 "activity_id": self.activity_id,
-                "standard_storage": str(self.paths.standard_storage),
+                "selection_source": self.selection_source,
+                "concurrency_safe": self.concurrency_safe,
                 "agent_storage": str(self.paths.agent_storage),
                 "bus_storage": str(self.paths.bus_storage),
                 "initialized_at": None,
                 "nodes": 0,
                 "relations": 0,
-                "derived_nodes": 0,
                 "agent_nodes": 0,
             }
+        self._migrate_operational_store()
         graph = self._open_agent(read_only=True)
         try:
             workspace = graph.get_node(WORKSPACE_NODE_ID)
             nodes = graph.store.all_nodes()
             edges = graph.store.all_edges()
-            derived_nodes = [node for node in nodes if node.properties.get("source") == "standard"]
             agent_nodes = [
                 node
                 for node in nodes
@@ -293,14 +275,14 @@ class AgentWorkspace:
                 "exists": True,
                 "agent_id": self.agent_id,
                 "activity_id": self.activity_id,
-                "standard_storage": str(self.paths.standard_storage),
+                "selection_source": self.selection_source,
+                "concurrency_safe": self.concurrency_safe,
                 "agent_storage": str(self.paths.agent_storage),
                 "bus_storage": str(self.paths.bus_storage),
                 "initialized_at": workspace.properties.get("initialized_at") if workspace else None,
                 **session_status,
                 "nodes": len(nodes),
                 "relations": len(edges),
-                "derived_nodes": len(derived_nodes),
                 "agent_nodes": len(agent_nodes),
                 "metadata": dict(workspace.properties) if workspace else {},
             }
@@ -308,15 +290,7 @@ class AgentWorkspace:
             graph.close()
 
     def _current_session_status_payload(self, nodes: list[MemoryNode], workspace: MemoryNode | None) -> dict[str, Any]:
-        if workspace is None:
-            return {
-                "current_session_id": None,
-                "current_session_title": None,
-                "current_session_started_at": None,
-                "current_session_open_tasks": 0,
-                "current_session_is_idle": True,
-            }
-        session_id = self._current_session_id(workspace)
+        session_id = self._current_session_id(workspace) if workspace is not None else ""
         if not session_id:
             return {
                 "current_session_id": None,
@@ -341,7 +315,7 @@ class AgentWorkspace:
             "current_session_title": session_title,
             "current_session_started_at": started_at,
             "current_session_open_tasks": len(open_tasks),
-            "current_session_is_idle": len(open_tasks) == 0,
+            "current_session_is_idle": not open_tasks,
         }
 
     def add_note(self, text: str) -> dict[str, Any]:
@@ -396,9 +370,11 @@ class AgentWorkspace:
                 current_by_activity[self._session_scope_key()] = stored.id
                 workspace_props["current_session_ids"] = current_by_activity
                 graph.store.update_node_fields(workspace.id, properties=workspace_props)
-            return {"created": created, "session": self._node_payload(stored)}
+            result = {"created": created, "session": self._node_payload(stored)}
         finally:
             graph.close()
+        self._register_agent(status="active")
+        return result
 
     def add_task(self, description: str) -> dict[str, Any]:
         return self.add_node("task", description, status="open")
@@ -448,12 +424,13 @@ class AgentWorkspace:
         graph = self._require_agent()
         try:
             left = graph.get_node(from_id)
-            if left is None:
-                raise ValueError(f"Link source not found in agent graph: {from_id}")
+            if left is None or left.properties.get("source") != "agent":
+                raise ValueError(f"Link source not found in agent memory: {from_id}")
             targets_by_id = {node.id: node for node in graph.store.get_nodes(target_ids)}
             for to_id in target_ids:
-                if to_id not in targets_by_id:
-                    raise ValueError(f"Link target not found in agent graph: {to_id}")
+                target = targets_by_id.get(to_id)
+                if target is None or target.properties.get("source") != "agent":
+                    raise ValueError(f"Link target not found in agent memory: {to_id}")
             session_props = self._current_session_properties(graph)
             edges = [self._agent_edge(from_id, to_id, relation, session_props=session_props) for to_id in target_ids]
             with graph.store.transaction():
@@ -464,29 +441,6 @@ class AgentWorkspace:
                 "updated": sum(1 for _, created in results if not created),
                 "relations": relations,
             }
-        finally:
-            graph.close()
-
-    def link_task(
-        self,
-        *,
-        task_id: str,
-        file_path: str | None = None,
-        relation: str = "touches",
-    ) -> dict[str, Any]:
-        if not file_path:
-            raise ValueError("A file path is required")
-        graph = self._require_agent()
-        try:
-            with graph.store.transaction():
-                task = self._resolve_open_task_for_link(graph, task_id)
-                target = self._resolve_file_node_by_path(graph, file_path)
-                linked = self._link_in_graph(graph, task.id, target.id, relation)
-                return {
-                    **linked,
-                    "task": self._node_payload(task, include_metadata=False),
-                    "target": self._node_payload(target, include_metadata=False),
-                }
         finally:
             graph.close()
 
@@ -613,25 +567,28 @@ class AgentWorkspace:
         graph = self._require_agent(read_only=True)
         try:
             since_dt = parse_dt(since) if since else None
-            nodes = [node for node in graph.store.all_nodes() if node.id != WORKSPACE_NODE_ID]
-            agent_nodes = [node for node in nodes if node.properties.get("source") != "standard"]
-            edges = graph.store.all_edges()
+            workspace = graph.get_node(WORKSPACE_NODE_ID)
+            agent_nodes = [
+                node
+                for node in graph.store.all_nodes()
+                if node.id != WORKSPACE_NODE_ID and node.properties.get("source") != "standard"
+            ]
             agent_edges = [
                 edge
-                for edge in edges
+                for edge in graph.store.all_edges()
                 if edge.properties.get("source") == "agent" and edge.type in AGENT_RELATIONS
             ]
             filters: dict[str, Any] = {}
             if session:
                 session_id = self._resolve_session_selector(graph, session)
                 filters["session"] = session_id
-                by_id = {node.id: node for node in nodes}
+                by_id = {node.id: node for node in agent_nodes}
                 agent_edges = [edge for edge in agent_edges if edge.properties.get("session_id") == session_id]
                 session_agent_ids = {
                     endpoint_id
                     for edge in agent_edges
                     for endpoint_id in (edge.from_id, edge.to_id)
-                    if (endpoint := by_id.get(endpoint_id)) is not None and endpoint.properties.get("source") != "standard"
+                    if endpoint_id in by_id
                 }
                 agent_nodes = [
                     node
@@ -640,12 +597,12 @@ class AgentWorkspace:
                 ]
             if task_id:
                 task = graph.get_node(task_id)
-                if task is None or task.id == WORKSPACE_NODE_ID or task.properties.get("source") == "standard":
+                if task is None or task.id == WORKSPACE_NODE_ID or task.properties.get("source") != "agent":
                     raise ValueError(f"Agent task not found: {task_id}")
                 if task.type != "task":
                     raise ValueError(f"Agent node is not a task: {task_id}")
                 filters["task"] = task_id
-                by_id = {node.id: node for node in nodes}
+                by_id = {node.id: node for node in agent_nodes}
                 focus_ids = {task_id}
                 changed = True
                 while changed:
@@ -655,7 +612,7 @@ class AgentWorkspace:
                             continue
                         for endpoint_id in (edge.from_id, edge.to_id):
                             endpoint = by_id.get(endpoint_id)
-                            if endpoint is None or endpoint.properties.get("source") == "standard":
+                            if endpoint is None:
                                 continue
                             if endpoint_id not in focus_ids:
                                 focus_ids.add(endpoint_id)
@@ -667,7 +624,7 @@ class AgentWorkspace:
                     if edge.from_id in focus_ids or edge.to_id in focus_ids
                 ]
             else:
-                relevant_edges = list(agent_edges)
+                relevant_edges = agent_edges
             if since_dt:
                 filters["since"] = since
                 recent_agent_ids = {
@@ -694,44 +651,14 @@ class AgentWorkspace:
             tasks = [node for node in agent_nodes if node.type == "task" and node.status != "done"]
             completed_tasks = [node for node in agent_nodes if node.type == "task" and node.status == "done"]
             decisions = [node for node in agent_nodes if node.type == "decision"]
-            endpoint_ids = {endpoint_id for edge in relevant_edges for endpoint_id in (edge.from_id, edge.to_id)}
-            endpoint_nodes = {node.id: node for node in graph.store.get_nodes(sorted(endpoint_ids))}
-            file_nodes_by_path = {
-                path: node
-                for node in nodes
-                if self._map_node_kind(node) == "file"
-                if (path := self._node_file_path(node))
-            }
-            files_by_key: dict[str, dict[str, Any]] = {}
-            symbols_by_key: dict[str, dict[str, Any]] = {}
-            for node in endpoint_nodes.values():
-                kind = self._map_node_kind(node)
-                if kind == "file":
-                    files_by_key[node.id] = self._node_payload(node, include_metadata=include_metadata)
-                    continue
-                if kind == "symbol":
-                    symbols_by_key[node.id] = self._node_payload(node, include_metadata=include_metadata)
-                elif kind not in {"fragment", "static_finding"}:
-                    continue
-                path = self._node_file_path(node)
-                if not path:
-                    continue
-                file_node = file_nodes_by_path.get(path)
-                if file_node is not None:
-                    files_by_key[file_node.id] = self._node_payload(file_node, include_metadata=include_metadata)
-                else:
-                    files_by_key[path] = self._related_file_payload(path, node, include_metadata=include_metadata)
-            visible_node_ids = {
-                node.id
-                for node in tasks
-                if node.type == "task" and node.status != "done"
-            }
+            visible_node_ids = {node.id for node in tasks}
             if include_completed:
                 filters["completed"] = True
                 visible_node_ids.update(node.id for node in completed_tasks)
             visible_node_ids.update(node.id for node in decisions)
-            visible_node_ids.update(files_by_key)
-            visible_node_ids.update(symbols_by_key)
+            visible_node_ids.update(
+                node.id for node in agent_nodes if node.type in LEARNED_NODE_TYPES or node.type == "session"
+            )
             essential_edges = [
                 edge
                 for edge in relevant_edges
@@ -740,8 +667,6 @@ class AgentWorkspace:
             payload = {
                 "open_tasks": [self._node_payload(node, include_metadata=include_metadata) for node in sorted(tasks, key=lambda item: item.updated_at, reverse=True)[:20]],
                 "decisions": [self._node_payload(node, include_metadata=include_metadata) for node in sorted(decisions, key=lambda item: item.updated_at, reverse=True)[:20]],
-                "files": sorted(files_by_key.values(), key=lambda item: str(item.get("updated_at") or ""), reverse=True)[:20],
-                "symbols": sorted(symbols_by_key.values(), key=lambda item: str(item.get("updated_at") or ""), reverse=True)[:20],
                 "relations": [self._edge_payload(edge, include_metadata=include_metadata) for edge in sorted(essential_edges, key=lambda item: item.updated_at, reverse=True)[:40]],
             }
             if include_completed:
@@ -749,6 +674,27 @@ class AgentWorkspace:
                     self._node_payload(node, include_metadata=include_metadata)
                     for node in sorted(completed_tasks, key=lambda item: item.updated_at, reverse=True)[:20]
                 ]
+            selected_session_id = str(filters.get("session") or "")
+            payload["context_format"] = "reql-agent-context-v3"
+            payload["context"] = {
+                "learned": {
+                    f"{node_type}s": [
+                        self._node_payload(node, include_metadata=include_metadata)
+                        for node in sorted(
+                            (item for item in agent_nodes if item.type == node_type),
+                            key=lambda item: item.updated_at,
+                            reverse=True,
+                        )[:10]
+                    ]
+                    for node_type in LEARNED_NODE_TYPES
+                },
+                "sessions": self._session_context_payload(
+                    agent_nodes,
+                    workspace,
+                    include_metadata=include_metadata,
+                    selected_session_id=selected_session_id or None,
+                ),
+            }
             if filters:
                 payload["filters"] = filters
             return payload
@@ -757,15 +703,14 @@ class AgentWorkspace:
 
     def export(self, *, include_metadata: bool = False) -> dict[str, Any]:
         if not include_metadata:
-            return {"format": "reql-agent-workspace-v1", **self.map(include_metadata=False)}
+            return {"format": "reql-agent-memory-v1", **self.map(include_metadata=False)}
         graph = self._require_agent(read_only=True)
         try:
             payload = graph.export_json()
             workspace = graph.get_node(WORKSPACE_NODE_ID)
             return {
-                "format": "reql-agent-workspace-v1",
+                "format": "reql-agent-memory-v1",
                 "agent_id": self.agent_id,
-                "standard_storage": str(self.paths.standard_storage),
                 "agent_storage": str(self.paths.agent_storage),
                 "bus_storage": str(self.paths.bus_storage),
                 "initialized_at": workspace.properties.get("initialized_at") if workspace else None,
@@ -805,6 +750,269 @@ class AgentWorkspace:
             }
         finally:
             graph.close()
+
+    def overview(self, *, limit: int = 50) -> dict[str, Any]:
+        """Return compact, independently versioned views of registered agents."""
+
+        bus = self.bus(limit=limit, include_payloads=False)
+        agents: list[dict[str, Any]] = []
+        for identity in bus.get("agents", []):
+            agent_id = str(identity.get("agent_id") or identity.get("title") or "").strip()
+            storage = identity.get("agent_storage")
+            if not agent_id or not storage:
+                continue
+            candidate = AgentWorkspace(
+                self.paths.standard_storage,
+                agent_id=agent_id,
+                agent_storage=str(storage),
+                bus_storage=self.paths.bus_storage,
+                config=self.config,
+            )
+            try:
+                status = candidate.status()
+                graph = candidate._open_agent(read_only=True)
+                try:
+                    nodes = graph.store.all_nodes()
+                    agents.append(
+                        {
+                            "agent_id": agent_id,
+                            "status": identity.get("status") or "active",
+                            "current_session": {
+                                "id": status.get("current_session_id"),
+                                "title": status.get("current_session_title"),
+                                "open_tasks": status.get("current_session_open_tasks", 0),
+                            },
+                            "open_tasks": [
+                                candidate._compact_node_payload(node)
+                                for node in sorted(nodes, key=lambda item: item.updated_at, reverse=True)
+                                if node.type == "task" and node.status == "open"
+                            ][:10],
+                            "recent_decisions": [
+                                candidate._compact_node_payload(node)
+                                for node in sorted(nodes, key=lambda item: item.updated_at, reverse=True)
+                                if node.type == "decision"
+                            ][:5],
+                        }
+                    )
+                finally:
+                    graph.close()
+            except (StorageError, ValueError, OSError) as exc:
+                agents.append({"agent_id": agent_id, "status": "busy", "error": str(exc)})
+        return {
+            "format": "reql-agent-overview-v1",
+            "observed_at": utcnow_iso(),
+            "agents": agents,
+        }
+
+    def dashboard(
+        self,
+        *,
+        post: str | None = None,
+        kind: str = "status",
+        target: str = "all",
+        limit: int = DASHBOARD_DEFAULT_LIMIT,
+        include_agent_details: bool = False,
+    ) -> dict[str, Any]:
+        """Read intra/inter-session coordination state and optionally post one update."""
+
+        if limit < 1 or limit > DASHBOARD_MAX_LIMIT:
+            raise ValueError(f"Agent dashboard limit must be between 1 and {DASHBOARD_MAX_LIMIT}")
+        posted = None
+        if post is not None:
+            content = post.strip()
+            if not content:
+                raise ValueError("Agent dashboard post must not be empty")
+            if len(content) > DASHBOARD_POST_MAX_CHARS:
+                raise ValueError(
+                    f"Agent dashboard posts are limited to {DASHBOARD_POST_MAX_CHARS} characters; "
+                    "use `reql agent note add`, `decision add`, `finding add`, or `handoff` for durable detail"
+                )
+            posted = self.publish(content, kind=kind, target=target)["message"]
+
+        private = self._dashboard_private_state(limit=limit)
+        bus = self.bus(limit=limit * 4, include_payloads=False)
+        relevant_targets = {"all", DEFAULT_AGENT_ID, self.agent_id}
+
+        def relevant(item: dict[str, Any]) -> bool:
+            return (
+                str(item.get("target_agent_id") or "all") in relevant_targets
+                or str(item.get("agent_id") or "") == self.agent_id
+            )
+
+        messages = [self._compact_bus_payload(item) for item in bus.get("messages", []) if relevant(item)][:limit]
+        handoffs = [self._compact_bus_payload(item) for item in bus.get("handoffs", []) if relevant(item)][:limit]
+        agents = [
+            {
+                "agent_id": item.get("agent_id"),
+                "status": item.get("status") or "active",
+                "activity_id": (item.get("metadata") or {}).get("activity_id"),
+            }
+            for item in bus.get("agents", [])[:limit]
+        ]
+        working_agents = [item for item in agents if item.get("status") == "active"]
+        finished_agents = [item for item in agents if item.get("status") != "active"]
+        is_active = any(item.get("agent_id") == self.agent_id for item in working_agents)
+        payload: dict[str, Any] = {
+            "format": "reql-agent-dashboard-v1",
+            "agent_id": self.agent_id,
+            "initialized": private["initialized"],
+            "session": private["session"],
+            "previous_session": private["previous_session"],
+            "work": private["work"],
+            "memory": private["memory"],
+            "working_agents": working_agents,
+            "finished_agents": finished_agents,
+            "messages": messages,
+            "handoffs": handoffs,
+            "drilldowns": self._dashboard_drilldowns(private, handoffs, is_active=is_active),
+        }
+        if include_agent_details:
+            payload["agent_details"] = self.overview(limit=limit)["agents"]
+        if posted is not None:
+            payload["posted"] = self._compact_bus_payload(posted)
+        return payload
+
+    def finish(self, summary: str | None = None) -> dict[str, Any]:
+        """Publish final context, close the current session, and leave the active roster."""
+
+        if not self.exists():
+            raise ValueError("Agent workspace is not initialized. Run `reql agent init` first.")
+        handoff = self.handoff(summary or f"Finished work for {self.agent_id}", target="all")
+        graph = self._require_agent()
+        closed_session = None
+        try:
+            with graph.store.transaction():
+                workspace = graph.get_node(WORKSPACE_NODE_ID)
+                if workspace is None:
+                    raise ValueError("Agent workspace is not initialized. Run `reql agent init` first.")
+                session_id = self._current_session_id(workspace)
+                if session_id:
+                    session = graph.get_node(session_id)
+                    if session is not None and session.type == "session":
+                        now = utcnow_iso()
+                        properties = dict(session.properties)
+                        properties.update({"ended_at": now, "is_current": False})
+                        graph.store.update_node_fields(
+                            session.id,
+                            status="completed",
+                            updated_at=now,
+                            properties=properties,
+                        )
+                        closed_session = session.id
+                    workspace_properties = dict(workspace.properties)
+                    current_by_activity = dict(workspace_properties.get("current_session_ids") or {})
+                    current_by_activity.pop(self._session_scope_key(), None)
+                    workspace_properties["current_session_ids"] = current_by_activity
+                    graph.store.update_node_fields(workspace.id, properties=workspace_properties)
+        finally:
+            graph.close()
+        self._register_agent(status="completed")
+        return {
+            "agent_id": self.agent_id,
+            "status": "completed",
+            "closed_session_id": closed_session,
+            "handoff": handoff["handoff"],
+        }
+
+    def _dashboard_private_state(self, *, limit: int) -> dict[str, Any]:
+        """Build the bounded private-memory slice shown on the dashboard."""
+
+        if not self.exists():
+            return {
+                "initialized": False,
+                "session": None,
+                "previous_session": None,
+                "work": [],
+                "memory": [],
+            }
+        graph = self._require_agent(read_only=True)
+        try:
+            workspace = graph.get_node(WORKSPACE_NODE_ID)
+            nodes = [
+                node
+                for node in graph.store.all_nodes()
+                if node.id != WORKSPACE_NODE_ID and node.properties.get("source") == "agent"
+            ]
+            ordered = sorted(nodes, key=lambda item: item.updated_at, reverse=True)
+            sessions = self._session_context_payload(
+                nodes,
+                workspace,
+                include_metadata=False,
+                selected_session_id=None,
+            )
+            return {
+                "initialized": True,
+                "session": sessions.get("current"),
+                "previous_session": (sessions.get("previous") or [None])[0],
+                "work": [
+                    self._compact_node_payload(node)
+                    for node in ordered
+                    if node.type == "task" and node.status != "done"
+                ][:limit],
+                "memory": [
+                    self._compact_node_payload(node)
+                    for node in ordered
+                    if node.type in {"decision", "finding", "risk", "plan"}
+                ][:limit],
+            }
+        finally:
+            graph.close()
+
+    @staticmethod
+    def _compact_bus_payload(item: dict[str, Any]) -> dict[str, Any]:
+        """Remove timestamps and storage metadata from one dashboard bus signal."""
+
+        return {
+            "id": item.get("id"),
+            "kind": (item.get("metadata") or {}).get("kind") or item.get("type"),
+            "from": item.get("agent_id"),
+            "to": item.get("target_agent_id"),
+            "text": item.get("content") or item.get("title"),
+        }
+
+    def _dashboard_drilldowns(
+        self,
+        private: dict[str, Any],
+        handoffs: list[dict[str, Any]],
+        *,
+        is_active: bool,
+    ) -> list[dict[str, str]]:
+        """Point an agent at deeper commands without expanding them eagerly."""
+
+        if not private["initialized"]:
+            return [{"reason": "initialize private memory", "command": "reql agent init"}]
+        commands: list[dict[str, str]] = []
+        work = private.get("work") or []
+        if work:
+            commands.append(
+                {"reason": "inspect active task", "command": f"reql agent show {work[0]['id']} --json"}
+            )
+        if private.get("session") is not None:
+            commands.append(
+                {"reason": "recover current plan", "command": "reql agent map --session current --json"}
+            )
+        elif private.get("previous_session") is not None:
+            commands.append(
+                {"reason": "recover previous session", "command": "reql agent map --json"}
+            )
+        if handoffs:
+            commands.append(
+                {"reason": "open handoff payloads", "command": "reql agent bus --include-payloads --json"}
+            )
+        commands.append(
+            {
+                "reason": "query canonical code facts",
+                "command": 'reql query_context --query "<task terms>" --code',
+            }
+        )
+        if is_active:
+            commands.append(
+                {
+                    "reason": "leave working roster when done",
+                    "command": 'reql agent finish "<compact outcome>"',
+                }
+            )
+        return commands[:5]
 
     def publish(self, text: str, *, kind: str = "note", target: str = "all") -> dict[str, Any]:
         content = text.strip()
@@ -883,9 +1091,6 @@ class AgentWorkspace:
         finally:
             graph.close()
 
-    def _add_node_in_graph(self, graph: MemoryGraph, node: MemoryNode) -> tuple[MemoryNode, bool]:
-        return graph.add_node(node)
-
     def _complete_task_in_graph(self, graph: MemoryGraph, node_id: str) -> dict[str, Any]:
         node = graph.get_node(node_id)
         if node is None or node.id == WORKSPACE_NODE_ID:
@@ -899,57 +1104,16 @@ class AgentWorkspace:
             raise ValueError(f"Agent node not found: {node_id}")
         return {"task": self._node_payload(updated)}
 
-    def _resolve_open_task_for_link(self, graph: MemoryGraph, task_id: str) -> MemoryNode:
-        if not task_id:
-            raise ValueError("An explicit task id is required")
-        node = graph.get_node(task_id)
-        if node is None or node.id == WORKSPACE_NODE_ID or node.properties.get("source") == "standard":
-            raise ValueError(f"Agent task not found: {task_id}")
-        if node.type != "task":
-            raise ValueError(f"Agent node is not a task: {task_id}")
-        if node.status == "done":
-            raise ValueError(f"Agent task is already done: {task_id}")
-        return node
-
-    def _resolve_file_node_by_path(self, graph: MemoryGraph, file_path: str) -> MemoryNode:
-        lookup_keys = self._path_lookup_keys(file_path)
-        if not lookup_keys:
-            raise ValueError("File path must not be empty")
-        matches = [
-            node
-            for node in graph.store.all_nodes()
-            if self._map_node_kind(node) == "file" and lookup_keys.intersection(self._node_path_lookup_keys(node))
-        ]
-        if not matches:
-            raise ValueError(f"File target not found in agent graph for path: {file_path}. Run `reql agent sync` after compiling new files.")
-        matches.sort(key=lambda item: (self._file_node_match_priority(item), item.id))
-        best = matches[0]
-        tied = [node for node in matches if self._file_node_match_priority(node) == self._file_node_match_priority(best)]
-        if len(tied) > 1:
-            ids = ", ".join(node.id for node in tied[:5])
-            raise ValueError(f"File path is ambiguous: {file_path} matches {ids}")
-        return best
-
-    def _file_node_match_priority(self, node: MemoryNode) -> int:
-        standard_type = str(node.properties.get("standard_type") or node.type)
-        priorities = {
-            "File": 0,
-            "SourceArtifact": 1,
-            "Artifact": 2,
-            "Document": 3,
-        }
-        return priorities.get(standard_type, 10)
-
     def _link_in_graph(self, graph: MemoryGraph, from_id: str, to_id: str, relation: str) -> dict[str, Any]:
         relation = relation.strip().casefold()
         if relation not in AGENT_RELATIONS:
             raise ValueError(f"Unsupported agent relation: {relation}")
         left = graph.get_node(from_id)
         right = graph.get_node(to_id)
-        if left is None:
-            raise ValueError(f"Link source not found in agent graph: {from_id}")
-        if right is None:
-            raise ValueError(f"Link target not found in agent graph: {to_id}")
+        if left is None or left.properties.get("source") != "agent":
+            raise ValueError(f"Link source not found in agent memory: {from_id}")
+        if right is None or right.properties.get("source") != "agent":
+            raise ValueError(f"Link target not found in agent memory: {to_id}")
         stored, created = graph.add_edge(self._agent_edge(from_id, to_id, relation, session_props=self._current_session_properties(graph)))
         return {"created": created, "relation": self._edge_payload(stored)}
 
@@ -979,7 +1143,7 @@ class AgentWorkspace:
         aliases: dict[str, str],
     ) -> dict[str, Any]:
         op = str(operation.get("op") or operation.get("action") or "").strip().casefold().replace("_", "-")
-        if op in {"add", "note.add", "note-add"}:
+        if op in {"note.add", "note-add"}:
             return self._batch_add_node(graph, "note", str(operation.get("text") or operation.get("content") or ""), operation)
         if op in {"task.add", "task-add"}:
             return self._batch_add_node(graph, "task", str(operation.get("description") or operation.get("text") or operation.get("content") or ""), operation, status="open")
@@ -1068,7 +1232,7 @@ class AgentWorkspace:
             salience=0.6,
             confidence=1.0,
         )
-        stored, created = self._add_node_in_graph(graph, node)
+        stored, created = graph.add_node(node)
         return {"created": created, "node": self._node_payload(stored)}
 
     def _link_many_in_graph(self, graph: MemoryGraph, from_id: str, to_ids: list[str], relation: str) -> dict[str, Any]:
@@ -1078,12 +1242,14 @@ class AgentWorkspace:
         target_ids = [str(to_id).strip() for to_id in to_ids if str(to_id).strip()]
         if not target_ids:
             raise ValueError("At least one link target is required")
-        if graph.get_node(from_id) is None:
-            raise ValueError(f"Link source not found in agent graph: {from_id}")
+        source = graph.get_node(from_id)
+        if source is None or source.properties.get("source") != "agent":
+            raise ValueError(f"Link source not found in agent memory: {from_id}")
         targets_by_id = {node.id: node for node in graph.store.get_nodes(target_ids)}
         for to_id in target_ids:
-            if to_id not in targets_by_id:
-                raise ValueError(f"Link target not found in agent graph: {to_id}")
+            target = targets_by_id.get(to_id)
+            if target is None or target.properties.get("source") != "agent":
+                raise ValueError(f"Link target not found in agent memory: {to_id}")
         session_props = self._current_session_properties(graph)
         results = graph.store.batch_upsert_edges([self._agent_edge(from_id, to_id, relation, session_props=session_props) for to_id in target_ids])
         return {
@@ -1115,14 +1281,11 @@ class AgentWorkspace:
             return str(relations[0]["id"])
         return None
 
-    def _recreate(self) -> dict[str, Any]:
-        self._remove_agent_store()
-        standard = MemoryGraph.open(self.paths.standard_storage, config=self.config, read_only=True)
+    def _recreate(self, *, remove_existing: bool = True) -> dict[str, Any]:
+        if remove_existing:
+            self._remove_agent_store()
         agent = self._open_agent()
         try:
-            standard_nodes = standard.store.all_nodes()
-            standard_edges = standard.store.all_edges()
-            derived_nodes, derived_edges = self._derive_standard_graph(standard_nodes, standard_edges)
             initialized_at = utcnow_iso()
             workspace = MemoryNode(
                 id=WORKSPACE_NODE_ID,
@@ -1131,37 +1294,29 @@ class AgentWorkspace:
                 text="Project-local working memory for coding agents.",
                 canonical_key=WORKSPACE_NODE_ID,
                 properties={
-                    "format": "reql-agent-workspace-v1",
+                    "format": "reql-agent-memory-v1",
                     "source": "system",
                     "agent_id": self.agent_id,
-                    "standard_storage": str(self.paths.standard_storage),
                     "agent_storage": str(self.paths.agent_storage),
                     "bus_storage": str(self.paths.bus_storage),
                     "initialized_at": initialized_at,
                     "current_session_ids": {},
-                    "derived_node_count": len(derived_nodes),
-                    "derived_relation_count": len(derived_edges),
                 },
                 status="active",
                 created_at=initialized_at,
                 updated_at=initialized_at,
             )
             with agent.store.transaction():
-                agent.store.batch_upsert_nodes([workspace, *derived_nodes])
-                agent.store.batch_upsert_edges(derived_edges)
+                agent.store.batch_upsert_nodes([workspace])
             return {
                 "initialized": True,
                 "agent_id": self.agent_id,
-                "standard_storage": str(self.paths.standard_storage),
                 "agent_storage": str(self.paths.agent_storage),
                 "bus_storage": str(self.paths.bus_storage),
                 "initialized_at": initialized_at,
-                "derived_nodes": len(derived_nodes),
-                "derived_relations": len(derived_edges),
             }
         finally:
             agent.close()
-            standard.close()
 
     def _remove_agent_store(self) -> None:
         base = self.paths.agent_storage
@@ -1182,33 +1337,51 @@ class AgentWorkspace:
         return value[:200] or None
 
     @classmethod
+    def _resolve_agent_identity(
+        cls,
+        standard_storage: Path,
+        bus_storage: Path,
+        explicit_agent_id: str | None,
+        activity_id: str | None,
+    ) -> tuple[str, str, bool]:
+        if explicit_agent_id:
+            return cls._normalize_agent_id(explicit_agent_id), "explicit", True
+        if activity_id:
+            derived = stable_id("agent-activity", str(standard_storage).casefold(), activity_id)
+            return f"agent:{derived.split(':')[-1][:16]}", "activity", True
+        registered = cls._registered_agent_ids(bus_storage)
+        if len(registered) > 1:
+            raise ValueError(
+                "Multiple REQL agents are registered for this project, so implicit selection is ambiguous. "
+                "Provide --activity/REQL_AGENT_ACTIVITY_ID or --agent/REQL_AGENT_ID."
+            )
+        if len(registered) == 1:
+            return registered[0], "legacy-single-agent", True
+        return DEFAULT_AGENT_ID, "legacy-default", False
+
+    @classmethod
+    def _registered_agent_ids(cls, bus_storage: Path) -> list[str]:
+        if not bus_storage.exists() or bus_storage.stat().st_size == 0:
+            return []
+        graph = MemoryGraph.open(bus_storage, read_only=True, snapshot=True)
+        try:
+            return sorted(
+                {
+                    str(node.properties.get("agent_id") or node.label).strip()
+                    for node in graph.store.all_nodes()
+                    if node.type == "agent" and node.status == "active"
+                    if str(node.properties.get("agent_id") or node.label).strip()
+                }
+            )
+        except StorageError:
+            return []
+        finally:
+            graph.close()
+
+    @classmethod
     def _safe_agent_file_stem(cls, agent_id: str) -> str:
         safe = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in agent_id)
         return safe.strip("._") or "agent"
-
-    @classmethod
-    def _read_current_agent_id(cls, bus_storage: Path) -> str | None:
-        if not bus_storage.exists() or bus_storage.stat().st_size == 0:
-            return None
-        try:
-            store = BlockGraphStore(bus_storage, read_only=True, lock_timeout_seconds=AGENT_READ_LOCK_TIMEOUT_SECONDS)
-            try:
-                graph = MemoryGraph(store)
-                bus_node = graph.get_node(BUS_NODE_ID)
-                if bus_node is None:
-                    return None
-                value = str(bus_node.properties.get("current_agent_id") or "").strip()
-                return value or None
-            finally:
-                store.close()
-        except StorageError as exc:
-            if "locked" in str(exc).casefold():
-                raise ValueError(
-                    f"Agent bus is busy; could not read current agent id from {bus_storage}. "
-                    f"The read lock wait ended after {AGENT_READ_LOCK_TIMEOUT_SECONDS:.2f}s. "
-                    "Retry the command, or pass `--agent AGENT_ID`/`REQL_AGENT_ID` explicitly."
-                ) from exc
-            return None
 
     def _register_agent(self, *, status: str) -> None:
         graph = self._ensure_bus()
@@ -1222,27 +1395,25 @@ class AgentWorkspace:
         now = updated_at or utcnow_iso()
         bus_node = self._bus_workspace_node(graph, now)
         bus_props = dict(bus_node.properties)
-        bus_props.update(
-            {
-                "current_agent_id": self.agent_id,
-                "standard_storage": str(self.paths.standard_storage),
-                "updated_at": now,
-            }
-        )
+        bus_props.update({"updated_at": now})
+        bus_props.pop("standard_storage", None)
+        bus_props.pop("current_agent_id", None)
         graph.store.update_node_fields(bus_node.id, updated_at=now, properties=bus_props)
         node_id = stable_id("agent-identity", self.agent_id)
         existing = graph.get_node(node_id)
         props = dict(existing.properties) if existing is not None else {}
+        props.pop("standard_storage", None)
         props.update(
             {
                 "source": "bus",
                 "agent_id": self.agent_id,
                 "agent_storage": str(self.paths.agent_storage),
-                "standard_storage": str(self.paths.standard_storage),
                 "role": DEFAULT_AGENT_ID if self.agent_id == DEFAULT_AGENT_ID else "worker",
                 "title": self.agent_id,
                 "content": self.agent_id,
                 "last_seen_at": now,
+                "activity_id": self.activity_id,
+                "selection_source": self.selection_source,
             }
         )
         node = MemoryNode(
@@ -1261,28 +1432,6 @@ class AgentWorkspace:
         stored, _ = graph.add_node(node)
         return stored
 
-    def _derive_standard_graph(
-        self,
-        standard_nodes: Iterable[MemoryNode],
-        standard_edges: Iterable[MemoryEdge],
-    ) -> tuple[list[MemoryNode], list[MemoryEdge]]:
-        derived_nodes = [self._derived_node(node) for node in standard_nodes]
-        derived_ids = {node.id for node in derived_nodes}
-        derived_edges = [
-            self._derived_edge(edge)
-            for edge in standard_edges
-            if edge.from_id in derived_ids and edge.to_id in derived_ids
-        ]
-        return derived_nodes, derived_edges
-
-    @staticmethod
-    def _derived_nodes_equivalent(left: MemoryNode, right: MemoryNode) -> bool:
-        return _normalized_derived_node_payload(left) == _normalized_derived_node_payload(right)
-
-    @staticmethod
-    def _derived_edges_equivalent(left: MemoryEdge, right: MemoryEdge) -> bool:
-        return _normalized_derived_edge_payload(left) == _normalized_derived_edge_payload(right)
-
     def _agent_store_files(self, base: Path) -> Iterable[Path]:
         yield base
         yield base.with_name(f"{base.name}.wal")
@@ -1292,6 +1441,7 @@ class AgentWorkspace:
     def _require_agent(self, *, read_only: bool = False) -> MemoryGraph:
         if not self.exists():
             raise ValueError("Agent workspace is not initialized. Run `reql agent init` first.")
+        self._migrate_operational_store()
         return self._open_agent(read_only=read_only)
 
     def _open_agent(self, *, read_only: bool = False) -> MemoryGraph:
@@ -1371,9 +1521,9 @@ class AgentWorkspace:
                 "format": "reql-agent-bus-v1",
                 "source": "system",
                 "bus_storage": str(self.paths.bus_storage),
-                "standard_storage": str(self.paths.standard_storage),
             }
         )
+        props.pop("standard_storage", None)
         node = MemoryNode(
             id=BUS_NODE_ID,
             type="AgentBus",
@@ -1390,69 +1540,6 @@ class AgentWorkspace:
         stored, _ = graph.add_node(node)
         return stored
 
-    def _derived_node(self, node: MemoryNode) -> MemoryNode:
-        node_type = self._agent_type_for_standard_node(node)
-        props = {
-            "source": "standard",
-            "standard_id": node.id,
-            "standard_type": node.type,
-            "standard_status": node.status,
-            "derived_from_storage": str(self.paths.standard_storage),
-            "metadata": dict(node.properties),
-        }
-        title = node.label or node.properties.get("name") or node.properties.get("relative_path") or node.id
-        props["title"] = str(title)
-        if node.text:
-            props["content"] = node.text
-        return MemoryNode(
-            id=node.id,
-            type=node_type,
-            label=str(title),
-            text=node.text,
-            canonical_key=stable_id("agent-standard-key", node.id),
-            properties=props,
-            status=node.status,
-            created_at=node.created_at,
-            updated_at=node.updated_at,
-            salience=node.salience,
-            confidence=node.confidence,
-            stability=node.stability,
-            utility=node.utility,
-        )
-
-    def _derived_edge(self, edge: MemoryEdge) -> MemoryEdge:
-        props = dict(edge.properties)
-        props.update(
-            {
-                "source": "standard",
-                "standard_id": edge.id,
-                "standard_type": edge.type,
-                "derived_from_storage": str(self.paths.standard_storage),
-            }
-        )
-        return MemoryEdge(
-            id=edge.id,
-            from_id=edge.from_id,
-            to_id=edge.to_id,
-            type=edge.type,
-            weight=edge.weight,
-            confidence=edge.confidence,
-            polarity=edge.polarity,
-            origin=edge.origin,
-            properties=props,
-            created_at=edge.created_at,
-            updated_at=edge.updated_at,
-        )
-
-    def _agent_type_for_standard_node(self, node: MemoryNode) -> str:
-        if node.type in SYMBOL_TYPES:
-            return "symbol"
-        if node.type in FILE_TYPES or node.properties.get("relative_path") or node.properties.get("path"):
-            return "file"
-        if node.type.casefold() in AGENT_NODE_TYPES:
-            return node.type.casefold()
-        return "note"
-
     def _node_payload(self, node: MemoryNode, *, include_metadata: bool = True) -> dict[str, Any]:
         if not include_metadata:
             return self._compact_node_payload(node)
@@ -1466,8 +1553,6 @@ class AgentWorkspace:
             "updated_at": node.updated_at,
             "metadata": dict(node.properties.get("metadata") or {}),
             "source": node.properties.get("source"),
-            "standard_id": node.properties.get("standard_id"),
-            "standard_type": node.properties.get("standard_type"),
             "session_id": node.properties.get("session_id"),
             "session_title": node.properties.get("session_title"),
         }
@@ -1500,32 +1585,64 @@ class AgentWorkspace:
             "status": node.status,
             "title": title,
         }
-        kind = self._map_node_kind(node)
-        if kind == "file":
-            path = self._node_file_path(node)
-            if path:
-                payload["path"] = path
-            return payload
-        if kind == "symbol":
-            metadata = node.properties.get("metadata")
-            if not isinstance(metadata, dict):
-                metadata = {}
-            qualified_name = metadata.get("qualified_name") or node.properties.get("qualified_name")
-            if qualified_name:
-                payload["qualified_name"] = str(qualified_name)
-            path = self._node_file_path(node)
-            if path:
-                payload["path"] = path
-            line_start = metadata.get("line_start") or node.properties.get("line_start")
-            line_end = metadata.get("line_end") or node.properties.get("line_end")
-            if line_start is not None:
-                payload["line_start"] = line_start
-            if line_end is not None:
-                payload["line_end"] = line_end
-            return payload
         if content and content != title:
             payload["content"] = content
+        if node.properties.get("session_id"):
+            payload["session_id"] = node.properties["session_id"]
+        if node.properties.get("session_title"):
+            payload["session_title"] = node.properties["session_title"]
         return payload
+
+    def _session_context_payload(
+        self,
+        agent_nodes: list[MemoryNode],
+        workspace: MemoryNode | None,
+        *,
+        include_metadata: bool,
+        selected_session_id: str | None,
+    ) -> dict[str, Any]:
+        sessions = [node for node in agent_nodes if node.type == "session"]
+        if selected_session_id:
+            sessions = [node for node in sessions if node.id == selected_session_id]
+        current_session_id = self._current_session_id(workspace)
+
+        def summary(session: MemoryNode) -> dict[str, Any]:
+            items = [
+                node
+                for node in agent_nodes
+                if node.id != session.id and node.properties.get("session_id") == session.id
+            ]
+            highlights = [
+                node
+                for node in items
+                if node.type in {*LEARNED_NODE_TYPES, "task"}
+                and (node.type != "task" or node.status == "done")
+            ]
+            payload: dict[str, Any] = {
+                "id": session.id,
+                "title": session.properties.get("title") or session.label,
+                "status": session.status,
+                "started_at": session.properties.get("started_at") or session.created_at,
+                "ended_at": session.properties.get("ended_at"),
+                "open_task_count": sum(1 for node in items if node.type == "task" and node.status != "done"),
+                "completed_task_count": sum(1 for node in items if node.type == "task" and node.status == "done"),
+                "highlights": [
+                    self._node_payload(node, include_metadata=include_metadata)
+                    for node in sorted(highlights, key=lambda item: item.updated_at, reverse=True)[:6]
+                ],
+            }
+            return payload
+
+        current = next((node for node in sessions if node.id == current_session_id), None)
+        previous = [node for node in sessions if node.id != current_session_id]
+        previous.sort(
+            key=lambda item: str(item.properties.get("started_at") or item.created_at or ""),
+            reverse=True,
+        )
+        return {
+            "current": summary(current) if current is not None else None,
+            "previous": [summary(node) for node in previous[:5]],
+        }
 
     def _bus_node_payload(self, node: MemoryNode, *, include_payload: bool = True) -> dict[str, Any]:
         metadata = {
@@ -1554,7 +1671,6 @@ class AgentWorkspace:
             "agent_id": node.properties.get("agent_id"),
             "target_agent_id": node.properties.get("target_agent_id"),
             "agent_storage": node.properties.get("agent_storage"),
-            "standard_storage": node.properties.get("standard_storage"),
             "source": node.properties.get("source"),
             "metadata": metadata,
         }
@@ -1612,109 +1728,5 @@ class AgentWorkspace:
             raise ValueError(f"Agent session not found: {selector}")
         return session.id
 
-    def _node_file_path(self, node: MemoryNode) -> str | None:
-        metadata = node.properties.get("metadata")
-        if not isinstance(metadata, dict):
-            metadata = {}
-        value = (
-            metadata.get("relative_path")
-            or metadata.get("path")
-            or node.properties.get("relative_path")
-            or node.properties.get("path")
-        )
-        if value is None:
-            return None
-        text = str(value).strip()
-        return text or None
-
-    def _node_path_lookup_keys(self, node: MemoryNode) -> set[str]:
-        metadata = node.properties.get("metadata")
-        if not isinstance(metadata, dict):
-            metadata = {}
-        values = [
-            metadata.get("relative_path"),
-            metadata.get("path"),
-            node.properties.get("relative_path"),
-            node.properties.get("path"),
-        ]
-        keys: set[str] = set()
-        for value in values:
-            if value is not None:
-                keys.update(self._path_lookup_keys(str(value)))
-        return keys
-
-    def _path_lookup_keys(self, value: str) -> set[str]:
-        raw = value.strip()
-        if not raw:
-            return set()
-        slash_path = raw.replace("\\", "/")
-        normalized = posixpath.normpath(slash_path)
-        keys = {normalized}
-        if normalized.startswith("./"):
-            keys.add(normalized[2:])
-        elif not normalized.startswith("../"):
-            keys.add(f"./{normalized}")
-        try:
-            resolved = Path(raw).expanduser().resolve(strict=False)
-        except OSError:
-            resolved = None
-        if resolved is not None:
-            keys.add(str(resolved).replace("\\", "/"))
-        return {key for key in keys if key and key != "."}
-
-    def _map_node_kind(self, node: MemoryNode) -> str:
-        standard_type = str(node.properties.get("standard_type") or node.type)
-        if node.properties.get("source") != "standard":
-            return "agent"
-        if standard_type in FILE_TYPES:
-            return "file"
-        if standard_type in SYMBOL_TYPES:
-            return "symbol"
-        if standard_type in FRAGMENT_TYPES:
-            return "fragment"
-        if standard_type in STATIC_FINDING_TYPES:
-            return "static_finding"
-        return "other"
-
-    def _related_file_payload(self, path: str, node: MemoryNode, *, include_metadata: bool = True) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "id": f"file:{path}",
-            "type": "file",
-            "status": node.status,
-            "title": path,
-            "path": path,
-        }
-        if not include_metadata:
-            return payload
-        payload.update({
-            "content": path,
-            "created_at": node.created_at,
-            "updated_at": node.updated_at,
-            "metadata": {"relative_path": path, "related_node_id": node.id, "related_node_type": node.type},
-            "source": "standard",
-            "standard_id": node.properties.get("standard_id") or node.id,
-            "standard_type": node.properties.get("standard_type") or node.type,
-        })
-        return payload
-
     def _title_from_content(self, content: str) -> str:
-        compact = " ".join(content.split())
-        return compact[:80] if len(compact) > 80 else compact
-
-
-def _normalized_derived_node_payload(node: MemoryNode) -> dict[str, Any]:
-    payload = node.to_dict()
-    payload.pop("updated_at", None)
-    payload["properties"] = _normalized_derived_properties(node.properties)
-    return payload
-
-
-def _normalized_derived_edge_payload(edge: MemoryEdge) -> dict[str, Any]:
-    payload = edge.to_dict()
-    payload.pop("updated_at", None)
-    payload["properties"] = _normalized_derived_properties(edge.properties)
-    return payload
-
-
-def _normalized_derived_properties(properties: dict[str, Any]) -> dict[str, Any]:
-    return {key: value for key, value in properties.items() if key not in {"created_at", "updated_at"}}
+        return " ".join(content.split())[:80]

@@ -91,7 +91,7 @@ class QueryContextServiceTests(unittest.TestCase):
 
         self.assertIsInstance(result, ContextResult)
         self.assertEqual(retrieve.call_count, 1)
-        self.assertEqual(result.schema_version, 1)
+        self.assertEqual(result.schema_version, 2)
         self.assertEqual(len(result.graph_revision), 64)
         self.assertNotIn("confidence", result.payload)
         self.assertIn("trace_id", result.payload)
@@ -99,7 +99,9 @@ class QueryContextServiceTests(unittest.TestCase):
         self.assertIn("seed_node_ids", result.payload)
         envelope = result.to_dict()
         self.assertIn("payload", envelope)
-        self.assertEqual(envelope["schema_version"], 1)
+        self.assertEqual(envelope["schema_version"], 2)
+        self.assertEqual(envelope["freshness"]["status"], "unknown")
+        self.assertIn("source_revision", envelope)
         self.assertEqual(envelope["graph_revision"], result.graph_revision)
         self.assertEqual(envelope["confidence"]["status"], result.confidence.status)
 

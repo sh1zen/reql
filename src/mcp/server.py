@@ -82,7 +82,9 @@ def main(argv: list[str] | None = None) -> int:
     if transport == "stdio":
         return serve(sys.stdin, sys.stdout, include_write=not args.read_only)
 
-    api_key = _resolve_api_key(args.api_key, args.api_key_env)
+    api_key = args.api_key
+    if not api_key and args.api_key_env:
+        api_key = os.environ.get(args.api_key_env) or None
     if not api_key:
         parser.error(f"HTTP transport requires --api-key or a non-empty {args.api_key_env} environment variable")
     host = args.host or DEFAULT_HTTP_HOST
@@ -254,15 +256,6 @@ def _result_response(request_id: Any, result: dict[str, Any]) -> dict[str, Any]:
 
 def _error_response(request_id: Any, code: int, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": request_id, "error": {"code": code, "message": message}}
-
-
-def _resolve_api_key(explicit: str | None, env_name: str | None) -> str | None:
-    if explicit:
-        return explicit
-    if not env_name:
-        return None
-    value = os.environ.get(env_name)
-    return value or None
 
 
 if __name__ == "__main__":

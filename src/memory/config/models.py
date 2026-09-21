@@ -19,8 +19,7 @@ def normalize_scan_path_pattern(pattern: str) -> str:
     while normalized != previous:
         previous = normalized
         normalized = normalized.lstrip("/")
-        if normalized.startswith("./"):
-            normalized = normalized[2:]
+        normalized = normalized.removeprefix("./")
     return normalized.rstrip("/")
 
 
@@ -220,21 +219,14 @@ def config_from_mapping(data: Mapping[str, Any]) -> REQLConfig:
     if unknown_sections:
         raise ValueError(f"Unknown config section(s): {', '.join(sorted(unknown_sections))}")
 
-    project = _section(ProjectConfig, data.get("project", {}), "project")
-    scan = _section(ScanConfig, data.get("scan", {}), "scan")
-    compile = _section(CompileConfig, data.get("compile", {}), "compile")
-    cache = _section(CacheConfig, data.get("cache", {}), "cache")
-    analysis = _section(AnalysisConfig, data.get("analysis", {}), "analysis")
-    reporting = _section(ReportingConfig, data.get("reporting", {}), "reporting")
-    diagnostics = _section(DiagnosticsConfig, data.get("diagnostics", {}), "diagnostics")
     cfg = REQLConfig(
-        project=project,
-        scan=scan,
-        compile=compile,
-        cache=cache,
-        analysis=analysis,
-        reporting=reporting,
-        diagnostics=diagnostics,
+        project=_section(ProjectConfig, data.get("project", {}), "project"),
+        scan=_section(ScanConfig, data.get("scan", {}), "scan"),
+        compile=_section(CompileConfig, data.get("compile", {}), "compile"),
+        cache=_section(CacheConfig, data.get("cache", {}), "cache"),
+        analysis=_section(AnalysisConfig, data.get("analysis", {}), "analysis"),
+        reporting=_section(ReportingConfig, data.get("reporting", {}), "reporting"),
+        diagnostics=_section(DiagnosticsConfig, data.get("diagnostics", {}), "diagnostics"),
     )
     _validate(cfg)
     return cfg
@@ -254,9 +246,10 @@ def _section(cls: type[Any], raw: object, section_name: str) -> Any:
     missing = option_names - set(raw_values)
     if missing:
         raise ValueError(f"Missing config option(s) in [{section_name}]: {', '.join(sorted(missing))}")
-    values: dict[str, Any] = {}
-    for key, value in raw_values.items():
-        values[key] = _coerce_value(section_name, key, value, hints[key])
+    values = {
+        key: _coerce_value(section_name, key, value, hints[key])
+        for key, value in raw_values.items()
+    }
     return cls(**values)
 
 def _coerce_value(section: str, key: str, value: Any, expected_type: Any) -> Any:

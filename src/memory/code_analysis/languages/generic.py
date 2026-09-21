@@ -420,7 +420,7 @@ def _generic_bases(source: bytes, node: Any, profile: AstProfile) -> list[str]:
         field = _field(node, field_name)
         if field is not None:
             values.extend(_identifier_texts(source, field, profile))
-    return [value for index, value in enumerate(values) if value and value not in values[:index]]
+    return list(dict.fromkeys(value for value in values if value))
 
 
 def _identifier_texts(source: bytes, node: Any | None, profile: AstProfile) -> list[str]:
@@ -439,12 +439,7 @@ def _generic_params(source: bytes, node: Any, profile: AstProfile) -> list[str]:
     params = _first_field(node, profile.parameter_fields)
     if params is None:
         return []
-    names: list[str] = []
-    for child in _named_children(params):
-        values = _identifier_texts(source, child, profile)
-        if values:
-            names.append(values[0])
-    return names
+    return [values[0] for child in _named_children(params) if (values := _identifier_texts(source, child, profile))]
 
 
 def _generic_import_target(source: bytes, node: Any, profile: AstProfile) -> str | None:
@@ -513,9 +508,7 @@ def _generic_import_call_head(source: bytes, node: Any, profile: AstProfile) -> 
         return None
     target = _call_target_node(node, profile)
     value = _call_target(source, target)
-    if value:
-        return value.strip()
-    return None
+    return value.strip() if value else None
 
 
 def _generic_import_call_target(source: bytes, node: Any, profile: AstProfile) -> str | None:
@@ -578,9 +571,7 @@ def _assignment_left(node: Any, profile: AstProfile) -> Any | None:
     if direct is not None:
         return direct
     children = _named_children(node)
-    if children:
-        return children[0]
-    return None
+    return children[0] if children else None
 
 
 def _assignment_right(node: Any, profile: AstProfile) -> Any | None:
@@ -588,9 +579,7 @@ def _assignment_right(node: Any, profile: AstProfile) -> Any | None:
     if direct is not None:
         return direct
     children = _named_children(node)
-    if len(children) >= 2:
-        return children[-1]
-    return None
+    return children[-1] if len(children) >= 2 else None
 
 
 def _node_defines_callable(node: Any) -> bool:
@@ -618,11 +607,7 @@ def _variable_container_value(node: Any) -> Any | None:
 
 def _node_contains_declaration_node(node: Any, profile: AstProfile) -> bool:
     nested_declarations = profile.class_nodes | profile.function_nodes | profile.method_nodes
-    for child in _named_children(node):
-        child_type = str(getattr(child, "type", ""))
-        if child_type in nested_declarations:
-            return True
-    return False
+    return any(str(getattr(child, "type", "")) in nested_declarations for child in _named_children(node))
 
 
 def _variable_name_nodes(node: Any, profile: AstProfile) -> list[Any]:

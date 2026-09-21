@@ -163,11 +163,7 @@ class GraphReportBuilder:
         lines.extend(f"- {item}" for item in items[:10])
 
 def _count_prop(nodes: list[MemoryNode], prop: str) -> Counter[str]:
-    counts: Counter[str] = Counter()
-    for node in nodes:
-        value = node.properties.get(prop) or "unknown"
-        counts[str(value)] += 1
-    return counts
+    return Counter(str(node.properties.get(prop) or "unknown") for node in nodes)
 
 
 def _name(path: str) -> str:

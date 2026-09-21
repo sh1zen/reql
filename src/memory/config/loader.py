@@ -286,7 +286,7 @@ def _parse_yaml_value(raw: str, path: Path, line_number: int) -> Any:
         return raw == "true"
     if raw in {"[]", "{}"}:
         return [] if raw == "[]" else {}
-    if raw.startswith("[") or raw.startswith("{"):
+    if raw.startswith(("[", "{")):
         try:
             value = json.loads(raw)
         except json.JSONDecodeError as exc:
@@ -326,7 +326,7 @@ def _strip_comment(line: str) -> str:
 def _parse_value(raw: str, path: Path, line_number: int) -> Any:
     if raw in {"true", "false"}:
         return raw == "true"
-    if raw.startswith("[") or raw.startswith("{"):
+    if raw.startswith(("[", "{")):
         try:
             value = json.loads(raw)
         except json.JSONDecodeError as exc:

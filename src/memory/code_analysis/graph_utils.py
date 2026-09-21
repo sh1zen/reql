@@ -5,13 +5,7 @@ from .models import CodeCall, CodeImport
 
 
 def imported_modules(imports: list[CodeImport]) -> set[str]:
-    modules: set[str] = set()
-    for item in imports:
-        if item.module:
-            modules.add(item.module)
-        elif item.name:
-            modules.add(item.name)
-    return modules
+    return {module for item in imports if (module := item.module or item.name)}
 
 
 def calls_by_caller(calls: list[CodeCall]) -> dict[str | None, list[CodeCall]]:

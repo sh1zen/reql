@@ -12,6 +12,8 @@ from api import MemoryGraph
 from memory.artifacts.scanner import MAX_SCAN_WORKERS, ProjectScanner, _scan_worker_count
 from memory.services import incremental_compilation as incremental_module
 from memory.services.project_watch import _WatchdogChangeHandler
+from memory.freshness import read_watch_state, write_watch_state
+from memory.storage import StoreLease, inspect_store_locks
 
 
 class CompilationPerformanceBehaviorTests(unittest.TestCase):
@@ -78,6 +80,19 @@ class CompilationPerformanceBehaviorTests(unittest.TestCase):
             )
             self.assertTrue(changed.is_set())
 
+    def test_watcher_lease_does_not_lock_canonical_store(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            storage = Path(td) / "memory.reql"
+            graph = MemoryGraph.open(storage)
+            graph.close()
+            lease_target = storage.with_name(f"{storage.name}.watch")
+            with StoreLease(lease_target):
+                self.assertIsNotNone(inspect_store_locks(lease_target)["writer"])
+                reader = MemoryGraph.open(storage, read_only=True, lock_timeout_seconds=0.0)
+                reader.close()
+                write_watch_state(storage, status="stale", pending_paths=2)
+                self.assertEqual(read_watch_state(storage)["pending_paths"], 2)
+            self.assertIsNone(inspect_store_locks(lease_target)["writer"])
 
 if __name__ == "__main__":
     unittest.main()

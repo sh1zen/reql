@@ -211,7 +211,7 @@ class RetrievalSearchMixin:
     def _coverage(tokens: set[str], query_profile: QueryProfile) -> float:
         if not query_profile.informative_tokens:
             return 0.0
-        return min(1.0, len(tokens & query_profile.informative_tokens) / len(query_profile.informative_tokens))
+        return len(tokens & query_profile.informative_tokens) / len(query_profile.informative_tokens)
 
     @staticmethod
     def _phrase_coverage(node_key: str, query_profile: QueryProfile) -> float:
@@ -219,7 +219,7 @@ class RetrievalSearchMixin:
             return 0.0
         haystack = f" {node_key} "
         matched = sum(1 for phrase in query_profile.phrase_terms if f" {phrase} " in haystack)
-        return min(1.0, matched / len(query_profile.phrase_terms))
+        return matched / len(query_profile.phrase_terms)
 
     def _significant_query_phrases(self, query_text: str) -> list[str]:
         tokens = [
@@ -230,7 +230,7 @@ class RetrievalSearchMixin:
         phrases: list[str] = []
         seen: set[str] = set()
         for size in (4, 3, 2):
-            for index in range(0, max(0, len(tokens) - size + 1)):
+            for index in range(len(tokens) - size + 1):
                 phrase = " ".join(tokens[index : index + size])
                 key = canonicalize(phrase)
                 if key and key not in seen:
@@ -294,10 +294,7 @@ class RetrievalSearchMixin:
 
     @staticmethod
     def _node_identifier_parts(node: MemoryNode) -> list[str]:
-        parts: list[str] = []
-        for part in (node.label, node.canonical_key):
-            if part:
-                parts.append(str(part))
+        parts = [str(part) for part in (node.label, node.canonical_key) if part]
         for key in STRUCTURED_SEARCH_FIELDS:
             value = node.properties.get(key)
             if value is None:
@@ -317,8 +314,7 @@ class RetrievalSearchMixin:
     @classmethod
     def _node_search_text(cls, node: MemoryNode) -> str:
         parts = cls._node_search_parts(node)
-        expanded_parts = [_identifier_expanded_text(part) for part in parts]
-        return " ".join([*parts, *expanded_parts])
+        return " ".join(parts + [_identifier_expanded_text(part) for part in parts])
 
     @classmethod
     def _node_query_token_overlap(cls, node: MemoryNode, query_tokens: set[str]) -> int:
@@ -349,9 +345,7 @@ class RetrievalSearchMixin:
     ) -> bool:
         if not query_key:
             return False
-        if node_key == query_key:
-            return True
-        if f" {query_key} " in f" {node_key} ":
+        if node_key == query_key or f" {query_key} " in f" {node_key} ":
             return True
         node_tokens = node_tokens if node_tokens is not None else set(tokenize(node_key))
         query_tokens = query_tokens if query_tokens is not None else set(tokenize(query_key))

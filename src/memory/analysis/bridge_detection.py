@@ -61,7 +61,6 @@ class BridgeDetector:
     def find_candidates(
         self,
         *,
-
         project_id: str | None = None,
         limit: int = 50,
     ) -> list[BridgeCandidate]:
@@ -83,9 +82,7 @@ class BridgeDetector:
                 continue
 
             evidence = _select_evidence(by_community)
-            evidence_strength = sum(strength for _, strength in evidence) / max(len(evidence), 1)
-            if len(evidence) < 2 and evidence_strength < 0.90:
-                continue
+            evidence_strength = sum(strength for _, strength in evidence) / len(evidence)
 
             spec = self.specificity.score(node)
             if spec.generic_penalty >= 0.45:
@@ -94,7 +91,6 @@ class BridgeDetector:
                 sorted(by_community),
                 community_members=community_members,
                 ignored_node_id=node.id,
-
             )
             bridge_centrality = min(1.0, (len(by_community) / 3.0) * 0.55 + min(1.0, len(incident) / 12.0) * 0.45)
             novelty = min(1.0, distance * 0.75 + min(1.0, len(by_community) / 4.0) * 0.25)
@@ -110,7 +106,7 @@ class BridgeDetector:
                 randomness_penalty=randomness_penalty,
                 generic_penalty=spec.generic_penalty,
             )
-            if score < 0.30 or spec.generic_penalty >= 0.75:
+            if score < 0.30:
                 continue
 
             community_ids = tuple(sorted(by_community))
@@ -187,7 +183,6 @@ class BridgeDetector:
         *,
         community_members: dict[str, set[str]],
         ignored_node_id: str,
-
     ) -> float:
         if len(community_ids) < 2:
             return 0.0
@@ -207,7 +202,7 @@ class BridgeDetector:
                 right_members = community_members.get(right, set()) - {ignored_node_id}
                 pair_count += 1
                 direct_strength += _direct_connectivity(candidate_edges, left_members, right_members, ignored_node_id)
-        obviousness = min(1.0, direct_strength / max(pair_count, 1))
+        obviousness = min(1.0, direct_strength / pair_count)
         return max(0.0, min(1.0, 1.0 - obviousness))
 
 

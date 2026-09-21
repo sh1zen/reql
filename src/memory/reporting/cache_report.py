@@ -25,19 +25,17 @@ class CacheReportBuilder:
             "## Parser versions",
         ]
         _counter(lines, Counter(str(n.properties.get("parser_version") or "unknown") for n in entries))
-        lines.append("")
-        lines.append("## Chunking versions")
+        lines.extend(["", "## Chunking versions"])
         _counter(lines, Counter(str(n.properties.get("chunking_version") or "unknown") for n in entries))
-        lines.append("")
-        lines.append("## Cache entries")
+        lines.extend(["", "## Cache entries"])
         if not entries:
             lines.append("- No data yet.")
         else:
-            for node in sorted(entries, key=lambda n: str(n.properties.get("relative_path") or n.label))[:50]:
-                lines.append(
-                    f"- `{node.properties.get('relative_path', node.label)}` status={node.status} "
-                    f"compiled_at={node.properties.get('compiled_at', '')} parser={node.properties.get('parser_version', '')}"
-                )
+            lines.extend(
+                f"- `{node.properties.get('relative_path', node.label)}` status={node.status} "
+                f"compiled_at={node.properties.get('compiled_at', '')} parser={node.properties.get('parser_version', '')}"
+                for node in sorted(entries, key=lambda n: str(n.properties.get("relative_path") or n.label))[:50]
+            )
         return "\n".join(lines).rstrip() + "\n"
 
 
@@ -45,5 +43,7 @@ def _counter(lines: list[str], counts: Counter[str]) -> None:
     if not counts:
         lines.append("- No data yet.")
         return
-    for key, count in sorted(counts.items(), key=lambda item: (-item[1], item[0])):
-        lines.append(f"- {key}: {count}")
+    lines.extend(
+        f"- {key}: {count}"
+        for key, count in sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    )

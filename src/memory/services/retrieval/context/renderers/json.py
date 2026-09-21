@@ -374,28 +374,51 @@ class JsonContextRendererMixin:
     ) -> list[dict[str, Any]]:
         rows: list[dict[str, Any]] = []
         seen: set[tuple[str, str | None]] = set()
-        for edge in edges:
-            if edge.type not in SERIALIZATION_EDGE_TYPES:
-                continue
-            if edge.from_id not in seed_ids and edge.to_id not in seed_ids:
-                continue
-            other_id = edge.to_id if edge.from_id in seed_ids else edge.from_id
-            node = nodes.get(other_id)
-            if node is None:
-                continue
-            key = (node.id, edge.id)
-            if key in seen:
-                continue
-            seen.add(key)
-            rows.append(
-                {
-                    "node": self._query_explore_node_payload(node),
-                    "edge": self._query_explore_edge_payload(edge, nodes),
-                    "reason": f"{edge.type} serialization-adjacent edge",
-                }
+        frontier = set(seed_ids)
+        visited = set(seed_ids)
+        prefetched = list(edges)
+        for depth in range(1, max(1, int(query.max_depth)) + 1):
+            if not frontier:
+                break
+            current_edges = prefetched if depth == 1 else self.store.incident_edges(
+                sorted(frontier),
+                edge_types=SERIALIZATION_EDGE_TYPES,
+                limit=max(1000, limit * 120),
             )
-            if len(rows) >= limit:
-                return rows
+            next_frontier: set[str] = set()
+            for edge in current_edges:
+                if edge.type not in SERIALIZATION_EDGE_TYPES:
+                    continue
+                if edge.from_id in frontier:
+                    other_id = edge.to_id
+                    direction = "outgoing"
+                elif edge.to_id in frontier:
+                    other_id = edge.from_id
+                    direction = "incoming"
+                else:
+                    continue
+                node = nodes.get(other_id) or self.store.get_node(other_id)
+                if node is None:
+                    continue
+                nodes.setdefault(node.id, node)
+                key = (node.id, edge.id)
+                if key not in seen:
+                    seen.add(key)
+                    rows.append(
+                        {
+                            "node": self._query_explore_node_payload(node),
+                            "edge": self._query_explore_edge_payload(edge, nodes),
+                            "depth": depth,
+                            "direction": direction,
+                            "reason": f"{edge.type} data-flow edge at depth {depth}",
+                        }
+                    )
+                    if len(rows) >= limit:
+                        return rows
+                if other_id not in visited:
+                    visited.add(other_id)
+                    next_frontier.add(other_id)
+            frontier = next_frontier
         return rows
 
     def _query_explore_docs_mentions(
@@ -574,10 +597,9 @@ class JsonContextRendererMixin:
             sequence.append(descriptor)
             features.add(f"edge:{parent}>{tag}")
             features.add(f"node:{descriptor}")
-            self_closing = raw_attrs.rstrip().endswith("/") or tag in void_tags
-            if not self_closing:
+            if not raw_attrs.rstrip().endswith("/") and tag not in void_tags:
                 stack.append(tag)
-        for index in range(max(0, len(sequence) - 2)):
+        for index in range(len(sequence) - 2):
             features.add("sequence:" + "/".join(sequence[index : index + 3]))
         return tuple(sequence), features
 
@@ -596,11 +618,10 @@ class JsonContextRendererMixin:
                 },
         ]
         if seed_nodes:
-            first = next(iter(seed_nodes))
             followups.append(
                 {
                     "label": "Inspect first seed",
-                    "command": f"reql inspect --node-id {first} --json",
+                    "command": f"reql inspect --node-id {next(iter(seed_nodes))} --json",
                     "purpose": "seed provenance and neighbors",
                 }
             )

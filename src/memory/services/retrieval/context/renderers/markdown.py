@@ -45,8 +45,7 @@ class MarkdownContextRendererMixin:
                     location = self._format_path_span(row.get("path"), row.get("line_start"), row.get("line_end"))
                     lines.append(f"- read `{location}` {row.get('reason')}: {row.get('label')}")
             elif value:
-                for row in value:
-                    lines.append(self._render_query_explore_row(row))
+                lines.extend(self._render_query_explore_row(row) for row in value)
             else:
                 lines.append("- No matches in this view.")
             lines.append("")
@@ -138,8 +137,7 @@ class MarkdownContextRendererMixin:
         return self._render_general_context_payload(payload)
 
     def _render_code_context_payload(self, payload: dict[str, Any]) -> str:
-        query_mode = str(payload.get("query_mode") or "informative")
-        if query_mode == "cleanup":
+        if str(payload.get("query_mode") or "informative") == "cleanup":
             return self._render_cleanup_context_payload(payload)
 
         lines = self._render_context_header(payload, title="# REQL Context")
@@ -173,6 +171,14 @@ class MarkdownContextRendererMixin:
                 if item.get("path") == path and (item.get("line_start") is not None or item.get("line_end") is not None):
                     return item.get("line_start"), item.get("line_end")
             return None, None
+
+        data_trace_lines: list[str] = []
+        for item in list(payload.get("data_trace") or []):
+            location = self._format_path_bracket_span(item.get("path"), item.get("line_start"), item.get("line_end"))
+            relation = f"; via={item.get('relation')}" if item.get("relation") else ""
+            data_trace_lines.append(f"- {item.get('stage')}: `{location}`; {item.get('label')}{relation}")
+        if data_trace_lines:
+            self._append_section(lines, "End-to-end data trace", data_trace_lines)
 
         file_lines: list[str] = []
         for row in source_rows:
@@ -218,10 +224,9 @@ class MarkdownContextRendererMixin:
             return "\n".join(lines).strip()
         results = list(payload["results"])
         result_lines: list[str] = []
-        if results:
-            for item in results:
-                result_lines.extend(self._render_general_result_lines(item))
-        else:
+        for item in results:
+            result_lines.extend(self._render_general_result_lines(item))
+        if not results:
             result_lines.append("- No ranked nodes matched this query.")
         self._append_section(lines, "Results", result_lines)
         return "\n".join(lines).strip()
@@ -406,8 +411,7 @@ class MarkdownContextRendererMixin:
     def _render_counts(payload: dict[str, Any]) -> list[str]:
         lines = ["## Counts"]
         counts = payload.get("counts") or {}
-        for key, value in counts.items():
-            lines.append(f"- {key}: {value}")
+        lines.extend(f"- {key}: {value}" for key, value in counts.items())
         if payload.get("trace_id"):
             lines.append(f"- trace_id: {payload['trace_id']}")
         return lines

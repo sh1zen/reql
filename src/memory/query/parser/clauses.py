@@ -51,7 +51,7 @@ class ClauseParserMixin:
             values.append(self.expect_identifier())
             if not self.match_symbol(","):
                 break
-        return tuple(v for v in values if v)
+        return tuple(values)
 
     def _parse_value_list_as_strings(self) -> list[str]:
         values: list[str] = []
@@ -60,8 +60,6 @@ class ClauseParserMixin:
             values.append(str(value))
             if not self.match_symbol(","):
                 break
-        if not values:
-            raise REQLSyntaxError("Expected at least one node id")
         return values
 
     def _parse_order_by(self) -> SortSpec:

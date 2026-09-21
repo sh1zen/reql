@@ -8,9 +8,11 @@ from memory.domain.query_context import (
     ContextPayload,
     ContextResult,
     ContextScope,
+    GraphFreshness,
     QueryContextRequest,
     QueryMode,
     RetrievalBudget,
+    SourceRevision,
 )
 from memory.storage import BlockGraphStore
 from memory.query import QueryResult, REQLError, REQLEvaluationError, REQLSyntaxError
@@ -29,9 +31,11 @@ __all__ = [
     "ContextPayload",
     "ContextResult",
     "ContextScope",
+    "GraphFreshness",
     "QueryContextRequest",
     "QueryMode",
     "RetrievalBudget",
+    "SourceRevision",
     "ProjectWatchEvent",
     "ProjectPipeline",
     "BlockGraphStore",

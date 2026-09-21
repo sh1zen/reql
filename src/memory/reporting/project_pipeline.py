@@ -36,7 +36,7 @@ def render_pipeline_mermaid(pipeline: ProjectPipeline) -> str:
             for symbol in component.symbols
         )
         lines.append(f"%% component {component.id}: {_comment_text(symbols)}")
-    lines.extend(["flowchart LR"])
+    lines.append("flowchart LR")
 
     if not pipeline.workflows:
         lines.extend(
@@ -97,7 +97,6 @@ def render_pipeline_mermaid(pipeline: ProjectPipeline) -> str:
         target = outcome_ids.get(outcome.id)
         if source and target:
             lines.append(f"  {source} --> {target}")
-            link_index += 1
 
     lines.extend(
         [
@@ -110,8 +109,7 @@ def render_pipeline_mermaid(pipeline: ProjectPipeline) -> str:
             "  classDef outcome fill:#166534,stroke:#86efac,color:#ffffff;",
         ]
     )
-    if workflow_ids:
-        lines.append(f"  class {','.join(workflow_ids.values())} entrypoint;")
+    lines.append(f"  class {','.join(workflow_ids.values())} entrypoint;")
     for layer in ("interface", "application", "domain", "core", "infrastructure"):
         ids = [component_ids[item.id] for item in pipeline.components if item.layer == layer]
         if ids:

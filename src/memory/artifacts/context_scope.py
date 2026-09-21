@@ -19,7 +19,7 @@ def artifact_context_scope(artifact: SourceArtifact) -> ContextScope:
 
 def _is_application_surface_path(path: str) -> bool:
     value = path.replace("\\", "/").lstrip("/").casefold()
-    if value.startswith(
+    return value.startswith(
         (
             "app/views/",
             "app/templates/",
@@ -34,6 +34,4 @@ def _is_application_surface_path(path: str) -> bool:
             "assets/",
             "static/",
         )
-    ):
-        return True
-    return any(part in value for part in ("/views/", "/templates/", "/public/assets/", "/static/"))
+    ) or any(part in value for part in ("/views/", "/templates/", "/public/assets/", "/static/"))

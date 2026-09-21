@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+import hashlib
 import posixpath
 import re
 from typing import Any, Sequence
@@ -227,6 +228,10 @@ CODE_GRAPH_EDGE_TYPES = {
 }
 
 
+class ArtifactContentChangedError(RuntimeError):
+    """Raised when an artifact no longer matches its scanned fingerprint."""
+
+
 class ArtifactCompiler:
     """Compiles one artifact into parsed SourceFragment nodes and relations."""
 
@@ -267,13 +272,17 @@ class ArtifactCompiler:
         return self.options.document_policies
 
     def compile_artifact(self, store: GraphStore, artifact: SourceArtifact) -> ArtifactCompilationResult:
+        content = self._read_verified_content(artifact)
         code_result: CodeParseResult | None = None
         if _is_code_artifact(artifact) and type(self).build_fragments is ArtifactCompiler.build_fragments:
-            code_text = self.read_code_artifact_text(artifact)
+            code_text = content.decode("utf-8-sig", errors="replace")
             code_result = self.parse_code_text(artifact, code_text)
             parse_result = _document_result_from_code(artifact, code_result, code_text)
         elif _is_document_artifact(artifact) and not self.document_ingest_enabled(artifact):
             parse_result = _skipped_document_parse_result(artifact)
+        elif type(self).build_fragments is ArtifactCompiler.build_fragments:
+            parser = self.parser_registry.parser_for(artifact)
+            parse_result = parser.parse(artifact, content)
         else:
             parse_result = self.build_fragments(artifact)
         result = ArtifactCompilationResult(artifact_id=artifact.id, errors=list(parse_result.errors))
@@ -296,8 +305,7 @@ class ArtifactCompiler:
             elif node.id in existing_ids:
                 result.updated_nodes.add(node.id)
 
-            for edge in _fragment_edges(artifact, fragment, node.id):
-                fragment_edges.append(edge)
+            fragment_edges.extend(_fragment_edges(artifact, fragment, node.id))
         _upsert_edges_deduped(store, result, fragment_edges)
 
         relation_result = self._persist_document_relations(store, artifact, parse_result, fragment_id_map)
@@ -337,6 +345,18 @@ class ArtifactCompiler:
         result.affected_node_ids.add(artifact.id)
         result.updated_nodes.add(artifact.id)
         return result
+
+    def _read_verified_content(self, artifact: SourceArtifact) -> bytes:
+        path = Path(artifact.path)
+        before = path.stat()
+        content = path.read_bytes()
+        after = path.stat()
+        digest = hashlib.sha256(content).hexdigest()
+        if before.st_size != after.st_size or before.st_mtime_ns != after.st_mtime_ns or digest != artifact.sha256:
+            raise ArtifactContentChangedError(
+                "source changed during compilation; the previous committed graph was preserved"
+            )
+        return content
 
     def build_fragments(self, artifact: SourceArtifact) -> DocumentParseResult:
         content = Path(artifact.path).read_bytes()
@@ -568,7 +588,7 @@ class ArtifactCompiler:
         module_node, created = store.upsert_node(_module_node(artifact, code_result.module, code_result))
         current_ids.add(module_node.id)
         result.record_node(module_node.id, created=created)
-        for edge in (
+        pending_edges += [
             _typed_edge(
                 artifact.id,
                 module_node.id,
@@ -591,10 +611,25 @@ class ArtifactCompiler:
                 extractor=code_result.parser_name,
                 evidence=code_result.module.name,
             ),
-        ):
-            pending_edges.append(edge)
+        ]
 
         read_references_by_name = _read_references_by_name(code_result.references)
+        references_by_owner: dict[str, list[dict[str, object]]] = {}
+        for reference in code_result.references:
+            if not reference.owner or "." not in reference.name:
+                continue
+            references_by_owner.setdefault(reference.owner, []).append(
+                {
+                    "name": reference.name,
+                    "access": reference.access,
+                    "line": reference.line,
+                    "column": reference.column,
+                }
+            )
+        for symbol in code_result.symbols:
+            field_references = references_by_owner.get(symbol.qualified_name)
+            if field_references:
+                symbol.metadata["field_references"] = field_references
         symbol_nodes: dict[str, MemoryNode] = {}
         skipped_local_variables = {
             symbol.qualified_name
@@ -616,8 +651,7 @@ class ArtifactCompiler:
             node = symbol_nodes.get(symbol.qualified_name)
             if node is None:
                 continue
-            for edge in _symbol_edges(artifact, file_id, module_node.id, symbol, node.id, symbol_nodes, code_result.parser_name):
-                pending_edges.append(edge)
+            pending_edges.extend(_symbol_edges(artifact, file_id, module_node.id, symbol, node.id, symbol_nodes, code_result.parser_name))
             fragment_id = fragment_by_symbol.get(symbol.qualified_name)
             if fragment_id:
                 pending_edges.append(
@@ -776,20 +810,19 @@ class ArtifactCompiler:
             if target_node is None or owner.id == target_node.id:
                 continue
             relation = {"read": "READS", "write": "WRITES", "raise": "RAISES", "return": "RETURNS"}.get(str(reference.access or ""), "REFERENCES")
-            for relation_type in (relation,):
-                pending_edges.append(
-                    _typed_edge(
-                        owner.id,
-                        target_node.id,
-                        relation_type,
-                        {"project_id": artifact.project_id, "artifact_id": artifact.id, "name": reference.name, "access": reference.access},
-                        source_file=artifact.relative_path,
-                        line_start=reference.line,
-                        line_end=reference.line,
-                        extractor=code_result.parser_name,
-                        evidence=reference.name,
-                    )
+            pending_edges.append(
+                _typed_edge(
+                    owner.id,
+                    target_node.id,
+                    relation,
+                    {"project_id": artifact.project_id, "artifact_id": artifact.id, "name": reference.name, "access": reference.access},
+                    source_file=artifact.relative_path,
+                    line_start=reference.line,
+                    line_end=reference.line,
+                    extractor=code_result.parser_name,
+                    evidence=reference.name,
                 )
+            )
 
         for node, node_created in _batch_upsert_nodes(store, list(external_nodes.values())):
             result.record_node(node.id, created=node_created)
@@ -1541,20 +1574,20 @@ def refresh_project_css_surface_findings(store: GraphStore, project_id: str) -> 
             "finding_type": finding.properties.get("finding_type"),
             "extractor": APPLICATION_SURFACE_LINKER,
         }
-        for owner_id in (css_artifact_id, css_file_id):
-            pending_edges.append(
-                _typed_edge(
-                    owner_id,
-                    finding.id,
-                    "HAS_FINDING",
-                    common,
-                    source_file=str(finding.properties.get("relative_path") or ""),
-                    line_start=finding.properties.get("line_start"),
-                    line_end=finding.properties.get("line_end"),
-                    extractor=APPLICATION_SURFACE_LINKER,
-                    evidence=finding.text or finding.label,
-                )
+        pending_edges.extend(
+            _typed_edge(
+                owner_id,
+                finding.id,
+                "HAS_FINDING",
+                common,
+                source_file=str(finding.properties.get("relative_path") or ""),
+                line_start=finding.properties.get("line_start"),
+                line_end=finding.properties.get("line_end"),
+                extractor=APPLICATION_SURFACE_LINKER,
+                evidence=finding.text or finding.label,
             )
+            for owner_id in (css_artifact_id, css_file_id)
+        )
     expected_edge_ids = {edge.id for edge in pending_edges}
     _upsert_edges_deduped(store, result, pending_edges)
 
@@ -2493,6 +2526,10 @@ def _symbol_node(artifact: SourceArtifact, symbol: CodeSymbol, code_result: Code
         "is_interface",
         "semantic_roles",
         "wrapper_targets",
+        "is_schema",
+        "annotation",
+        "param_types",
+        "field_references",
     ):
         if key in symbol.metadata:
             properties[key] = symbol.metadata[key]
@@ -2931,9 +2968,7 @@ def _solidity_base_is_interface(code_result: CodeParseResult, base: str, target:
         return False
     if target.properties.get("solidity_kind") == "interface":
         return True
-    if target.properties.get("synthetic") and base.split(".")[-1].startswith("I"):
-        return True
-    return False
+    return bool(target.properties.get("synthetic") and base.split(".")[-1].startswith("I"))
 
 
 def _should_record_unresolved_call(target: str | None, *, imported_names: set[str] | None = None) -> bool:
@@ -3310,11 +3345,7 @@ def _should_skip_unused_symbol(symbol: CodeSymbol) -> bool:
         return True
     if symbol.name.startswith("_"):
         return True
-    if symbol.name.startswith("__") and symbol.name.endswith("__"):
-        return True
-    if symbol.decorators:
-        return True
-    return False
+    return bool(symbol.decorators)
 
 
 def _is_public_api_risk_symbol(symbol: CodeSymbol) -> bool:

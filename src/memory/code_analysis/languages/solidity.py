@@ -317,11 +317,7 @@ def _foundry_remappings(project_root: Path) -> list[tuple[str, str]]:
         except OSError:
             text = ""
         remappings.extend(_parse_foundry_toml_remappings(text))
-    deduped: list[tuple[str, str]] = []
-    for item in remappings:
-        if item not in deduped:
-            deduped.append(item)
-    return deduped
+    return list(dict.fromkeys(remappings))
 
 
 def _parse_foundry_remapping_lines(lines: list[str]) -> list[tuple[str, str]]:
@@ -397,10 +393,7 @@ def _solidity_import_names(source: bytes, node: Any) -> list[tuple[str, str | No
 
 
 def _solidity_dependency_name(source_path: str, resolved_relative_path: str | None) -> str:
-    if resolved_relative_path:
-        return resolved_relative_path
-    stem = Path(source_path).stem
-    return stem or source_path
+    return resolved_relative_path or Path(source_path).stem or source_path
 
 
 def _solidity_import_metadata(source_path: str, resolved_relative_path: str | None) -> dict[str, Any]:
@@ -460,8 +453,7 @@ def _solidity_return_text(source: bytes, node: Any) -> str | None:
     returns = next((child for child in _children(node) if str(getattr(child, "type", "")) == "return_type_definition"), None)
     if returns is None:
         return None
-    value = _node_text(source, returns).strip()
-    return value or None
+    return _node_text(source, returns).strip() or None
 
 
 def _solidity_visibility(source: bytes, node: Any) -> str | None:
@@ -500,8 +492,7 @@ def _solidity_call_target(source: bytes, node: Any) -> tuple[str | None, str]:
     if new_expression is not None:
         target = _solidity_type_name_text(source, new_expression)
         return target, "instantiates"
-    target = _call_target(source, expression)
-    return target, "call"
+    return _call_target(source, expression), "call"
 
 
 SOLIDITY_BUILTINS = {

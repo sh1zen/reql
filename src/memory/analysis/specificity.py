@@ -26,7 +26,7 @@ class SpecificityScorer:
         self.store = store
 
     def score(self, node: MemoryNode) -> SpecificityScore:
-        text = " ".join(str(value or "") for value in [node.label, node.text, node.canonical_key, node.properties.get("name"), node.properties.get("qualified_name")]).strip()
+        text = " ".join(str(value or "") for value in (node.label, node.text, node.canonical_key, node.properties.get("name"), node.properties.get("qualified_name"))).strip()
         tokens = _tokens(text)
         reasons: list[str] = []
         specificity = 0.35

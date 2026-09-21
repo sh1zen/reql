@@ -9,10 +9,8 @@ from pathlib import PurePosixPath
 from ..domain.ids import stable_id
 from ..domain.models import MemoryEdge, MemoryNode
 from ..explanation.service import (
-    _capability_key,
     _capability_name,
     _CapabilityGroup,
-    _dominant_source_root,
     _humanize_symbol,
     _implementation_body_text,
     _infer_layer,
@@ -120,8 +118,6 @@ class ProjectPipelineService:
                 _traverse(anchor, reason=reason, inferred=inferred, adjacency=adjacency)
                 for anchor, reason, inferred in entries
             ]
-        traversals = [traversal for traversal in traversals if traversal.depth_by_node]
-
         project_name = str(project.properties.get("name") or project.label or project.id)
         root_path = str(project.properties.get("root_path") or project.canonical_key or project.text or "")
         project_payload = {"id": project.id, "name": project_name, "root_path": root_path}
@@ -139,14 +135,8 @@ class ProjectPipelineService:
             for node_id in traversal.depth_by_node
             if node_id in participants
         }
-        traversed_paths = [
-            _node_path(participants[node_id])
-            for node_id in sorted(traversed_node_ids)
-            if _node_path(participants[node_id])
-        ]
-        dominant_root = _dominant_source_root(traversed_paths)
         component_key_by_node = {
-            node_id: _component_key(participants[node_id], dominant_root)
+            node_id: _component_key(participants[node_id])
             for node_id in traversed_node_ids
         }
         entry_ids = {traversal.anchor.id for traversal in traversals}
@@ -204,7 +194,6 @@ class ProjectPipelineService:
                 traversal,
                 workflow_id=workflow_id,
                 participants=participants,
-                node_by_id=node_by_id,
                 adjacency=adjacency,
                 effects=effects,
                 component_key_by_node=component_key_by_node,
@@ -340,9 +329,9 @@ def _flow_adjacency(
             handled_by_endpoint.add(source.id)
             continue
         adjacency[source.id].append(_FlowStep(source.id, target.id, edge.type))
-    for node_id in list(adjacency):
+    for node_id, steps in adjacency.items():
         adjacency[node_id] = sorted(
-            set(adjacency[node_id]),
+            set(steps),
             key=lambda item: (item.relation, item.to_id, item.from_id),
         )
     return dict(adjacency), handled_by_endpoint
@@ -359,8 +348,8 @@ def _outcome_edges(
         target = node_by_id.get(edge.to_id)
         if target is not None:
             effects[edge.from_id].append((edge.type, target))
-    for node_id in list(effects):
-        effects[node_id].sort(key=lambda item: (item[0], _node_label(item[1]).casefold(), item[1].id))
+    for node_effects in effects.values():
+        node_effects.sort(key=lambda item: (item[0], _node_label(item[1]).casefold(), item[1].id))
     return dict(effects)
 
 
@@ -509,7 +498,6 @@ def _workflow_outcomes(
     *,
     workflow_id: str,
     participants: dict[str, MemoryNode],
-    node_by_id: dict[str, MemoryNode],
     adjacency: dict[str, list[_FlowStep]],
     effects: dict[str, list[tuple[str, MemoryNode]]],
     component_key_by_node: dict[str, str],
@@ -554,22 +542,18 @@ def _workflow_outcomes(
     return sorted(outcomes.values(), key=lambda item: (item.kind, item.label.casefold(), item.id)), observed_terminal
 
 
-def _component_key(node: MemoryNode, dominant_root: str | None) -> str:
+def _component_key(node: MemoryNode) -> str:
     path = _node_path(node).replace("\\", "/").strip("/")
     if path:
         module_path = str(PurePosixPath(path).with_suffix(""))
         module_path = module_path.removesuffix("/__init__")
         return f"module:{module_path.casefold()}"
-    path_key = _capability_key(path, dominant_root)
-    if path_key:
-        return f"capability:{path_key}"
     return f"unlocated-{node.type.casefold()}"
 
 
 def _component_name(key: str, group: _CapabilityGroup, degree_by_id: dict[str, int]) -> str:
-    paths = [path for path, count in group.paths.items() for _ in range(count)]
-    if paths:
-        path = PurePosixPath(Counter(paths).most_common(1)[0][0].replace("\\", "/"))
+    if group.paths:
+        path = PurePosixPath(group.paths.most_common(1)[0][0].replace("\\", "/"))
         stem = path.stem
         if stem.casefold() in GENERIC_MODULE_NAMES and path.parent.name:
             stem = f"{path.parent.name} {stem}"
@@ -726,8 +710,8 @@ def _strongly_connected_components(
         nodes.add(source)
         nodes.add(target)
         adjacency[source].append(target)
-    for source in list(adjacency):
-        adjacency[source] = sorted(set(adjacency[source]))
+    for source, targets in adjacency.items():
+        adjacency[source] = sorted(set(targets))
 
     index = 0
     indices: dict[str, int] = {}

@@ -102,8 +102,8 @@ class DocumentProcessor:
         if not term_counts:
             return DocumentProcessingResult(terms=[], relations=[], raw_events=[], signature={"term_count": 0, "relation_count": 0})
 
-        max_count = max(term_counts.values()) or 1.0
-        fragment_total = max(1, len(indexed))
+        max_count = max(term_counts.values())
+        fragment_total = len(indexed)
         ranked_terms: list[DocumentTerm] = []
         for key, count in term_counts.items():
             fragment_count = len(term_fragments[key])
@@ -135,9 +135,7 @@ class DocumentProcessor:
             ]
             fragment_counts.sort(key=lambda item: (-item[0], item[1]))
             for count, fragment_id in fragment_counts[: self.max_events_per_term]:
-                fragment = fragment_by_id.get(fragment_id)
-                if fragment is None:
-                    continue
+                fragment = fragment_by_id[fragment_id]
                 event = DocumentRawEvent(
                     id_key=f"{fragment_id}:{term.key}",
                     event_type="document_term_observation",
@@ -163,7 +161,7 @@ class DocumentProcessor:
                 first_fragment_id=term.first_fragment_id,
                 evidence=term.evidence,
                 term_type=term.term_type,
-                raw_events=list(event_map.get(term.key, [])),
+                raw_events=event_map.get(term.key, []),
             )
             for term in ranked_terms
         ]
@@ -192,15 +190,13 @@ class DocumentProcessor:
             present = sorted(key for key in item["terms"] if key in ranked_keys)
             for index, source in enumerate(present):
                 for target in present[index + 1 :]:
-                    if source == target:
-                        continue
                     pair = (source, target)
                     pair_counts[pair] += 1
                     pair_fragments[pair].add(fragment.id)
                     pair_evidence.setdefault(pair, short_label(str(fragment.text or ""), 260))
         if not pair_counts:
             return []
-        max_count = max(pair_counts.values()) or 1
+        max_count = max(pair_counts.values())
         relations: list[DocumentTermRelation] = []
         for pair, count in pair_counts.items():
             source, target = pair
@@ -218,7 +214,7 @@ class DocumentProcessor:
                     rank=rank,
                     cooccurrence_count=float(count),
                     fragment_count=len(fragment_ids),
-                    evidence_fragment_id=fragment_ids[0] if fragment_ids else "",
+                    evidence_fragment_id=fragment_ids[0],
                     evidence=pair_evidence.get(pair, ""),
                 )
             )

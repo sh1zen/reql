@@ -7,9 +7,11 @@ from .domain.query_context import (
     ContextPayload,
     ContextResult,
     ContextScope,
+    GraphFreshness,
     QueryContextRequest,
     QueryMode,
     RetrievalBudget,
+    SourceRevision,
 )
 from .storage import BlockGraphStore
 from .query import QueryResult, REQLError, REQLEvaluationError, REQLSyntaxError
@@ -26,9 +28,11 @@ __all__ = [
     "ContextPayload",
     "ContextResult",
     "ContextScope",
+    "GraphFreshness",
     "QueryContextRequest",
     "QueryMode",
     "RetrievalBudget",
+    "SourceRevision",
     "BlockGraphStore",
     "QueryResult",
     "REQLError",

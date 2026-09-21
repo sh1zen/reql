@@ -47,17 +47,16 @@ class BlockStorageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             store = BlockGraphStore(Path(td) / "memory.reql", defer_lexical_index=True)
             try:
-                with self.assertRaisesRegex(RuntimeError, "rollback"):
-                    with store.transaction():
-                        store.upsert_node(
-                            MemoryNode(
-                                id="n1",
-                                type="Topic",
-                                text="should never be searchable",
-                                canonical_key="n1",
-                            )
+                with self.assertRaisesRegex(RuntimeError, "rollback"), store.transaction():
+                    store.upsert_node(
+                        MemoryNode(
+                            id="n1",
+                            type="Topic",
+                            text="should never be searchable",
+                            canonical_key="n1",
                         )
-                        raise RuntimeError("rollback")
+                    )
+                    raise RuntimeError("rollback")
 
                 self.assertIsNone(store.get_node("n1"))
                 self.assertFalse(store._deferred_lexical_changes)
@@ -349,6 +348,21 @@ class BlockStorageTests(unittest.TestCase):
             finally:
                 second.close()
 
+    def test_memory_graph_reader_falls_back_to_committed_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "memory.reql"
+            writer = MemoryGraph.open(path)
+            try:
+                writer.add_node(MemoryNode(id="committed", type="Topic", canonical_key="committed"))
+                reader = MemoryGraph.open(path, read_only=True, lock_timeout_seconds=0.0)
+                try:
+                    self.assertTrue(reader.store.snapshot)
+                    self.assertIsNotNone(reader.get_node("committed"))
+                finally:
+                    reader.close()
+            finally:
+                writer.close()
+
     def test_stale_lock_recovery_is_safe_for_dead_and_incomplete_owners(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "memory.reql"
@@ -488,10 +502,9 @@ class BlockStorageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             store = BlockGraphStore(Path(td) / "memory.reql")
             try:
-                with self.assertRaises(RuntimeError):
-                    with store.transaction():
-                        store.upsert_node(MemoryNode(id="n1", type="Topic", canonical_key="topic:one"))
-                        raise RuntimeError("fail")
+                with self.assertRaises(RuntimeError), store.transaction():
+                    store.upsert_node(MemoryNode(id="n1", type="Topic", canonical_key="topic:one"))
+                    raise RuntimeError("fail")
                 self.assertIsNone(store.get_node("n1"))
             finally:
                 store.close()
@@ -501,10 +514,9 @@ class BlockStorageTests(unittest.TestCase):
             store = BlockGraphStore(Path(td) / "memory.reql")
             try:
                 store.upsert_node(MemoryNode(id="n1", type="Topic", label="before", canonical_key="n1"))
-                with self.assertRaises(RuntimeError):
-                    with store.transaction():
-                        store.update_node_fields("n1", label="after", properties={"marker": "changed"})
-                        raise RuntimeError("fail")
+                with self.assertRaises(RuntimeError), store.transaction():
+                    store.update_node_fields("n1", label="after", properties={"marker": "changed"})
+                    raise RuntimeError("fail")
                 node = store.get_node("n1")
                 self.assertIsNotNone(node)
                 assert node is not None
@@ -525,13 +537,12 @@ class BlockStorageTests(unittest.TestCase):
                 )
                 store.upsert_edge(MemoryEdge(id="e1", from_id="a", to_id="b", type="RELATED_TO", properties={"project_id": "p1"}))
 
-                with self.assertRaises(RuntimeError):
-                    with store.transaction():
-                        store.update_node_fields("a", label="changed", text="mutated-only-token", properties={"project_id": "p2", "name": "changed"})
-                        store.update_edge_fields("e1", properties={"project_id": "p2"})
-                        store.upsert_node(MemoryNode(id="c", type="Topic", label="created", text="created-only-token", canonical_key="topic:c", properties={"project_id": "p2", "name": "created"}))
-                        store.upsert_edge(MemoryEdge(id="e2", from_id="a", to_id="c", type="RELATED_TO", properties={"project_id": "p2"}))
-                        raise RuntimeError("rollback")
+                with self.assertRaises(RuntimeError), store.transaction():
+                    store.update_node_fields("a", label="changed", text="mutated-only-token", properties={"project_id": "p2", "name": "changed"})
+                    store.update_edge_fields("e1", properties={"project_id": "p2"})
+                    store.upsert_node(MemoryNode(id="c", type="Topic", label="created", text="created-only-token", canonical_key="topic:c", properties={"project_id": "p2", "name": "created"}))
+                    store.upsert_edge(MemoryEdge(id="e2", from_id="a", to_id="c", type="RELATED_TO", properties={"project_id": "p2"}))
+                    raise RuntimeError("rollback")
 
                 node = store.get_node("a")
                 edge = store.get_edge("e1")

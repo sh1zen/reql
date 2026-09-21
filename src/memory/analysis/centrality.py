@@ -29,7 +29,6 @@ class CentralityCalculator:
     def calculate(
         self,
         *,
-
         project_id: str | None = None,
         community_by_node: dict[str, str] | None = None,
         candidate_nodes: list[MemoryNode] | None = None,
@@ -89,7 +88,7 @@ class CentralityCalculator:
                 total_pairs += 1
                 if right not in neighbors.get(left, set()):
                     disconnected_pairs += 1
-        return disconnected_pairs / max(total_pairs, 1)
+        return disconnected_pairs / total_pairs
 
     def _community_bridge_score(self, node_id: str, neighbors: dict[str, set[str]], community_by_node: dict[str, str]) -> float:
         communities = {community_by_node.get(neighbor) for neighbor in neighbors.get(node_id, set()) if community_by_node.get(neighbor)}

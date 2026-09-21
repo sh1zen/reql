@@ -76,19 +76,18 @@ class CompilationOptions:
 
     @classmethod
     def from_sections(cls, compile_config: CompileConfig, scan_config: ScanConfig) -> "CompilationOptions":
-        policies = []
-        for format_name, definition in compile_config.document_formats.items():
-            policies.append(
-                DocumentPolicy(
-                    format=format_name,
-                    extensions=tuple(definition.get("extensions", ())),
-                    filenames=tuple(definition.get("filenames", ())),
-                    ingest=bool(compile_config.documents.get(format_name, False)),
-                )
+        policies = tuple(
+            DocumentPolicy(
+                format=format_name,
+                extensions=tuple(definition.get("extensions", ())),
+                filenames=tuple(definition.get("filenames", ())),
+                ingest=bool(compile_config.documents.get(format_name, False)),
             )
+            for format_name, definition in compile_config.document_formats.items()
+        )
         return cls(
             ingest_documents=compile_config.ingest_documents,
-            document_policies=tuple(policies),
+            document_policies=policies,
             use_gitignore=scan_config.use_gitignore,
             ignore_defaults=scan_config.ignore_defaults,
         )

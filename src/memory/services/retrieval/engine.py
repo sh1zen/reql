@@ -112,7 +112,7 @@ class RetrievalEngine(
                 if query_scopes
                 else self.store.lexical_search(
                     query.text,
-                    top_k=max(query.top_k * 3, 30),
+                    top_k=lexical_limit,
                     node_types=lexical_node_types,
                     include_archived=query.include_archived,
                 )
@@ -214,7 +214,6 @@ class RetrievalEngine(
             "LIKES",
             "RELATED_TO",
             "DERIVED_FROM",
-            "SUPPORTS",
             "SYNTHESIZES",
             "PROMOTED_TO",
             "EXPRESSES",
@@ -250,9 +249,7 @@ class RetrievalEngine(
                     context_edges[edge.id] = edge
                     context_nodes.setdefault(neighbor.id, neighbor)
 
-        trace_id: str | None = None
-        if query.store_trace:
-            trace_id = stable_id("retrieval", None, query.text, utcnow_iso())
+        trace_id = stable_id("retrieval", None, query.text, utcnow_iso()) if query.store_trace else None
 
         return MemorySubgraph(
             query=query,

@@ -1078,8 +1078,7 @@ def _module_hint_matches_path(module_hint: str, path: str) -> bool:
     suffix = PurePosixPath(normalized_path).suffix
     if suffix:
         normalized_path = normalized_path[: -len(suffix)]
-    if normalized_path.endswith("/__init__"):
-        normalized_path = normalized_path[: -len("/__init__")]
+    normalized_path = normalized_path.removesuffix("/__init__")
     return bool(
         normalized_hint
         and (
@@ -1107,9 +1106,8 @@ def _implementation_body_text(node: MemoryNode, source_text: str) -> str:
     signature_started = False
     for index, line in enumerate(lines):
         stripped = line.strip()
-        if not signature_started and (
-            stripped.startswith(("def ", "async def ", "class "))
-            or stripped.startswith("@")
+        if not signature_started and stripped.startswith(
+            ("def ", "async def ", "class ", "@")
         ):
             signature_started = True
         if signature_started and stripped.endswith(":"):

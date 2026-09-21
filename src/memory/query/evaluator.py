@@ -763,8 +763,7 @@ class QueryEvaluator:
             elif node.status == "archived":
                 row["archived_entries"] += 1
             compiled_at = str(node.properties.get("compiled_at") or "")
-            if compiled_at > row["latest_compiled_at"]:
-                row["latest_compiled_at"] = compiled_at
+            row["latest_compiled_at"] = max(row["latest_compiled_at"], compiled_at)
         rows = sorted(by_project.values(), key=lambda row: (row["latest_compiled_at"], row["project_id"]), reverse=True)[: statement.limit]
         columns = ["project_id", "total_entries", "active_entries", "archived_entries", "cached_artifacts", "latest_compiled_at"]
         diagnostics = {
@@ -915,7 +914,7 @@ class QueryEvaluator:
 
     def _finding_scopes(self, finding: MemoryNode, symbol: MemoryNode | None, uses: list[dict[str, Any]]) -> list[dict[str, Any]]:
         props = finding.properties
-        scopes = [
+        return [
             {
                 "scope": "finding",
                 "finding_id": finding.id,
@@ -942,7 +941,6 @@ class QueryEvaluator:
                 "incoming_found": sum(1 for item in uses if item.get("direction") == "incoming"),
             },
         ]
-        return scopes
 
     def _finding_risks(self, finding: MemoryNode, uses: list[dict[str, Any]]) -> list[str]:
         props = finding.properties

@@ -206,12 +206,13 @@ def _hub_reasons(node: MemoryNode, metrics: CentralityMetrics, spec: Specificity
 
 
 def _rankable_hub_node(node: MemoryNode) -> bool:
-    meaningful = _first_meaningful_label(node)
-    if meaningful is None:
+    if _first_meaningful_label(node) is None:
         return False
-    if node.type == "CodeSymbol" and (node.properties.get("external") or node.properties.get("synthetic") or node.properties.get("kind") in {"external", "decorator"}):
-        return False
-    return True
+    return node.type != "CodeSymbol" or not (
+        node.properties.get("external")
+        or node.properties.get("synthetic")
+        or node.properties.get("kind") in {"external", "decorator"}
+    )
 
 
 def _hub_label(node: MemoryNode) -> str:

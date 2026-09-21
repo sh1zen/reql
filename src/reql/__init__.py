@@ -8,6 +8,7 @@ from api import (
     ContextPayload,
     ContextResult,
     ContextScope,
+    GraphFreshness,
     MemoryEdge,
     MemoryGraph,
     MemoryNode,
@@ -23,6 +24,7 @@ from api import (
     REQLEvaluationError,
     REQLSyntaxError,
     RetrievalBudget,
+    SourceRevision,
     load_config,
 )
 
@@ -37,9 +39,11 @@ __all__ = [
     "ContextPayload",
     "ContextResult",
     "ContextScope",
+    "GraphFreshness",
     "QueryContextRequest",
     "QueryMode",
     "RetrievalBudget",
+    "SourceRevision",
     "ProjectWatchEvent",
     "BlockGraphStore",
     "QueryResult",

@@ -368,10 +368,10 @@ class GeneralContextProjectionMixin:
 
 
     def _has_source_relation(self, node_id: str) -> bool:
-        for edge, _ in self.store.neighbors(node_id, direction="both", edge_types=SOURCE_EDGE_TYPES, limit=20):
-            if edge.type in SOURCE_EDGE_TYPES:
-                return True
-        return False
+        return any(
+            edge.type in SOURCE_EDGE_TYPES
+            for edge, _ in self.store.neighbors(node_id, direction="both", edge_types=SOURCE_EDGE_TYPES, limit=20)
+        )
 
     def _collect_sources(
         self,
@@ -417,7 +417,7 @@ class GeneralContextProjectionMixin:
         sources: set[str],
     ) -> tuple[OrderedDict[str, MemoryNode], OrderedDict[str, MemoryEdge], list[str]]:
         query_tokens = set(_expanded_tokens(query_text))
-        degree: dict[str, int] = {node_id: 0 for node_id in nodes}
+        degree: dict[str, int] = dict.fromkeys(nodes, 0)
         for edge in edges.values():
             if edge.from_id in degree:
                 degree[edge.from_id] += 1
@@ -458,11 +458,7 @@ class GeneralContextProjectionMixin:
 
     @staticmethod
     def _is_explicit_code_context(node_types: Sequence[str] | None = None) -> bool:
-        if node_types:
-            requested = {node_type for node_type in node_types}
-            if requested and requested <= CODE_CONTEXT_NODE_TYPES:
-                return True
-        return False
+        return bool(node_types and set(node_types) <= CODE_CONTEXT_NODE_TYPES)
 
     @classmethod
     def _is_code_context_node(cls, node: MemoryNode) -> bool:
@@ -485,14 +481,12 @@ class GeneralContextProjectionMixin:
     @staticmethod
     def _is_code_source_path(path: str) -> bool:
         value = path.replace("\\", "/").lstrip("/").casefold()
-        if value.startswith(("src/", "tests/")):
-            return True
-        return GeneralContextProjectionMixin._is_application_surface_path(value)
+        return value.startswith(("src/", "tests/")) or GeneralContextProjectionMixin._is_application_surface_path(value)
 
     @staticmethod
     def _is_application_surface_path(path: str) -> bool:
         value = path.replace("\\", "/").lstrip("/").casefold()
-        if value.startswith(
+        return value.startswith(
             (
                 "app/views/",
                 "app/templates/",
@@ -507,9 +501,7 @@ class GeneralContextProjectionMixin:
                 "assets/",
                 "static/",
             )
-        ):
-            return True
-        return any(part in value for part in ("/views/", "/templates/", "/public/assets/", "/static/"))
+        ) or any(part in value for part in ("/views/", "/templates/", "/public/assets/", "/static/"))
 
     @staticmethod
     def _is_test_context_path(path: str) -> bool:
@@ -523,11 +515,9 @@ class GeneralContextProjectionMixin:
             return True
         if node.type in SOURCE_NODE_TYPES:
             return False
-        if node.type in {"Topic", "Entity"} and local_degree <= 1 and len(text) <= 2:
-            return True
-        if node.type in {"Topic", "Entity"} and local_degree == 0:
-            return True
-        return False
+        return node.type in {"Topic", "Entity"} and (
+            local_degree == 0 or (local_degree <= 1 and len(text) <= 2)
+        )
 
     def _is_relevant_memory_node(self, node: MemoryNode, query_text: str, *, query_tokens: set[str] | None = None) -> bool:
         if node.type in TECHNICAL_NODE_TYPES:

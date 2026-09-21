@@ -1,6 +1,7 @@
 """Project-wide structural code relations derived after artifact parsing."""
 from __future__ import annotations
 
+import re
 from collections import defaultdict, deque
 from dataclasses import replace
 from time import perf_counter
@@ -18,7 +19,27 @@ SYMBOL_TYPES = {"Class", "Interface", "Function", "Method", "Variable"}
 CALLABLE_TYPES = {"Function", "Method", "Class", "Interface"}
 STRUCTURAL_PROPERTY_NODE_TYPES = {"Module", "File", "Class", "Interface", "Function", "Method"}
 STRUCTURAL_INPUT_NODE_TYPES = {*STRUCTURAL_PROPERTY_NODE_TYPES, "Import", "Variable"}
-STRUCTURAL_EDGE_TYPES = {"INHERITS", "OVERRIDES", "WRAPS", "RE_EXPORTS"}
+STRUCTURAL_EDGE_TYPES = {"INHERITS", "OVERRIDES", "WRAPS", "RE_EXPORTS", "READS", "WRITES", "RETURNS", "RAISES"}
+
+_ANNOTATION_IDENTIFIER_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.]*")
+_ANNOTATION_BUILTINS = {
+    "Annotated",
+    "Any",
+    "Literal",
+    "None",
+    "Optional",
+    "Union",
+    "bool",
+    "bytes",
+    "dict",
+    "float",
+    "int",
+    "list",
+    "object",
+    "set",
+    "str",
+    "tuple",
+}
 
 
 def refresh_project_structural_links(
@@ -63,6 +84,7 @@ def refresh_project_structural_links(
     symbols_by_name: dict[str, list[MemoryNode]] = defaultdict(list)
     classes_by_qualified_name: dict[str, list[MemoryNode]] = defaultdict(list)
     methods_by_parent_name: dict[tuple[str, str], list[MemoryNode]] = defaultdict(list)
+    fields_by_parent_name: dict[tuple[str, str], list[MemoryNode]] = defaultdict(list)
     modules_by_path: dict[str, list[MemoryNode]] = defaultdict(list)
     files_by_path: dict[str, list[MemoryNode]] = defaultdict(list)
 
@@ -83,6 +105,8 @@ def refresh_project_structural_links(
             parent = str(node.properties.get("parent_qualified_name") or "")
             if node.type == "Method" and parent and name:
                 methods_by_parent_name[(parent, name)].append(node)
+            if node.type == "Variable" and parent and name:
+                fields_by_parent_name[(parent, name)].append(node)
         if node.type == "Module" and path:
             modules_by_path[path].append(node)
         if node.type == "File" and path:
@@ -158,6 +182,53 @@ def refresh_project_structural_links(
             if target is None or target.id == wrapper.id:
                 continue
             edge = _structural_edge(wrapper, target, "WRAPS", evidence=target_name, extra={"target": target_name})
+            new_edges[edge.id] = edge
+
+    for owner in (node for node in nodes if node.type in {"Function", "Method"}):
+        field_references = owner.properties.get("field_references")
+        param_types = owner.properties.get("param_types")
+        if not isinstance(field_references, list) or not isinstance(param_types, dict):
+            continue
+        owner_imports = imports_by_artifact.get(str(owner.properties.get("artifact_id") or ""), [])
+        for reference in field_references:
+            if not isinstance(reference, dict):
+                continue
+            reference_name = str(reference.get("name") or "")
+            parts = reference_name.split(".")
+            if len(parts) < 2:
+                continue
+            parameter_name, field_name = parts[:2]
+            annotation = param_types.get(parameter_name)
+            if not isinstance(annotation, str):
+                continue
+            parameter_class = _resolve_annotation_class(
+                owner,
+                annotation,
+                owner_imports,
+                by_path,
+                symbols_by_name,
+            )
+            if parameter_class is None:
+                continue
+            parent_name = str(parameter_class.properties.get("qualified_name") or "")
+            target = _unique_node(fields_by_parent_name.get((parent_name, field_name), []))
+            if target is None:
+                continue
+            access = str(reference.get("access") or "read")
+            relation = {"write": "WRITES", "return": "RETURNS", "raise": "RAISES"}.get(access, "READS")
+            edge = _structural_edge(
+                owner,
+                target,
+                relation,
+                evidence=reference_name,
+                extra={
+                    "name": reference_name,
+                    "access": access,
+                    "relation": "typed_field_reference",
+                    "line_start": reference.get("line"),
+                    "line_end": reference.get("line"),
+                },
+            )
             new_edges[edge.id] = edge
 
     for module in (node for node in nodes if node.type == "Module" and _is_initializer(_path(node))):
@@ -393,6 +464,32 @@ def _resolve_symbol_reference(
         return exact[0]
     candidates = [node for node in symbols_by_name.get(tail, []) if node.type in allowed_types]
     return candidates[0] if len(candidates) == 1 else None
+
+
+def _resolve_annotation_class(
+    owner: MemoryNode,
+    annotation: str,
+    imports: list[MemoryNode],
+    by_path: dict[str, list[MemoryNode]],
+    symbols_by_name: dict[str, list[MemoryNode]],
+) -> MemoryNode | None:
+    candidates = [
+        value
+        for value in _ANNOTATION_IDENTIFIER_RE.findall(annotation)
+        if value.rsplit(".", 1)[-1] not in _ANNOTATION_BUILTINS
+    ]
+    for candidate in reversed(candidates):
+        resolved = _resolve_symbol_reference(
+            owner,
+            candidate,
+            imports,
+            by_path,
+            symbols_by_name,
+            allowed_types={"Class", "Interface"},
+        )
+        if resolved is not None:
+            return resolved
+    return None
 
 
 def _re_export_targets(

@@ -8,7 +8,7 @@ relationships into dedicated dense-edge records so node pages stay small.
 from __future__ import annotations
 
 from collections import OrderedDict, defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import replace
 from datetime import datetime, timezone
 import hashlib
@@ -383,10 +383,8 @@ def inspect_store_locks(target_path: str | Path, *, recover_stale: bool = False)
 
     writer = inspect_path(lock_path, "write")
     readers = [item for path in sorted(readers_path.glob("*.lock")) if (item := inspect_path(path, "read")) is not None]
-    try:
+    with suppress(OSError):
         readers_path.rmdir()
-    except OSError:
-        pass
     snapshot_available = target.exists() and target.is_file() and target.stat().st_size > 0
     return {
         "path": str(target),
@@ -499,6 +497,20 @@ class _StoreLock:
         return _format_locked_message(self.target_path, diagnostic)
 
 
+class StoreLease:
+    """Recoverable process lease that does not lock a graph store."""
+
+    def __init__(self, target_path: str | Path, *, timeout_seconds: float = 0.0) -> None:
+        self._lock = _StoreLock(Path(target_path), timeout_seconds=timeout_seconds)
+
+    def __enter__(self) -> "StoreLease":
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        self._lock.release()
+
+
 class _ReaderLock:
     def __init__(self, target_path: Path, *, timeout_seconds: float = DEFAULT_LOCK_TIMEOUT_SECONDS) -> None:
         self.target_path = target_path
@@ -574,10 +586,8 @@ class _ReaderLock:
         return payload if isinstance(payload, dict) else {}
 
     def _remove_empty_readers_dir(self) -> None:
-        try:
+        with suppress(OSError):
             self.readers_path.rmdir()
-        except OSError:
-            pass
 
 
 class _StoreReadWriteLock:
@@ -636,10 +646,8 @@ class _StoreReadWriteLock:
                     active.append(payload)
                 continue
             active.append(payload)
-        try:
+        with suppress(OSError):
             self.reader.readers_path.rmdir()
-        except OSError:
-            pass
         return active
 
     def _read_payload(self, path: Path) -> dict[str, Any]:
@@ -1020,12 +1028,11 @@ class BlockGraphStore:
         if create and not self.read_only:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = _StoreReadWriteLock(self.path, timeout_seconds=lock_timeout_seconds)
-        if self.snapshot:
-            pass
-        elif self.read_only:
-            self._lock.acquire_read()
-        else:
-            self._lock.acquire_write()
+        if not self.snapshot:
+            if self.read_only:
+                self._lock.acquire_read()
+            else:
+                self._lock.acquire_write()
         try:
             if self.path.exists() and self.path.stat().st_size > 0:
                 self._load()
@@ -1726,7 +1733,7 @@ class BlockGraphStore:
                 "space_map": dict(self._space_map),
             }
         file_size = self.path.stat().st_size
-        data_offset = self._data_offset if self._data_offset else 0
+        data_offset = self._data_offset or 0
         if data_offset < 0 or data_offset % self.block_size != 0:
             raise StorageError(f"Invalid REQL root index offset for {self.path}")
         if file_size < data_offset or (file_size - data_offset) % self.block_size != 0:
@@ -1757,7 +1764,7 @@ class BlockGraphStore:
                 offset += length
                 compressed_payload_bytes += length
                 try:
-                    record, uncompressed_length, compressed = _decode_record_payload(payload)
+                    record, uncompressed_length, _compressed = _decode_record_payload(payload)
                 except (StorageError, UnicodeDecodeError, json.JSONDecodeError) as exc:
                     raise StorageError(f"Invalid REQL record at block {block_id}") from exc
                 if record.get("kind") == "record_part":
@@ -1765,7 +1772,7 @@ class BlockGraphStore:
                     expected_parts = int(dict(record.get("value", {})).get("total_parts", 0))
                     if expected_parts and len(pending_parts) == expected_parts:
                         try:
-                            record, uncompressed_length, compressed = _decode_record_parts(pending_parts)
+                            record, uncompressed_length, _compressed = _decode_record_parts(pending_parts)
                         except (StorageError, UnicodeDecodeError, json.JSONDecodeError) as exc:
                             raise StorageError(f"Invalid REQL large record ending at block {block_id}") from exc
                         pending_parts = []
@@ -1775,8 +1782,6 @@ class BlockGraphStore:
                     raise StorageError(f"Incomplete REQL large record before block {block_id}")
                 uncompressed_payload_bytes += uncompressed_length
                 record_count += 1
-                if compressed:
-                    pass
                 records_by_kind[str(record.get("kind", "unknown"))] += 1
         if pending_parts:
             raise StorageError(f"Incomplete REQL large record in {self.path}")
@@ -1906,8 +1911,7 @@ class BlockGraphStore:
             if magic != _BLOCK_MAGIC or version != SCHEMA_VERSION or block_size != self.block_size or current_id != current_block:
                 raise StorageError(f"Invalid REQL block header at block {current_block}")
             end = min(self.block_size, _HEADER_SIZE + used)
-            if offset < _HEADER_SIZE:
-                offset = _HEADER_SIZE
+            offset = max(offset, _HEADER_SIZE)
             if offset + _FRAME_HEADER.size > end:
                 current_block += 1
                 offset = _HEADER_SIZE
@@ -2027,7 +2031,7 @@ class BlockGraphStore:
             "value": {
                 "id": "lexical_index",
                 "node_terms": {
-                    term: {node_id: weight for node_id, weight in sorted(postings.items())}
+                    term: dict(sorted(postings.items()))
                     for term, postings in sorted(self._node_terms.items())
                 },
             },
@@ -2222,10 +2226,7 @@ class BlockGraphStore:
         value = record.get("value", {})
         if not isinstance(value, dict):
             return
-        if kind == "root_index":
-            record_id = "root_index"
-        else:
-            record_id = str(value.get("id", ""))
+        record_id = "root_index" if kind == "root_index" else str(value.get("id", ""))
         if not record_id:
             return
         locations[kind][record_id] = {
@@ -2608,9 +2609,9 @@ class BlockGraphStore:
         merged.last_used_at = incoming.last_used_at or merged.last_used_at
         merged.usage_count = max(merged.usage_count, incoming.usage_count)
         merged.evidence_count = max(merged.evidence_count, incoming.evidence_count)
-        if merged.status == "archived" and incoming.status in ACTIVE_STATUSES:
-            merged.status = incoming.status
-        elif incoming.status not in {"candidate", "latent"}:
+        if (
+            merged.status == "archived" and incoming.status in ACTIVE_STATUSES
+        ) or incoming.status not in {"candidate", "latent"}:
             merged.status = incoming.status
         return merged
 
@@ -3074,7 +3075,7 @@ class BlockGraphStore:
         if not raw_tokens or not tokens:
             return []
         unique_terms = set(tokens)
-        query_terms: dict[str, float] = {term: 1.0 for term in unique_terms}
+        query_terms: dict[str, float] = dict.fromkeys(unique_terms, 1.0)
         expanded_query_tokens = [
             variant
             for token in tokenize(identifier_expanded_text(text))
@@ -3369,7 +3370,7 @@ class BlockGraphStore:
             self._usage_by_node[node_id] = current
 
     def export_json(self) -> dict[str, Any]:
-        graph_nodes = list(self.all_nodes())
+        graph_nodes = self.all_nodes()
         graph_node_ids = {node.id for node in graph_nodes}
         graph_edges = [
             edge

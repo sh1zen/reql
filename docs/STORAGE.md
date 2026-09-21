@@ -146,6 +146,19 @@ leave the old store untouched. A successful clear also removes the old WAL and
 usage journal. With `--storage`, the explicitly selected store is replaced in
 full and should therefore not be shared by unrelated projects.
 
+## Agent Memory Isolation
+
+Private agent files and the shared agent bus use the block adapter as a storage
+implementation, but they are not project graph replicas. Agent stores contain
+only operational records and relationships between those records. They contain
+no project, file, symbol, source-fragment, or canonical relationship records,
+and initialization does not open the canonical store.
+
+Legacy private stores are cleaned on idempotent `agent init`: records marked as
+derived from the standard graph and relationships connected to those records
+are removed transactionally. Agent-authored decisions, tasks, plans, findings,
+risks, notes, sessions, and relationships among them are retained.
+
 ## Reader/Writer Locking
 
 `BlockGraphStore` uses a cross-platform reader/writer lock before opening a
@@ -201,6 +214,10 @@ reql --snapshot project status .
 
 Snapshot mode is explicitly read-only and may lag changes still held in the
 writer's in-memory transaction.
+
+CLI and MCP read commands automatically fall back to snapshot mode when a
+writer is active. Snapshot opening compares checkpoint and WAL boundaries
+before and after load and retries if a generation changes mid-read.
 
 ## Transactions
 

@@ -99,15 +99,14 @@ class StorageMaintenanceTests(unittest.TestCase):
             with patch(
                 "memory.storage.maintenance._compile_clean_store",
                 side_effect=StorageError("simulated clean-build failure"),
-            ):
-                with self.assertRaisesRegex(StorageError, "simulated clean-build failure"):
-                    clear_project_storage(
-                        storage,
-                        root,
-                        config=config,
-                        max_file_size_bytes=1024 * 1024,
-                        parsing_options=CompilationOptions.from_config(config),
-                    )
+            ), self.assertRaisesRegex(StorageError, "simulated clean-build failure"):
+                clear_project_storage(
+                    storage,
+                    root,
+                    config=config,
+                    max_file_size_bytes=1024 * 1024,
+                    parsing_options=CompilationOptions.from_config(config),
+                )
 
             self.assertEqual(storage.read_bytes(), b"existing-store")
             self.assertEqual(cache_path.read_text(encoding="utf-8"), '{"existing": true}\n')

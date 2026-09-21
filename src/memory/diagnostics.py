@@ -35,10 +35,9 @@ class PerformanceLogger:
             "command": self.command,
             **_jsonable_fields(fields),
         }
-        with self._lock:
-            with self.path.open("a", encoding="utf-8") as fh:
-                fh.write(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
-                fh.write("\n")
+        with self._lock, self.path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
+            fh.write("\n")
 
     @contextmanager
     def span(self, name: str, *, category: str = "span", **fields: Any) -> Iterator[None]:

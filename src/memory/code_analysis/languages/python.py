@@ -21,6 +21,7 @@ from ..base import (
     _named_children,
     _node_text,
     _owner,
+    _param_name,
     _params,
     _parent,
     _reference,
@@ -135,6 +136,9 @@ class PythonTreeSitterExtractor(TreeSitterExtractorBase):
             param_annotations = _param_annotations(self.source, parameters)
             if param_annotations:
                 symbol.metadata["param_annotations"] = param_annotations
+            param_types = _parameter_types(self.source, parameters)
+            if param_types:
+                symbol.metadata["param_types"] = param_types
             wrapper_target = _python_wrapper_target(self.source, node)
             if wrapper_target:
                 symbol.metadata["semantic_roles"] = ["wrapper"]
@@ -330,7 +334,7 @@ def _python_bases(source: bytes, node: Any) -> list[str]:
     superclasses = _field(node, "superclasses")
     if superclasses is None:
         return []
-    return [_node_text(source, child).strip() for child in _named_children(superclasses) if _node_text(source, child).strip()]
+    return [base for child in _named_children(superclasses) if (base := _node_text(source, child).strip())]
 
 
 def _python_wrapper_target(source: bytes, node: Any) -> str | None:
@@ -445,6 +449,18 @@ def _param_annotations(source: bytes, node: Any | None) -> list[str]:
     for child in _named_children(node):
         annotations.extend(_type_annotations(source, child))
     return annotations
+
+
+def _parameter_types(source: bytes, node: Any | None) -> dict[str, str]:
+    """Return parameter-name to annotation mappings for field resolution."""
+
+    result: dict[str, str] = {}
+    for child in _named_children(node):
+        annotation = _clean_type_text(_node_text(source, _field(child, "type")))
+        name = _param_name(source, child)
+        if name and annotation:
+            result[name] = annotation
+    return result
 
 
 def _type_annotations(source: bytes, node: Any | None) -> list[str]:

@@ -100,20 +100,17 @@ class DeterministicExtractor:
         )
 
     def _extract_topics(self, text: str) -> list[tuple[str, float]]:
-        topics: list[tuple[str, float]] = []
-        for term, score in keyword_scores(text, max_terms=14):
-            if len(term) < 3:
-                continue
-            if " " not in term and score < 0.45:
-                continue
-            topics.append((term, score))
-        return topics[:10]
+        return [
+            (term, score)
+            for term, score in keyword_scores(text, max_terms=14)
+            if len(term) >= 3 and not (" " not in term and score < 0.45)
+        ][:10]
 
     def _extract_entities(self, text: str) -> list[tuple[str, str, float]]:
         entities: list[tuple[str, str, float]] = []
         for entity in extract_capitalized_entities(text):
             key = canonicalize(entity)
-            if not key or key in {"ok"}:
+            if not key or key == "ok":
                 continue
             kind = "technology" if any(ch.isdigit() for ch in entity) or key in {"neo4j", "sqlite", "llm"} else "named_thing"
             score = 0.85 if kind == "technology" else 0.65
