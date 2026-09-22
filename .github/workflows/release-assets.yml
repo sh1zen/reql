@@ -4,6 +4,11 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      release_ref:
+        description: Existing release tag to package (vMAJOR.MINOR.PATCH)
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -11,7 +16,7 @@ permissions:
 jobs:
   build-release-assets:
     name: Build release assets
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     permissions:
       contents: write
@@ -19,7 +24,7 @@ jobs:
     steps:
       - name: Validate release version
         env:
-          RELEASE_REF: ${{ github.event.release.tag_name || github.ref_name }}
+          RELEASE_REF: ${{ github.event.release.tag_name || inputs.release_ref }}
         run: |
           if [[ ! "$RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Release tag must match vMAJOR.MINOR.PATCH, for example v0.0.1. Got '$RELEASE_REF'."
@@ -27,14 +32,14 @@ jobs:
           fi
 
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: sh1zen/reql
-          ref: ${{ github.ref }}
+          ref: ${{ github.event.release.tag_name || inputs.release_ref }}
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.14"
 
@@ -44,6 +49,8 @@ jobs:
           python -m pip install -e .
 
       - name: Generate CHANGELOG.md
+        env:
+          RELEASE_REF: ${{ github.event.release.tag_name || inputs.release_ref }}
         run: |
           python - <<'PY'
           from __future__ import annotations
@@ -62,10 +69,10 @@ jobs:
           event_path = Path(os.environ["GITHUB_EVENT_PATH"])
           event = json.loads(event_path.read_text(encoding="utf-8"))
           release = event.get("release") or {}
-          tag = release.get("tag_name") or os.environ.get("GITHUB_REF_NAME", "")
+          tag = os.environ["RELEASE_REF"]
           title = release.get("name") or tag or "Manual workflow run"
           body = (release.get("body") or "").strip()
-          sha = os.environ.get("GITHUB_SHA", "")
+          sha = git("rev-parse", "HEAD")
 
           try:
               tags = [item for item in git("tag", "--sort=-creatordate").splitlines() if item]
@@ -101,7 +108,9 @@ jobs:
           PY
 
       - name: Run tests
-        run: PYTHONPATH=src python -m unittest discover -s tests -v
+        run: |
+          mkdir -p .tmp
+          PYTHONPATH=src python -m unittest discover -s tests -v
 
       - name: Build Python distributions
         run: |
@@ -119,13 +128,13 @@ jobs:
 
       - name: Upload to GitHub release
         if: github.event_name == 'release'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: reql-release-assets.tar.gz
 
       - name: Upload as workflow artifact
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: reql-release-assets
           path: reql-release-assets.tar.gz

@@ -18,6 +18,23 @@ from .context.models import NodeMatchMetrics, QueryProfile
 
 
 class RetrievalSearchMixin:
+    @staticmethod
+    def _normalized_query_path(query_text: str) -> str:
+        """Normalize a whole-query path without treating free-form prose as a path."""
+        value = str(query_text or "").strip().strip("'\"`").replace("\\", "/")
+        while value.startswith("./"):
+            value = value[2:]
+        return value.casefold()
+
+    @classmethod
+    def _node_matches_exact_query_path(cls, node: MemoryNode, query_text: str) -> bool:
+        """Return whether the complete query names this node's path or filename."""
+        query_path = cls._normalized_query_path(query_text)
+        relative_path = str(node.properties.get("relative_path") or "").strip().replace("\\", "/").casefold()
+        if not query_path or not relative_path:
+            return False
+        return query_path == relative_path or ("/" not in query_path and query_path == relative_path.rsplit("/", 1)[-1])
+
     def _query_profile(self, query_text: str) -> QueryProfile:
         ordered_tokens = tuple(_expanded_tokens(query_text))
         tokens = set(ordered_tokens)

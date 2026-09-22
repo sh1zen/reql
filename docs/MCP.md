@@ -36,6 +36,13 @@ To expose only read-only tools:
 reql-mcp --read-only
 ```
 
+If the console script is not available in the active environment, run the same
+server through the installed package:
+
+```bash
+python -m mcp.server --read-only
+```
+
 To start MCP tools with a project config and process-level overrides:
 
 ```bash

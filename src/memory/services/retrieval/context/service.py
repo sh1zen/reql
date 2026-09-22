@@ -55,8 +55,16 @@ class ContextServiceMixin:
         query_mode = self._normalize_query_context_mode(query_mode)
         scopes = self._normalize_query_context_scopes(query_scopes)
         subgraph = self._filter_query_context_subgraph(subgraph, scopes)
+        document_scope = scopes == {"docs"}
         explicit_code_scope = bool(scopes and scopes <= {"code", "test"})
-        if explicit_code_scope or self._should_render_code_context(subgraph, max_items=max_items):
+        exact_document_path = any(
+            str(item.node.properties.get("context_scope") or "").casefold() == "docs"
+            and self._node_matches_exact_query_path(item.node, subgraph.query.text)
+            for item in subgraph.ranked_nodes
+        )
+        if not document_scope and not exact_document_path and (
+            explicit_code_scope or self._should_render_code_context(subgraph, max_items=max_items)
+        ):
             payload = self._code_agent_context_payload(subgraph, query_mode=query_mode, max_items=max_items)
         else:
             payload = self._general_agent_context_payload(subgraph, query_mode=query_mode, max_items=max_items)
@@ -553,7 +561,13 @@ class ContextServiceMixin:
                 break
             if not include_sources:
                 continue
-            for edge, neighbor in self.store.neighbors(item.node.id, direction="both", edge_types=SOURCE_EDGE_TYPES, limit=20):
+            for edge, neighbor in self.store.neighbors(
+                item.node.id,
+                direction="both",
+                edge_types=SOURCE_EDGE_TYPES,
+                limit=20,
+                clone=False,
+            ):
                 if edge.type in TECHNICAL_EDGE_TYPES or neighbor.type in TECHNICAL_NODE_TYPES:
                     continue
                 if neighbor.type not in SOURCE_NODE_TYPES:

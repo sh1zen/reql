@@ -313,11 +313,11 @@ def uninstall_agent_files(
     root = (project_dir or Path(".")).resolve()
     home = (home_dir or Path.home()).expanduser()
     actions: list[InstallAction] = []
-    command_plan = _command_plan(command_dir)
-
-    for path, _content in command_plan.files:
-        status = _remove_command_file(path, dry_run=dry_run, stop=path.parent.parent)
-        actions.append(InstallAction(platform="shared", scope=scope, kind="command", path=path, status=status))
+    if command_dir is not None:
+        command_plan = _command_plan(command_dir)
+        for path, _content in command_plan.files:
+            status = _remove_command_file(path, dry_run=dry_run, stop=path.parent.parent)
+            actions.append(InstallAction(platform="shared", scope=scope, kind="command", path=path, status=status))
 
     for name in selected:
         for kind, path, _content in _planned_files(name, project=project, project_dir=root, home_dir=home):

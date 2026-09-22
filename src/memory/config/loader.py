@@ -161,14 +161,21 @@ def set_local_config_option(option: str, raw_value: str, *, start_dir: str | Pat
     """Add or replace one validated option in the local project config."""
     target = Path(start_dir or Path.cwd()).expanduser().resolve(strict=False) / PROJECT_CONFIG_FILENAME
     override = parse_config_override_assignment(f"{option}={raw_value}")
-    section, option_name = option.strip().split(".", 1)
+    option_parts = option.strip().split(".")
+    section = option_parts[0]
     value = override[option.strip()]
 
     data = _load_yaml(target) if target.is_file() else {}
     section_data = data.setdefault(section, {})
     if not isinstance(section_data, dict):
         raise ConfigError(f"Configuration section must be a mapping: {section}")
-    section_data[option_name] = value
+    option_data = section_data
+    for part in option_parts[1:-1]:
+        child = option_data.setdefault(part, {})
+        if not isinstance(child, dict):
+            raise ConfigError(f"Configuration option must be a mapping: {'.'.join(option_parts[:-1])}")
+        option_data = child
+    option_data[option_parts[-1]] = value
     try:
         merge_config(default_config(), data)
     except ValueError as exc:

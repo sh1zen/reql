@@ -23,6 +23,7 @@ from ...common import (
     _code_context_query_tokens,
     _expanded_tokens,
 )
+from ..models import QueryProfile
 
 
 class CodeContextProjectionMixin:
@@ -877,10 +878,20 @@ class CodeContextProjectionMixin:
         return list(reads.values())[: min(max_items, 10)]
 
     def _matching_source_fragments_for_query(self, query_text: str, working_paths: set[str], *, max_items: int) -> list[MemoryNode]:
+        query_profile = self._query_profile(query_text)
+        candidates: dict[str, MemoryNode] = {}
+        for path in sorted(working_paths):
+            for node_type in sorted(SOURCE_NODE_TYPES):
+                for node in self.store.find_nodes_by_property(
+                    "relative_path",
+                    path,
+                    type_=node_type,
+                    limit=None,
+                    clone=False,
+                ):
+                    candidates.setdefault(node.id, node)
         matches: list[tuple[float, MemoryNode]] = []
-        for node in self._nodes_for_types(SOURCE_NODE_TYPES):
-            if node.type not in SOURCE_NODE_TYPES:
-                continue
+        for node in sorted(candidates.values(), key=lambda item: (item.created_at, item.id)):
             path = self._node_relative_path(node)
             if not path or path not in working_paths or self._is_generated_context_path(path):
                 continue
@@ -891,9 +902,9 @@ class CodeContextProjectionMixin:
                 continue
             if line_end is not None and line_end - line_start > 80:
                 continue
-            if not self._source_fragment_is_strong_query_match(node, query_text):
+            if not self._source_fragment_is_strong_query_match(node, query_text, query_profile=query_profile):
                 continue
-            metrics = self._node_match_metrics(node, self._query_profile(query_text))
+            metrics = self._node_match_metrics(node, query_profile)
             matches.append((metrics.match_score, node))
         matches.sort(key=lambda item: (item[0], item[1].salience, self._location_summary(item[1]) or ""), reverse=True)
         return [node for _, node in matches[: min(max_items, 5)]]
@@ -925,11 +936,17 @@ class CodeContextProjectionMixin:
                 break
         return self._code_snippet_payload(selected, subgraph, max_items=min(max_items, 2)) if selected else []
 
-    def _source_fragment_is_strong_query_match(self, node: MemoryNode, query_text: str) -> bool:
+    def _source_fragment_is_strong_query_match(
+        self,
+        node: MemoryNode,
+        query_text: str,
+        *,
+        query_profile: QueryProfile | None = None,
+    ) -> bool:
         text = str(node.text or node.label or "")
         if not text:
             return False
-        profile = self._query_profile(query_text)
+        profile = query_profile or self._query_profile(query_text)
         metrics = self._node_match_metrics(node, profile)
         if metrics.match_score >= 0.50:
             return True

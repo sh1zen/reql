@@ -67,10 +67,7 @@ class QueryContextService:
         payload["confidence"] = result.confidence.to_dict()
         rendered = self.retrieval.render_context_payload(payload)
         source = result.source_revision.id if result.source_revision else "unknown"
-        return (
-            f"Graph freshness: {result.freshness.status}; source_revision={source}; "
-            f"snapshot_used={str(result.freshness.snapshot_used).lower()}\n\n{rendered}"
-        )
+        return f"Graph freshness: {result.freshness.status}; source_revision={source}\n\n{rendered}"
 
 
 def _source_revision_and_freshness(subgraph: MemorySubgraph, store: Any) -> tuple[SourceRevision | None, GraphFreshness]:
@@ -84,13 +81,12 @@ def _source_revision_and_freshness(subgraph: MemorySubgraph, store: Any) -> tupl
     source = SourceRevision(latest.id, latest.sequence, latest.tree_hash) if latest else None
     storage_path = getattr(store, "path", None)
     state = read_watch_state(storage_path) if storage_path is not None else {}
-    raw_status = str(state.get("status") or "unknown")
+    raw_status = str(state.get("status") or ("current" if latest is not None else "unknown"))
     status = raw_status if raw_status in {"current", "refreshing", "stale", "unknown"} else "unknown"
-    if status == "current" and latest is not None and state.get("source_revision_id") != latest.id:
+    if status == "current" and state and latest is not None and state.get("source_revision_id") != latest.id:
         status = "stale"
     return source, GraphFreshness(
         status=status,  # type: ignore[arg-type]
-        snapshot_used=bool(getattr(store, "snapshot", False)),
         pending_paths=max(0, int(state.get("pending_paths") or 0)),
         checked_at=str(state.get("checked_at")) if state.get("checked_at") else None,
     )

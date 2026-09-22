@@ -4,6 +4,11 @@ on:
   release:
     types: [published]
   workflow_dispatch:
+    inputs:
+      release_ref:
+        description: Existing release tag to test and publish (vMAJOR.MINOR.PATCH)
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -11,12 +16,12 @@ permissions:
 jobs:
   test:
     name: Test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Validate release version
         env:
-          RELEASE_REF: ${{ github.event.release.tag_name || github.ref_name }}
+          RELEASE_REF: ${{ github.event.release.tag_name || inputs.release_ref }}
         run: |
           if [[ ! "$RELEASE_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "::error::Release tag must match vMAJOR.MINOR.PATCH, for example v0.1.0. Got '$RELEASE_REF'."
@@ -24,10 +29,12 @@ jobs:
           fi
 
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.release_ref }}
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.14"
 
@@ -35,12 +42,14 @@ jobs:
         run: python -m pip install --upgrade pip && python -m pip install -e .
 
       - name: Run tests
-        run: PYTHONPATH=src python -m unittest discover -s tests -v
+        run: |
+          mkdir -p .tmp
+          PYTHONPATH=src python -m unittest discover -s tests -v
 
   publish:
     name: Publish
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: pypi
 
     permissions:
@@ -49,10 +58,12 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.release_ref }}
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.14"
 

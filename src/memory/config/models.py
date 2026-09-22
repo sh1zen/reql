@@ -165,8 +165,15 @@ def merge_config(config: REQLConfig, overrides: Mapping[str, Any]) -> REQLConfig
         if value is None:
             continue
         if "." in key:
-            section, option = key.split(".", 1)
-            nested.setdefault(section, {})[option] = value
+            section, option_path = key.split(".", 1)
+            target = nested.setdefault(section, {})
+            option_parts = option_path.split(".")
+            for part in option_parts[:-1]:
+                child = target.setdefault(part, {})
+                if not isinstance(child, dict):
+                    raise ValueError(f"Config override conflicts with a scalar option: {key}")
+                target = child
+            target[option_parts[-1]] = value
         elif isinstance(value, Mapping):
             nested.setdefault(key, {}).update(dict(value))
         else:

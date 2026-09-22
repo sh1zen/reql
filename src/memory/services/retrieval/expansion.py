@@ -74,6 +74,7 @@ class GraphExpansionMixin:
                 edge_types=edge_types,
                 min_weight=0.01,
                 limit=120,
+                clone=False,
             )
             for edge, neighbor in neighbors:
                 if edge.type in TECHNICAL_EDGE_TYPES:

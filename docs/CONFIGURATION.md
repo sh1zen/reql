@@ -24,6 +24,7 @@ Add or update one validated option in the local `./reql.conf`:
 ```bash
 reql config set retention.agent_sessions 30
 reql config set scan.use_gitignore false
+reql config set compile.documents.markdown true
 ```
 
 Values accept plain text, numbers, booleans, or JSON lists and objects. The

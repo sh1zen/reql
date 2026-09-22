@@ -350,8 +350,8 @@ def _format_locked_message(target_path: Path, diagnostic: dict[str, Any]) -> str
         f"duration={float(diagnostic.get('duration_seconds', 0.0)):.3f}s; "
         f"process_alive={alive_text}; watcher={str(bool(diagnostic.get('watcher'))).lower()}; "
         f"stale={str(bool(diagnostic.get('stale'))).lower()}. "
-        "Read commands automatically fall back to the latest complete snapshot; "
-        "inspect or recover locks with `reql storage locks --recover-stale`."
+        "Wait for the active command to finish, or inspect and recover stale locks with "
+        "`reql storage locks --recover-stale`."
     )
 
 
@@ -385,17 +385,12 @@ def inspect_store_locks(target_path: str | Path, *, recover_stale: bool = False)
     readers = [item for path in sorted(readers_path.glob("*.lock")) if (item := inspect_path(path, "read")) is not None]
     with suppress(OSError):
         readers_path.rmdir()
-    snapshot_available = target.exists() and target.is_file() and target.stat().st_size > 0
     return {
         "path": str(target),
         "locked": writer is not None or bool(readers),
         "writer": writer,
         "readers": readers,
         "recovered": recovered,
-        "snapshot_available": snapshot_available,
-        "snapshot_hint": "Read commands automatically use the latest complete snapshot when a writer is active."
-        if snapshot_available
-        else None,
     }
 
 
@@ -964,7 +959,6 @@ class BlockGraphStore:
         dense_node_threshold: int = DEFAULT_DENSE_NODE_THRESHOLD,
         page_cache_blocks: int = DEFAULT_PAGE_CACHE_BLOCKS,
         read_only: bool = False,
-        snapshot: bool = False,
         defer_lexical_index: bool = False,
         lock_timeout_seconds: float = DEFAULT_LOCK_TIMEOUT_SECONDS,
     ) -> None:
@@ -976,10 +970,7 @@ class BlockGraphStore:
         self.block_size = block_size
         self.dense_node_threshold = dense_node_threshold
         self.read_only = read_only
-        self.snapshot = bool(snapshot)
         self.defer_lexical_index = bool(defer_lexical_index)
-        if self.snapshot and not self.read_only:
-            raise ValueError("snapshot mode requires read_only=True")
         self._page_cache = _PageCache(page_cache_blocks)
         self._transaction_depth = 0
         self._transaction_journals: list[_TransactionJournal] = []
@@ -1030,11 +1021,10 @@ class BlockGraphStore:
         if create and not self.read_only:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = _StoreReadWriteLock(self.path, timeout_seconds=lock_timeout_seconds)
-        if not self.snapshot:
-            if self.read_only:
-                self._lock.acquire_read()
-            else:
-                self._lock.acquire_write()
+        if self.read_only:
+            self._lock.acquire_read()
+        else:
+            self._lock.acquire_write()
         try:
             if self.path.exists() and self.path.stat().st_size > 0:
                 self._load()
@@ -2621,12 +2611,12 @@ class BlockGraphStore:
         node = self._load_node_from_location(node_id) if node_id not in self._nodes else self._nodes.get(node_id)
         return self._clone_node(node) if node and clone else node
 
-    def get_nodes(self, node_ids: Sequence[str]) -> list[MemoryNode]:
+    def get_nodes(self, node_ids: Sequence[str], *, clone: bool = True) -> list[MemoryNode]:
         out: list[MemoryNode] = []
         for node_id in node_ids:
             node = self._load_node_from_location(node_id) if node_id not in self._nodes else self._nodes.get(node_id)
             if node:
-                out.append(self._clone_node(node))
+                out.append(self._clone_node(node) if clone else node)
         return out
 
     def get_node_by_key(self, type_: str, canonical_key: str) -> MemoryNode | None:
@@ -2917,12 +2907,31 @@ class BlockGraphStore:
         edge_types: set[str] | None = None,
         min_weight: float = 0.0,
         limit: int = 500,
+        clone: bool = True,
     ) -> list[tuple[MemoryEdge, MemoryNode]]:
         results: list[tuple[MemoryEdge, MemoryNode]] = []
         if direction in {"out", "both"}:
-            results.extend(self._neighbors_one(node_id, outgoing=True, edge_types=edge_types, min_weight=min_weight, limit=limit))
+            results.extend(
+                self._neighbors_one(
+                    node_id,
+                    outgoing=True,
+                    edge_types=edge_types,
+                    min_weight=min_weight,
+                    limit=limit,
+                    clone=clone,
+                )
+            )
         if direction in {"in", "both"}:
-            results.extend(self._neighbors_one(node_id, outgoing=False, edge_types=edge_types, min_weight=min_weight, limit=limit))
+            results.extend(
+                self._neighbors_one(
+                    node_id,
+                    outgoing=False,
+                    edge_types=edge_types,
+                    min_weight=min_weight,
+                    limit=limit,
+                    clone=clone,
+                )
+            )
         seen: set[str] = set()
         deduped: list[tuple[MemoryEdge, MemoryNode]] = []
         for edge, node in results:
@@ -2940,6 +2949,7 @@ class BlockGraphStore:
         edge_types: set[str] | None,
         min_weight: float,
         limit: int,
+        clone: bool,
     ) -> list[tuple[MemoryEdge, MemoryNode]]:
         edge_ids = self._out_edges.get(node_id, set()) if outgoing else self._in_edges.get(node_id, set())
         candidates: list[MemoryEdge] = []
@@ -2956,7 +2966,7 @@ class BlockGraphStore:
             other_id = edge.to_id if outgoing else edge.from_id
             node = self._load_node_from_location(other_id)
             if node:
-                results.append((self._clone_edge(edge), self._clone_node(node)))
+                results.append((self._clone_edge(edge), self._clone_node(node)) if clone else (edge, node))
         return results
 
     def bounded_neighborhood(

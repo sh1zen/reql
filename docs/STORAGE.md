@@ -205,14 +205,8 @@ exclusive file lock so concurrent readers do not interleave usage writes.
 payload; it raises `StorageError` instead of returning an empty graph for a
 missing or empty storage path.
 
-When a writer intentionally stays active, read commands automatically fall
-back to the latest complete on-disk generation plus complete WAL frames. This
-read-only snapshot may lag changes still held in the writer's in-memory
-transaction.
-
-CLI and MCP read commands automatically fall back to snapshot mode when a
-writer is active. Snapshot opening compares checkpoint and WAL boundaries
-before and after load and retries if a generation changes mid-read.
+When a writer is active, read commands respect its lock and either wait or
+raise `StorageError` according to their configured lock timeout.
 
 ## Transactions
 

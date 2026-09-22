@@ -21,7 +21,9 @@ and options, the same relevant node types, edge types, properties, provenance,
 confidence values, cache records, and `GraphDelta` shape are emitted. Runtime
 improvements come from parallel content hashing, lower-cost storage transactions, batched upserts, cache
 planning maps, set-backed delta aggregation, scoped context-scope metadata
-refresh, and scoped document-code linking.
+refresh, scoped document-code linking, borrowed read-only node batches, and an
+indexed retention fast path that avoids materializing the graph while the
+project remains within its commit window.
 
 Document classification recognizes `readme.txt`, changelog and FAQ files,
 WordPress Plugin Directory readme structure, and extensionless files with
@@ -165,6 +167,9 @@ runs do not trigger cleanup; shared stores retain data and mixed usage-event
 entries owned by other projects. The runs and deltas associated with retained
 commits are protected. A graph deletion triggers one compact rewrite so
 tombstones and old pages do not remain as wasted disk space.
+Retention first reads at most `retention.commits + 1` revisions through the
+project index. Project nodes and edges are loaded only when that bounded check
+shows that pruning is actually required.
 
 Supported code artifacts produce deterministic technical nodes such as
 `Module`, `Package`, `Class`, `Interface`, `Function`, `Method`, meaningful

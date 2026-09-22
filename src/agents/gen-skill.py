@@ -31,15 +31,15 @@ class SkillResource:
 
 PROJECT_SKILL_SOURCE = SkillSource(
     name="reql-agent",
-    title="REQL Project",
+    title="REQL Coding Workflow",
     description=(
-        "Use when {platform_name} needs bounded REQL repository context for coding work or durable "
-        "Agent Workspace planning for a multi-step task. Guides graph-first discovery, targeted edits, "
-        "verification, and final graph refresh without requiring LLM calls."
+        "Use when {platform_name} is working in a REQL-indexed repository and needs bounded code context, "
+        "dependency evidence, or durable task recovery. Guides focused retrieval, source verification, "
+        "optional Agent Workspace use, and graph refresh."
     ),
     summary=(
-        "Begin repository reasoning from the local deterministic graph, keep its returned working set in focus, "
-        "and load detailed guidance only when its trigger occurs."
+        "Use REQL to narrow repository discovery, not to replace source inspection. Retrieve enough graph evidence "
+        "to identify the likely owner and impact, then verify the current code and tests before changing anything."
     ),
     command_examples=(
         CommandExample("project status", "check whether this project has a compiled REQL graph"),
@@ -51,56 +51,63 @@ PROJECT_SKILL_SOURCE = SkillSource(
     ),
     workflow_steps=(
         (
-            "Run `{command_name} project status`; if the graph is missing or stale, stop and use the matching route below."
+            "Follow the repository's own instructions, then run `{command_name} project status`. If the command is unavailable "
+            "or the graph is missing, use `references/bootstrap.md`; do not compile a healthy graph just to begin a task."
         ),
         (
-            "For nontrivial, resumed, or coordinated work, run `{command_name} agent dashboard` before repository discovery. "
-            "On resumption, use the public Context and the relevant private dashboard to recover prior work before querying "
-            "only the relevant canonical code facts."
+            "For multi-step, resumed, or coordinated work, run `{command_name} agent dashboard`. If it reports that Agent Workspace "
+            "is uninitialized, run `{command_name} agent init --name \"<task>\"` and retry the dashboard. Skip Agent Workspace for a small, self-contained task."
         ),
         (
-            "On an active graph, run `{command_name} query_context --query \"<user terms>\"` with `--code`, `--docs`, or `--test` only when needed."
+            "If a path is already known, use `{command_name} locate \"<path>\"`; otherwise run `{command_name} query_context --query \"<short literal terms>\"`. "
+            "Add `--code` for implementation work and other scope flags only when they improve the result."
         ),
         (
-            "Treat returned files, owners, line ranges, and tests as the working set. On `Confidence: insufficient`, "
-            "refine the query or inspect related graph evidence before opening only the unresolved locations."
+            "Use returned owners, paths, spans, relationships, and tests as a bounded discovery set. Inspect the relevant source, callers, contracts, and tests; "
+            "the current files are authoritative when graph evidence is incomplete or stale."
         ),
         (
-            "Edit the existing owner, preserve public contracts, and run the repository's documented tests."
+            "If context is insufficient, make one narrower graph query or use a targeted exact-name/path search for the unresolved gap. "
+            "Do not loop on broad queries or treat REQL confidence as proof of correctness."
         ),
         (
-            "After changing files, run `{command_name} project watch-status --json`; if it reports `running`, wait for the watcher to refresh the graph, otherwise run `{command_name} project compile` before the final response."
+            "Edit the authoritative owner, update affected consumers and tests together, and run the repository's documented checks."
         ),
         (
-            "Before ending any initialized Agent Workspace pass, run `{command_name} agent finish \"<compact outcome>\"` so other sessions stop treating this agent as active."
+            "After changing tracked project files, run `{command_name} project watch-status --json`; let a running watcher refresh the graph, otherwise run one "
+            "`{command_name} project compile`. Skip refresh for read-only work."
+        ),
+        (
+            "If this pass initialized Agent Workspace, close it with `{command_name} agent finish \"<outcome and validation>\"`."
         ),
     ),
     rule_points=(
         (
-            "Prefer `{command_name}`; fall back to `{command_path}`, then `{fallback_command}`. Start with `project status`; "
-            "bootstrap with `project compile` only when the project is missing."
+            "Prefer `{command_name}`; fall back to `{command_path}`, then `{fallback_command}`. Start with `project status` and bootstrap "
+            "with `project compile` only when the graph is missing or unusable."
         ),
         (
-            "Query the active graph with terms from the user's request and let its paths, owners, spans, and associated tests define the "
-            "working set. Deepen or refine graph queries when evidence is missing; inspect source only at the remaining exact locations."
+            "If a path is known, use `{command_name} locate \"<path>\"`; otherwise start with `{command_name} query_context --query \"<short literal terms>\"`. "
+            "Let graph paths, owners, spans, relationships, and associated tests bound discovery, then inspect the current source and contracts needed to make the change safely."
         ),
         (
-            "Only after the current task changes project files, run documented tests, then let an existing watcher refresh the graph or "
-            "run one `project compile`. Skip both `watch-status` and compile for read-only tasks. Do not start watch mode unless "
-            "continuous monitoring was requested."
+            "When graph context is insufficient, refine once or use a targeted exact-name/path search. Source is authoritative; REQL evidence "
+            "narrows work but does not replace code review, tests, or repository instructions."
         ),
         (
-            "In the final response, report versioned files, updated symbols, associated tests, and test results. Keep any required personal "
-            "`config.json` action separate and never edit that file unless requested."
+            "Use Agent Workspace only for multi-step, resumed, or coordinated work. If `agent dashboard` is uninitialized, run `agent init --name \"<task>\"`; "
+            "finish only a pass that initialized or resumed an Agent Workspace session."
         ),
         (
-            "For nontrivial, resumed, or coordinated work, use `agent dashboard` as the compact entry point before repository discovery. "
-            "On resumption, use public Context and the relevant private dashboard to recover the latest completed work before querying "
-            "canonical code facts. Persist durable pipeline state through agent tasks and notes, and keep canonical project facts in the standard graph."
+            "After changed project files pass their documented checks, run `{command_name} project watch-status --json`; let a running watcher refresh the graph or run one "
+            "`{command_name} project compile`. Skip refresh for read-only work and do not start watch mode unless continuous monitoring was requested."
         ),
-        "Load only the generated `references/` file relevant to the current special case; do not preload or restate all references.",
+        (
+            "In the final response, report changed files, behavior, and checks actually run. Keep personal configuration actions separate and "
+            "never edit them unless requested."
+        ),
     ),
-    deterministic_requirement="Keep REQL optional and deterministic; document processing runs in the local compiler, and Agent Workspace operations stay local and separate from the standard REQL graph.",
+    deterministic_requirement="Keep REQL deterministic and local; the project graph stores repository facts, while Agent Workspace stores only operational task state.",
 )
 
 def skill_markdowns(
@@ -170,7 +177,7 @@ name: {source.name}
 description: {source.description.format(platform_name=platform_name)}
 ---
 
-# REQL Fast Path
+# REQL Coding Workflow
 
 {source.summary}
 
@@ -182,9 +189,9 @@ description: {source.description.format(platform_name=platform_name)}
 
 ## Rules
 
-- Load exactly one relevant reference; do not preload or restate the others.
-- Treat graph locations as evidence and follow repository instructions.
-- Keep REQL deterministic and usable without mandatory LLM calls.
+- Load a routed reference only when its trigger occurs. Load another only if the task later reaches that separate case; never preload all references.
+- Treat graph output as discovery evidence, current source as authoritative, and repository instructions as controlling.
+- Stop querying once the owner, impact, edit locations, and test targets are clear.
 """
 
 
@@ -210,9 +217,10 @@ def _project_skill_resources(
     fallback_command: str,
 ) -> tuple[SkillResource, ...]:
     usage = _command_usage(command_name=command_name, command_path=command_path, fallback_command=fallback_command)
-    openai_yaml = """display_name: REQL Project
-short_description: Use REQL graph context and agent memory.
-default_prompt: Use REQL to inspect this project, use agent dashboard for compact intra/inter-session coordination on nontrivial or resumed work, compile only to bootstrap a missing graph or after the current task changes project files, keep discovery within the graph-defined working set, persist durable pipeline state when useful, and run agent finish at the end of the work pass.
+    openai_yaml = """interface:
+  display_name: "REQL Coding Workflow"
+  short_description: "Narrow coding work with REQL graph evidence."
+  default_prompt: "Use $reql-agent to narrow repository discovery, verify the current source and tests before editing, use Agent Workspace only for multi-step or resumed work, and refresh the graph once after changed project files."
 """
     bootstrap = f"""# REQL reference: bootstrap and project state
 
@@ -244,9 +252,9 @@ The one-shot bootstrap is allowed without asking again because the installed wor
 
 ## Graph-defined working set
 
-Use REQL results to establish the working set: candidate files, symbols, owners, source fragments, line ranges, and associated tests. When the first result is incomplete, refine the terms or follow the graph with `query_explore`, `query_graph`, `query_memories`, or `inspect`.
+Use REQL results to establish a bounded discovery set: candidate files, symbols, owners, source fragments, line ranges, relationships, and associated tests. When the first result is incomplete, make one narrower query or follow a specific graph edge with `query_explore`, `query_graph`, `query_memories`, or `inspect`.
 
-Once the graph identifies specific paths or spans, inspect only those locations and the nearby callers needed for edits, debugging, or tests. Stop discovery as soon as the owner file, edit location, contracts, and test targets are supported by evidence.
+Once the graph identifies specific paths or spans, inspect the current source plus the callers, contracts, and tests needed to verify the change. Use targeted exact-name or path searches when checking references the graph may not model, such as dynamic registrations. Stop discovery as soon as the owner, impact, edit locations, and test targets are clear.
 
 ## Exclusions
 
@@ -345,15 +353,15 @@ Prefer `owners` to find implementation homes, `callers` for impact, `public_surf
 
 ## Answering rules
 
-Use graph output as evidence, not as permission to invent missing links. Cite node ids, source files, source fragments, or REQL rows when making factual claims. If the graph lacks enough evidence, say what is missing and read the specific files identified by REQL or by the user's exact target.
+Use graph output as evidence, not as permission to invent missing links. Cite node ids, source files, source fragments, or REQL rows when making factual claims. The checked-out source is authoritative: inspect it before edits and whenever the graph is stale, ambiguous, or incomplete.
 
-Let graph queries establish and refine the working set, while still running targeted tests and inspecting exact files before editing code.
+Let graph queries establish a bounded discovery set, while still reading enough implementation, callers, contracts, and tests to understand the behavior being changed.
 
 ## Graph-led source inspection
 
-Start with `query_context`, `query_explore`, `query_memories`, `query_graph`, `inspect`, or bounded raw REQL statements. Continue within the graph when it can answer the next discovery question or identify the next exact source location.
+Start with `locate` for a known path or `query_context` for task terms. Use `query_explore`, `query_graph`, `query_memories`, `inspect`, or bounded raw REQL only when the first result leaves a specific relationship or location unresolved.
 
-After REQL returns candidate paths, symbols, owners, source fragments, or line ranges, inspect those exact locations for verification and implementation. If `query_context` reports `Confidence: insufficient`, refine the user's terms, select a narrower graph view, or inspect the most relevant node; use direct source lookup only for a specific gap the graph leaves unresolved.
+After REQL returns candidate paths, symbols, owners, source fragments, or line ranges, inspect the current files for verification and implementation. If context is insufficient, make one narrower graph query or use a targeted exact-name/path search. Broad repository scans remain a last resort, but direct source inspection is part of the normal coding workflow.
 
 ## Code-Scoped Workflow
 
@@ -361,14 +369,14 @@ When the task asks for an implementation, bug fix, refactor, or behavior change:
 
 1. Build a query from the user request's own feature, behavior, file, command, error, field, endpoint, API, or symbol terms; then run `{command_name} query_context --query "<terms from user request>" --code`.
 2. For exact identifiers, legacy names, or one-off removals, try the plain shortest form first, for example `{command_name} query_context --query "graphify"`.
-3. For a clear one-file or exact-symbol edit, stop after the first sufficient bounded result or targeted file read; skip Agent Workspace, reference docs, and extra graph views unless ambiguity appears.
-4. Use rendered files, symbols, line ranges, and structured fields such as `owner_candidates`, `read_plan`, `change_chain`, `contracts`, `impact`, `targeted_reads`, and `test_targets` to choose the smallest files and spans to inspect.
-5. When more source is required, read only the missing spans. Do not read entire files unless the line ranges are missing, ambiguous, stale, or tests/debugging require more context.
+3. For a clear one-file or exact-symbol edit, stop after the first sufficient result or targeted read; skip Agent Workspace and extra graph views unless ambiguity appears.
+4. Use rendered files, symbols, line ranges, and structured fields such as `owner_candidates`, `read_plan`, `change_chain`, `contracts`, `impact`, `targeted_reads`, and `test_targets` to choose the initial files and spans.
+5. Read enough surrounding implementation to understand invariants and evaluation order. Read a full file when its size or structure makes that safer than stitching together isolated spans.
 6. Run `{command_name} query_explore --query "<terms from user request>" --view owners --view code` when the context is noisy or you need owners and code slices before choosing files.
 7. If the context still lacks enough code, retrieve exact locations with `{command_name} inspect --node-id NODE_ID --json` or `{command_name} query "RETRIEVE '<terms from user request>' LIMIT 8 RETURN id,type,text,score,relative_path,line_start,line_end"`.
-8. Read only the files and line ranges identified by rendered context, linked `SourceFragment` evidence, or raw REQL rows.
-9. Modify existing owner symbols first. Do not add wrappers, override layers, new parallel services, or duplicate configuration until REQL shows that no suitable owner exists.
-10. If the context is too broad or irrelevant, refine the query with concrete nouns from the request and rerun `query_context`, `query_explore`, or `query_graph` until it yields a bounded working set or exposes a specific evidence gap.
+8. Confirm references with a targeted exact-name/path search when dynamic use, public exports, generated code, or framework registration may not be represented in the graph.
+9. Modify the existing authoritative owner when one exists; preserve contracts and update affected consumers and tests together.
+10. If context remains broad or irrelevant after one refinement, state the evidence gap and continue with targeted source inspection instead of repeatedly querying.
 
 ## Unused-Code Cleanup
 
@@ -513,6 +521,10 @@ reql-mcp --read-only
 reql-mcp --config reql.conf --set project.id=agent-a --read-only
 ```
 
+If the `reql-mcp` console script is unavailable but the REQL Python package is
+installed, use `python -m mcp.server --read-only` (and pass the same `--config`
+or `--set` options when needed).
+
 Use read-only mode for context retrieval. Use write tools such as compile/watch/hubs only with the same approval discipline as the CLI commands.
 """
     document_semantics = f"""# REQL reference: document structure
@@ -574,6 +586,8 @@ Load this when using `{command_name} agent` for durable task planning and coordi
 ## Dashboard model
 
 The public dashboard at `.reql/agent-dashboard.reql` is the shared coordination layer. It contains agents, active-task summaries, public context, and drill commands. Each agent has a private dashboard under `.reql/agents/` containing its complete tasks, private notes, external notes, and sessions. The canonical project graph remains the only source of repository facts.
+
+Use Agent Workspace only when durable planning or recovery is useful. For a small self-contained task, skip it. On a resumed pass, try `agent dashboard` first; if it reports that the workspace is uninitialized, initialize a named session and retry. Do not call `agent finish` unless this pass initialized or resumed a session.
 
 ## Workflow
 

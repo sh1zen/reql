@@ -44,13 +44,13 @@ def prune_project_data(
 
     if retention_commits < 1:
         raise ValueError("retention_commits must be greater than zero")
-    nodes = store.all_nodes()
     revisions = sorted(
-        (
-            node
-            for node in nodes
-            if node.type == "ProjectRevision"
-            and str(node.properties.get("project_id") or "") == project_id
+        store.find_nodes_by_property(
+            "project_id",
+            project_id,
+            type_="ProjectRevision",
+            limit=retention_commits + 1,
+            clone=False,
         ),
         key=_revision_order,
         reverse=True,
@@ -62,6 +62,15 @@ def prune_project_data(
     if len(revisions) <= retention_commits:
         return result
 
+    nodes = store.find_nodes_by_property(
+        "project_id",
+        project_id,
+        limit=None,
+        clone=False,
+    )
+    project_node = store.get_node(project_id, clone=False)
+    if project_node is not None:
+        nodes.append(project_node)
     project_node_ids = {
         node.id
         for node in nodes
@@ -74,10 +83,28 @@ def prune_project_data(
         if _expired_project_node(node, project_id, cutoff_dt, protected_history)
     }
 
-    edges = store.all_edges()
+    edges_by_id = {
+        edge.id: edge
+        for edge in store.incident_edges(
+            sorted(project_node_ids),
+            limit=None,
+            clone=False,
+        )
+    }
+    edges_by_id.update(
+        {
+            edge.id: edge
+            for edge in store.find_edges_by_property(
+                "project_id",
+                project_id,
+                limit=2**63 - 1,
+                clone=False,
+            )
+        }
+    )
     removal_edge_ids = {
         edge.id
-        for edge in edges
+        for edge in edges_by_id.values()
         if edge.from_id in removal_ids
         or edge.to_id in removal_ids
         or _expired_project_edge(edge, project_id, project_node_ids, cutoff_dt)

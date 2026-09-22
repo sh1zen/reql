@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -541,7 +542,7 @@ class AgentWorkspace:
         cls, standard_storage: str | Path, query: str, *, limit: int = 20, config: REQLConfig | None = None
     ) -> dict[str, Any]:
         """Search public history and every registered private dashboard."""
-        needle = query.strip().casefold()
+        needle = query.strip()
         if not needle:
             raise ValueError("Dashboard search query must not be empty")
         reader = cls(standard_storage, agent_id=DEFAULT_AGENT_ID, config=config)
@@ -549,7 +550,7 @@ class AgentWorkspace:
         results: list[dict[str, Any]] = []
         for entry in [*dashboard["context"], *dashboard["active_tasks"]]:
             context = str(entry.get("content") or "")
-            if needle in context.casefold():
+            if cls._dashboard_search_matches(context, needle):
                 results.append({"timestamp": entry.get("timestamp") or entry.get("updated_at"), "agent_id": entry.get("agent_id"), "context": context, "scope": "public"})
         for identity in dashboard["agents"]:
             agent_id = str(identity["agent_id"])
@@ -562,7 +563,7 @@ class AgentWorkspace:
                     if node.id == WORKSPACE_NODE_ID:
                         continue
                     content = str(node.properties.get("content") or node.text or "")
-                    if needle in content.casefold():
+                    if cls._dashboard_search_matches(content, needle):
                         results.append({
                             "timestamp": node.updated_at or node.created_at,
                             "agent_id": agent_id,
@@ -574,6 +575,20 @@ class AgentWorkspace:
                 graph.close()
         results.sort(key=lambda item: str(item.get("timestamp") or ""), reverse=True)
         return {"query": query, "results": results[:limit]}
+
+    @staticmethod
+    def _dashboard_search_matches(content: str, query: str) -> bool:
+        """Match a literal phrase or all normalized query terms in dashboard text."""
+
+        normalized_content = content.casefold()
+        normalized_query = query.casefold()
+        if normalized_query in normalized_content:
+            return True
+        query_terms = re.findall(r"\w+", normalized_query)
+        if not query_terms:
+            return False
+        content_terms = set(re.findall(r"\w+", normalized_content))
+        return all(term in content_terms for term in query_terms)
 
     def dashboard(
         self,
@@ -889,7 +904,7 @@ class AgentWorkspace:
     def _registered_agent_ids(cls, dashboard_storage: Path) -> list[str]:
         if not dashboard_storage.exists() or dashboard_storage.stat().st_size == 0:
             return []
-        graph = MemoryGraph.open(dashboard_storage, read_only=True, snapshot=True)
+        graph = MemoryGraph.open(dashboard_storage, read_only=True)
         try:
             return sorted(
                 {

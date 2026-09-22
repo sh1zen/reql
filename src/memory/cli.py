@@ -79,7 +79,6 @@ class CommandSpec:
 
     path: tuple[str, ...]
     access: AccessMode | Callable[[argparse.Namespace], AccessMode]
-    snapshot: bool
     help: str
     configure_parser: Callable[[argparse.ArgumentParser], None]
     handler: Callable[[CommandContext], int]
@@ -87,8 +86,6 @@ class CommandSpec:
     def __post_init__(self) -> None:
         if not self.path or any(not part for part in self.path):
             raise ValueError("CommandSpec.path must contain non-empty command names")
-        if self.snapshot and isinstance(self.access, AccessMode) and self.access is not AccessMode.READ_ONLY:
-            raise ValueError("Only read-only commands may support snapshots")
 
     def access_mode(self, args: argparse.Namespace) -> AccessMode:
         return self.access if isinstance(self.access, AccessMode) else self.access(args)
@@ -444,9 +441,6 @@ def _print_storage_locks(payload: dict[str, Any]) -> None:
         )
     for item in payload.get("recovered") or []:
         print(f"Recovered stale {item['mode']} lock: {item['lock_path']}")
-    print(f"Snapshot available: {payload.get('snapshot_available', False)}")
-    if payload.get("snapshot_hint"):
-        print(f"Snapshot command: {payload['snapshot_hint']}")
 
 
 def _project_watch_status(storage_path: str | Path, project_path: str | Path) -> dict[str, Any]:
@@ -539,8 +533,9 @@ def _print_agent_status(payload: dict[str, Any]) -> None:
 
 
 def _print_agent_node(payload: dict[str, Any]) -> None:
-    node = payload.get("node") or payload.get("task") or payload
-    print(f"{node['id']}\t{node['type']}\t{node.get('status') or ''}\t{node.get('title') or node.get('content') or ''}")
+    node = payload.get("node") or payload.get("task") or payload.get("context") or payload
+    node_type = node.get("type") or node.get("message_type") or ""
+    print(f"{node['id']}\t{node_type}\t{node.get('status') or ''}\t{node.get('title') or node.get('content') or ''}")
 
 
 def _print_agent_dashboard(payload: dict[str, Any]) -> None:
@@ -564,7 +559,15 @@ def _print_agent_dashboard(payload: dict[str, Any]) -> None:
         for section, label in (("tasks", "Tasks"), ("private_notes", "Private Notes"), ("external_notes", "External Notes")):
             print(f"{label}:")
             for item in private.get(section) or []:
-                print(f"  {item.get('updated_at')}\t{item.get('title') or item.get('content')}")
+                if section == "tasks":
+                    completion = item.get("completion_message")
+                    suffix = f"\t{completion}" if completion else ""
+                    print(
+                        f"  {item.get('updated_at')}\t{item.get('id')}\t{item.get('status')}\t"
+                        f"{item.get('title') or item.get('content')}{suffix}"
+                    )
+                else:
+                    print(f"  {item.get('updated_at')}\t{item.get('title') or item.get('content')}")
 
 
 def _configure_project_explain_parser(parser: argparse.ArgumentParser) -> None:
@@ -1136,8 +1139,6 @@ def _open(args: argparse.Namespace, config: REQLConfig, profile_logger: Performa
                 with profile_logger.span("storage.open", path=str(args.storage), read_only=True):
                     return MemoryGraph.open(Path(args.storage), config=config, profile_logger=profile_logger, read_only=True, lock_timeout_seconds=0.05)
             except StorageError as exc:
-                if "locked" in str(exc).casefold():
-                    return MemoryGraph.open(Path(args.storage), config=config, profile_logger=profile_logger, read_only=True, snapshot=True)
                 if "missing REQL storage" not in str(exc):
                     raise
                 profile_logger.event("storage.open.read_only_unavailable", category="lifecycle", reason=str(exc))
@@ -1148,8 +1149,6 @@ def _open(args: argparse.Namespace, config: REQLConfig, profile_logger: Performa
         try:
             return MemoryGraph.open(Path(args.storage), config=config, read_only=True, lock_timeout_seconds=0.05)
         except StorageError as exc:
-            if "locked" in str(exc).casefold():
-                return MemoryGraph.open(Path(args.storage), config=config, read_only=True, snapshot=True)
             if "missing REQL storage" not in str(exc):
                 raise
             graph = MemoryGraph.open(Path(args.storage), config=config)
@@ -1378,7 +1377,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec(
         path=("project", "compile"),
         access=AccessMode.MUTATING,
-        snapshot=False,
         help="Scan and incrementally compile dirty artifacts",
         configure_parser=_configure_project_compile_parser,
         handler=_handle_project_compile,
@@ -1386,7 +1384,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec(
         path=("project", "status"),
         access=AccessMode.READ_ONLY,
-        snapshot=True,
         help="Show registered project artifact status",
         configure_parser=_configure_project_status_parser,
         handler=_handle_project_status,
@@ -1394,7 +1391,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec(
         path=("project", "explain"),
         access=AccessMode.READ_ONLY,
-        snapshot=True,
         help="Explain repository capabilities, architecture, workflows, and change starting points",
         configure_parser=_configure_project_explain_parser,
         handler=_handle_project_explain,
@@ -1402,7 +1398,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec(
         path=("project", "pipeline"),
         access=AccessMode.MUTATING,
-        snapshot=False,
         help="Export all detected project flows as Mermaid or interactive HTML",
         configure_parser=_configure_project_pipeline_parser,
         handler=_handle_project_pipeline,
@@ -1410,7 +1405,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec(
         path=("project", "history"),
         access=AccessMode.READ_ONLY,
-        snapshot=True,
         help="Show newest-first content-addressed project revisions",
         configure_parser=_configure_project_history_parser,
         handler=_handle_project_history,
@@ -1418,7 +1412,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec(
         path=("project", "diff"),
         access=AccessMode.READ_ONLY,
-        snapshot=True,
         help="Show file changes in a revision; defaults to the latest revision",
         configure_parser=_configure_project_diff_parser,
         handler=_handle_project_diff,
@@ -1426,7 +1419,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec(
         path=("project", "report"),
         access=AccessMode.MUTATING,
-        snapshot=False,
         help="Write project Markdown reports",
         configure_parser=_configure_project_report_parser,
         handler=_handle_project_report,
@@ -1434,7 +1426,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec(
         path=("cache", "status"),
         access=AccessMode.MUTATING,
-        snapshot=False,
         help="Show incremental cache status for a project path",
         configure_parser=_configure_cache_status_parser,
         handler=_handle_cache_status,
@@ -1442,7 +1433,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec(
         path=("cache", "clear"),
         access=AccessMode.MUTATING,
-        snapshot=False,
         help="Archive cache metadata for a project path",
         configure_parser=_configure_cache_clear_parser,
         handler=_handle_cache_clear,
@@ -1450,7 +1440,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec(
         path=("query_context",),
         access=AccessMode.READ_ONLY,
-        snapshot=True,
         help="Compose a deterministic context block for a query",
         configure_parser=_add_query_context_arguments,
         handler=_handle_query_context,
@@ -1458,7 +1447,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec(
         path=("query_explore",),
         access=AccessMode.READ_ONLY,
-        snapshot=True,
         help="Explore owners, callers, public surface, serialization paths, docs, and code",
         configure_parser=_add_query_explore_arguments,
         handler=_handle_query_explore,
@@ -1466,7 +1454,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec(
         path=("query_graph",),
         access=AccessMode.READ_ONLY,
-        snapshot=True,
         help="Retrieve a structured query-centered subgraph",
         configure_parser=_add_query_graph_arguments,
         handler=_handle_query_graph,
@@ -1474,7 +1461,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec(
         path=("query_memories",),
         access=AccessMode.READ_ONLY,
-        snapshot=True,
         help="Retrieve relevant memory texts for a query",
         configure_parser=_add_query_memories_arguments,
         handler=_handle_query_memories,
@@ -1482,7 +1468,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec(
         path=("query",),
         access=_query_access_mode,
-        snapshot=True,
         help="Execute a REQL statement",
         configure_parser=_add_reql_statement_arguments,
         handler=_handle_query,
@@ -1490,7 +1475,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec(
         path=("locate",),
         access=AccessMode.READ_ONLY,
-        snapshot=True,
         help="Resolve a known project-relative path without semantic ranking",
         configure_parser=_configure_locate_parser,
         handler=_handle_locate,
@@ -1498,7 +1482,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec(
         path=("stats",),
         access=AccessMode.READ_ONLY,
-        snapshot=True,
         help="Print graph statistics",
         configure_parser=_configure_stats_parser,
         handler=_handle_stats,
@@ -1506,7 +1489,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec(
         path=("export",),
         access=AccessMode.MUTATING,
-        snapshot=False,
         help="Export nodes and edges as JSON or standalone HTML",
         configure_parser=_configure_export_parser,
         handler=_handle_export,
@@ -1514,7 +1496,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
     CommandSpec(
         path=("inspect",),
         access=AccessMode.READ_ONLY,
-        snapshot=True,
         help="Inspect a node and adjacent edges",
         configure_parser=_configure_inspect_parser,
         handler=_handle_inspect,
@@ -1646,12 +1627,13 @@ def build_parser() -> argparse.ArgumentParser:
     storage.set_defaults(path=".")
     storage_sub = storage.add_subparsers(dest="storage_command", required=True)
     storage_clear = storage_sub.add_parser("clear", help="Rebuild storage from the current project and discard historical graph state")
+    storage_clear.add_argument("path", nargs="?", default=".", help="Project path; defaults to the current directory")
     storage_clear.add_argument("--json", action="store_true", help="Print structured JSON result")
     storage_compact = storage_sub.add_parser("compact", help="Rewrite the block store into a compact generation")
     storage_compact.add_argument("--json", action="store_true", help="Print structured JSON result")
     storage_inspect = storage_sub.add_parser("inspect", help="Inspect block layout, compression, dense nodes, and indexes")
     storage_inspect.add_argument("--json", action="store_true", help="Print structured JSON result")
-    storage_locks = storage_sub.add_parser("locks", help="Inspect lock owners, liveness, duration, watcher state, and snapshot availability")
+    storage_locks = storage_sub.add_parser("locks", help="Inspect lock owners, liveness, duration, and watcher state")
     storage_locks.add_argument("--recover-stale", action="store_true", help="Remove only locks proven stale; incomplete local locks require a safety grace period")
     storage_locks.add_argument("--json", action="store_true", help="Print structured JSON result")
 
@@ -2013,7 +1995,7 @@ def _main(argv: list[str] | None = None) -> int:
         read_only = args.storage_command == "inspect"
         if profile_logger:
             profile_logger.event("storage.open.start", category="lifecycle", path=str(args.storage), read_only=read_only)
-        store = BlockGraphStore(Path(args.storage), read_only=read_only, snapshot=read_only)
+        store = BlockGraphStore(Path(args.storage), read_only=read_only)
         try:
             if args.storage_command == "inspect":
                 if profile_logger:

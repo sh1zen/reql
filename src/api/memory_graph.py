@@ -56,17 +56,6 @@ def _ensure_readable_storage_payload(path: Path) -> None:
         raise StorageError(f"Cannot open missing REQL storage in read-only mode: {path}")
 
 
-def _storage_snapshot_signature(path: Path) -> tuple[tuple[int, int] | None, tuple[int, int] | None]:
-    def signature(target: Path) -> tuple[int, int] | None:
-        try:
-            stat = target.stat()
-        except FileNotFoundError:
-            return None
-        return stat.st_size, stat.st_mtime_ns
-
-    return signature(path), signature(path.with_name(f"{path.name}.wal"))
-
-
 class MemoryGraph:
     """Stable public facade over the memory subsystem.
 
@@ -119,42 +108,21 @@ class MemoryGraph:
         config: REQLConfig | None = None,
         profile_logger: PerformanceLogger | None = None,
         read_only: bool = False,
-        snapshot: bool = False,
         defer_lexical_index: bool = False,
         lock_timeout_seconds: float | None = None,
     ) -> MemoryGraphT:
         storage_path = Path(path).expanduser()
         if read_only:
             _ensure_readable_storage_payload(storage_path)
-        effective_snapshot = snapshot
         options: dict[str, Any] = {
             "read_only": read_only,
-            "snapshot": effective_snapshot,
             "defer_lexical_index": defer_lexical_index,
         }
         if lock_timeout_seconds is not None:
             options["lock_timeout_seconds"] = lock_timeout_seconds
-        elif read_only and not snapshot:
+        elif read_only:
             options["lock_timeout_seconds"] = 0.05
-        store = None
-        for _ in range(3 if read_only else 1):
-            before = _storage_snapshot_signature(storage_path) if effective_snapshot else None
-            try:
-                candidate = BlockGraphStore(storage_path, **options)
-            except StorageError as exc:
-                if not read_only or effective_snapshot or "locked" not in str(exc).casefold():
-                    raise
-                effective_snapshot = True
-                options["snapshot"] = True
-                before = _storage_snapshot_signature(storage_path)
-                candidate = BlockGraphStore(storage_path, **options)
-            after = _storage_snapshot_signature(storage_path) if effective_snapshot else None
-            if not effective_snapshot or before == after:
-                store = candidate
-                break
-            candidate.close()
-        if store is None:
-            raise StorageError(f"REQL snapshot changed repeatedly while opening {storage_path}; retry the read")
+        store = BlockGraphStore(storage_path, **options)
         try:
             return cls(store, extractor=extractor, config=config, profile_logger=profile_logger)
         except Exception:

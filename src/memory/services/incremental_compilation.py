@@ -503,7 +503,7 @@ class IncrementalCompilationService:
         }
         path_by_node_id = {
             node.id: path
-            for node in self.store.get_nodes(sorted(endpoint_ids))
+            for node in self.store.get_nodes(sorted(endpoint_ids), clone=False)
             if node.status == "active"
             if (path := _node_relative_path(node))
         }
@@ -583,7 +583,7 @@ class IncrementalCompilationService:
 
         symbols = [
             node
-            for node in self.store.get_nodes(sorted(symbol_ids))
+            for node in self.store.get_nodes(sorted(symbol_ids), clone=False)
             if node.status == "active" and node.type in UNUSED_SYMBOL_NODE_TYPES
         ]
         symbol_ids = {node.id for node in symbols}

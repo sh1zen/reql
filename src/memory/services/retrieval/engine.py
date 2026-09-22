@@ -74,6 +74,27 @@ class RetrievalEngine(
         if code_context and lexical_node_types is None:
             lexical_node_types = tuple(sorted(CODE_CONTEXT_NODE_TYPES))
 
+        exact_path_nodes: OrderedDict[str, MemoryNode] = OrderedDict()
+        normalized_query_path = self._normalized_query_path(query.text)
+        if normalized_query_path:
+            exact_artifacts = self.store.find_nodes_by_property(
+                "relative_path_key",
+                normalized_query_path,
+                type_="SourceArtifact",
+                limit=20,
+                clone=False,
+            )
+            for artifact in exact_artifacts:
+                exact_path_nodes[artifact.id] = artifact
+                for file_node in self.store.find_nodes_by_property(
+                    "artifact_id",
+                    artifact.id,
+                    type_="File",
+                    limit=20,
+                    clone=False,
+                ):
+                    exact_path_nodes[file_node.id] = file_node
+
         # 1) canonical topic/entity matches.
         with (profile.span("retrieval.canonical_seed", topics=len(extraction.topics), entities=len(extraction.entities)) if profile else nullcontext()):
             for topic, score in extraction.topics:
@@ -100,25 +121,32 @@ class RetrievalEngine(
         # 2) lexical search across the graph.
         lexical_limit = max(query.top_k * 3, 30)
         with (profile.span("retrieval.lexical_search", top_k=lexical_limit) if profile else nullcontext()):
-            lexical_matches = (
-                self._scoped_lexical_search(
-                    query,
-                    query_profile,
-                    lexical_node_types=lexical_node_types,
-                    scopes=query_scopes,
-                    top_k=lexical_limit,
-                    metrics_cache=match_metrics,
+            if exact_path_nodes:
+                lexical_matches = [(node, 1.0) for node in exact_path_nodes.values()]
+            else:
+                lexical_matches = (
+                    self._scoped_lexical_search(
+                        query,
+                        query_profile,
+                        lexical_node_types=lexical_node_types,
+                        scopes=query_scopes,
+                        top_k=lexical_limit,
+                        metrics_cache=match_metrics,
+                    )
+                    if query_scopes
+                    else self.store.lexical_search(
+                        query.text,
+                        top_k=lexical_limit,
+                        node_types=lexical_node_types,
+                        include_archived=query.include_archived,
+                    )
                 )
-                if query_scopes
-                else self.store.lexical_search(
-                    query.text,
-                    top_k=lexical_limit,
-                    node_types=lexical_node_types,
-                    include_archived=query.include_archived,
-                )
-            )
             for node, score in lexical_matches:
+                if lexical_node_types is not None and node.type not in lexical_node_types:
+                    continue
                 if node.type in TECHNICAL_NODE_TYPES:
+                    continue
+                if not query.include_archived and node.status in INACTIVE_STATUSES:
                     continue
                 if code_context and not self._is_code_context_node(node):
                     continue
@@ -138,6 +166,19 @@ class RetrievalEngine(
                     continue
                 adjusted_score = max(score, metrics.match_score)
                 seed_scores[node.id] = max(seed_scores.get(node.id, 0.0), adjusted_score)
+
+        exact_path_seed_scores = OrderedDict(
+            (node.id, seed_scores[node.id])
+            for node, _score in lexical_matches
+            if node.id in seed_scores
+            and node.type in {"File", "SourceArtifact"}
+            and self._node_matches_exact_query_path(node, query.text)
+        )
+        if exact_path_nodes:
+            # A complete path or filename is stronger intent than incidental
+            # prose or extension overlap elsewhere in the graph. A scope that
+            # excludes that path returns no seeds instead of unrelated matches.
+            seed_scores = exact_path_seed_scores
 
         sorted_seed_scores = sorted(seed_scores.items(), key=lambda item: item[1], reverse=True)
         seed_node_ids = self._pick_seed_node_ids(sorted_seed_scores, max_k=max(query.top_k * 2, 20), gap_ratio=0.20)
@@ -235,6 +276,7 @@ class RetrievalEngine(
                 edge_types=traversal_edge_types,
                 min_weight=0.25,
                 limit=80,
+                clone=False,
             )
             for edge, neighbor in neighbors:
                 if edge.type in TECHNICAL_EDGE_TYPES or neighbor.type in TECHNICAL_NODE_TYPES:
@@ -251,11 +293,28 @@ class RetrievalEngine(
 
         trace_id = stable_id("retrieval", None, query.text, utcnow_iso()) if query.store_trace else None
 
+        public_nodes = self.store.get_nodes(list(context_nodes))
+        public_nodes_by_id = {node.id: node for node in public_nodes}
+        public_ranked = [
+            RankedNode(
+                node=public_nodes_by_id[item.node.id],
+                score=item.score,
+                reasons=dict(item.reasons),
+            )
+            for item in ranked
+            if item.node.id in public_nodes_by_id
+        ]
+        public_edges = [
+            edge
+            for edge_id in context_edges
+            if (edge := self.store.get_edge(edge_id)) is not None
+        ]
+
         return MemorySubgraph(
             query=query,
-            ranked_nodes=ranked,
-            nodes=list(context_nodes.values()),
-            edges=list(context_edges.values()),
+            ranked_nodes=public_ranked,
+            nodes=public_nodes,
+            edges=public_edges,
             seed_node_ids=seed_node_ids,
             trace_id=trace_id,
         )

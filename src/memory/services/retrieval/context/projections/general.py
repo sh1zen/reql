@@ -177,6 +177,10 @@ class GeneralContextProjectionMixin:
             if document_scope
             else self._general_best_match_items(subgraph, max_items=max_items, prefer_general=has_direct_general_evidence)
         )
+        exact_path_items = self._exact_path_result_items(subgraph)
+        if exact_path_items:
+            exact_ids = {item.node.id for item in exact_path_items}
+            best_items = [*exact_path_items, *(item for item in best_items if item.node.id not in exact_ids)]
         source_items = self._agent_source_payloads(subgraph, max_items=max_items, query_text=subgraph.query.text)
         best_payloads = [self._agent_ranked_payload(item, max_text_chars=220) for item in best_items]
         cleanup_payloads = [self._agent_ranked_payload(item, max_text_chars=260) for item in buckets["StaticAnalysisFinding"]]
@@ -200,6 +204,23 @@ class GeneralContextProjectionMixin:
             },
             "trace_id": subgraph.trace_id,
         }
+
+    def _exact_path_result_items(self, subgraph: MemorySubgraph) -> list[RankedNode]:
+        """Keep one canonical exact file result ahead of semantic neighbors."""
+        by_path: dict[str, RankedNode] = {}
+        type_priority = {"File": 2, "SourceArtifact": 1}
+        for item in subgraph.ranked_nodes:
+            node = item.node
+            if node.type not in type_priority or not self._node_matches_exact_query_path(node, subgraph.query.text):
+                continue
+            path = self._node_relative_path(node) or ""
+            current = by_path.get(path)
+            if current is None or type_priority[node.type] > type_priority.get(current.node.type, 0):
+                by_path[path] = item
+        return sorted(
+            by_path.values(),
+            key=lambda item: (-item.score, self._node_relative_path(item.node) or ""),
+        )
 
     def _general_best_match_items(self, subgraph: MemorySubgraph, *, max_items: int, prefer_general: bool = False) -> list[RankedNode]:
         limit = min(max_items, 20)
@@ -370,7 +391,13 @@ class GeneralContextProjectionMixin:
     def _has_source_relation(self, node_id: str) -> bool:
         return any(
             edge.type in SOURCE_EDGE_TYPES
-            for edge, _ in self.store.neighbors(node_id, direction="both", edge_types=SOURCE_EDGE_TYPES, limit=20)
+            for edge, _ in self.store.neighbors(
+                node_id,
+                direction="both",
+                edge_types=SOURCE_EDGE_TYPES,
+                limit=20,
+                clone=False,
+            )
         )
 
     def _collect_sources(
@@ -392,7 +419,13 @@ class GeneralContextProjectionMixin:
                 if len(sources) >= limit:
                     return sources
         for node_id in list(nodes):
-            for edge, neighbor in self.store.neighbors(node_id, direction="both", edge_types=SOURCE_EDGE_TYPES, limit=40):
+            for edge, neighbor in self.store.neighbors(
+                node_id,
+                direction="both",
+                edge_types=SOURCE_EDGE_TYPES,
+                limit=40,
+                clone=False,
+            ):
                 if edge.type in TECHNICAL_EDGE_TYPES or neighbor.type in TECHNICAL_NODE_TYPES:
                     continue
                 if not query.include_archived and neighbor.status in INACTIVE_STATUSES:
@@ -465,6 +498,8 @@ class GeneralContextProjectionMixin:
         if node.type in CODE_CONTEXT_EXCLUDED_NODE_TYPES or node.type in TECHNICAL_NODE_TYPES:
             return False
         if node.type not in CODE_CONTEXT_NODE_TYPES:
+            return False
+        if node.type in {"File", "SourceArtifact"} and str(node.properties.get("context_scope") or "").casefold() == "docs":
             return False
         path = cls._node_relative_path(node)
         if path and cls._is_generated_context_path(path):

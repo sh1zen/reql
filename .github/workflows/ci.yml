@@ -13,7 +13,7 @@ permissions:
 jobs:
   test:
     name: Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
@@ -21,10 +21,10 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python-version }}
 
@@ -34,7 +34,9 @@ jobs:
           python -m pip install -e .
 
       - name: Run tests
-        run: PYTHONPATH=src python -m unittest discover -s tests -v
+        run: |
+          mkdir -p .tmp
+          PYTHONPATH=src python -m unittest discover -s tests -v
 
       - name: Verify CLI entry points
         run: |
@@ -44,14 +46,14 @@ jobs:
 
   package-check:
     name: Package check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.14"
 
@@ -63,14 +65,14 @@ jobs:
 
   reql-self-check:
     name: REQL self graph
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.14"
 
@@ -80,16 +82,16 @@ jobs:
           python -m pip install -e .
 
       - name: Compile repository graph
-        run: python cli.py project compile .
+        run: python cli.py project compile
 
       - name: Generate reports
-        run: python cli.py project report . --output reports
+        run: python cli.py project report --output reports
 
       - name: Generate HTML and JSON graph export
         run: python cli.py export --html --json --out reql-graph-out
 
       - name: Upload graph artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: reql-self-graph
           path: |
@@ -101,20 +103,21 @@ jobs:
 
   security-scan:
     name: Security scan
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: "3.14"
 
       - name: Install security tools
         run: |
           python -m pip install --upgrade pip
+          python -m pip install -e .
           python -m pip install bandit pip-audit
 
       - name: bandit static security analysis

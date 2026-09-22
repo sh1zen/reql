@@ -103,7 +103,7 @@ def build_compilation_summary(
     changed_files = [change.to_dict() for change in revision.changes] if revision is not None else []
     changed_paths = {_normalize_path(str(item["path"])) for item in changed_files}
     node_status = _node_statuses(delta)
-    nodes = store.get_nodes(sorted(node_status))
+    nodes = store.get_nodes(sorted(node_status), clone=False)
     changed_nodes = [node for node in nodes if _relative_path(node) in changed_paths]
     current_symbol_state = capture_symbol_state(
         store,

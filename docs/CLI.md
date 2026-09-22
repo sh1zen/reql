@@ -150,8 +150,8 @@ reql query_context --help
 ### Declarative command registration
 
 New leaf commands should be described by a `CommandSpec` in
-`src/memory/cli.py`. The spec supplies the command path, access mode, snapshot
-support, parser configurator, help text, and handler. `build_parser()` installs
+`src/memory/cli.py`. The spec supplies the command path, access mode, parser
+configurator, help text, and handler. `build_parser()` installs
 registered specs into their parent parser group, while execution uses the same
 selected spec to choose read-only versus mutating storage access and invoke the
 handler.
@@ -220,7 +220,10 @@ reql agent terminate agent:stale-worker
 `agent list` returns active agents by default; `--all` includes finished and
 terminated agents. `agent search QUERY` searches the public dashboard, private
 dashboards, notes, tasks, and historical finish and completion messages. Each
-result includes timestamp, agent id, and surrounding context.
+result includes timestamp, agent id, and surrounding context. Search matches an
+exact phrase or all normalized query terms in any order, so punctuation and
+word order do not prevent recovery of otherwise matching history. Private
+dashboard task rows include their ids, statuses, and completion messages.
 
 Use `agent note TEXT` for a private self-note, `agent note --agent AGENT_ID
 TEXT` for a directed external note, and `agent note --public TEXT` for shared
@@ -365,16 +368,15 @@ edge.
 
 Query/retrieval commands write usage events to an append-only journal rather
 than rewriting canonical graph records. `project status`, `query_context`, and
-non-mutating `query` statements open a consistent read-only index snapshot, so
-parallel readers can run together. Compile writers wait for existing
-readers and block new readers while opening the write session.
+non-mutating `query` statements open the index read-only, so parallel readers
+can run together. Compile writers wait for existing readers and block new
+readers while opening the write session.
 Use `reql storage locks` to see the owning command, lock duration, process
-liveness, watcher state, stale status, and snapshot availability. Add
-`--recover-stale` for conservative cleanup of dead same-host owners. Read-only
-commands automatically fall back to the latest complete snapshot while a live
-writer remains active. Expected storage failures return exit code `1` without a
-Python traceback. A writer lock prints the recovery command `reql storage locks
---recover-stale`.
+liveness, watcher state, and stale status. Add `--recover-stale` for
+conservative cleanup of dead same-host owners. Read-only commands respect a
+live writer's lock. Expected storage failures return exit code `1` without a
+Python traceback. A writer lock prints the recovery command
+`reql storage locks --recover-stale`.
 
 ## Inspection and Export
 
@@ -464,15 +466,17 @@ By default, installs write project-local files such as
 `.codex/skills/reql-agent/SKILL.md`, `.claude/CLAUDE.md`, `AGENTS.md`,
 `GEMINI.md`, `.cursor/rules/reql.mdc`, `.kilocode/rules/reql.md`,
 `.agents/skills/reql-agent/SKILL.md`, and agent-specific skill/rule
-directories. `reql-agent` covers compile/query/report workflows for the
-standard project graph and Agent Workspace commands such as `reql agent init`,
-routine coordination through `agent dashboard` and `agent task add`,
-recovery via `agent dashboard`, cleanup via `agent finish`, `agent export --json`, and
-`agent reset`. Pass `--project-dir` to target another project root. Pass
+directories. `reql-agent` uses the project graph to bound repository discovery,
+then directs the coding agent to verify the current source, callers, contracts,
+and tests. For multi-step or resumed work it also covers Agent Workspace
+commands such as `reql agent init`, recovery and coordination through `agent
+dashboard` and `agent task add`, cleanup via `agent finish`, `agent export
+--json`, and `agent reset`. Small self-contained tasks skip Agent Workspace.
+Pass `--project-dir` to target another project root. Pass
 `--user` to write to matching assistant profiles under the home directory.
 
-Generated `SKILL.md` files keep a 20–30 line fast path for status, bounded
-retrieval, targeted reads, edits, tests, and routing. Bootstrap, query variants,
+Generated `SKILL.md` files keep a concise fast path for status, bounded
+retrieval, source verification, edits, tests, refresh, and routing. Bootstrap, query variants,
 graph refresh, reports, documents, and Agent Workspace guidance live only in
 routed `references/` files and are loaded when that situation occurs. Platform rules
 for Cursor, Copilot, Kilo, and shared instruction files are rendered from the
@@ -481,8 +485,11 @@ same canonical rule set so their behavior does not drift or repeat.
 The installer also writes a REQL-owned `reql` command shim; use `--command-dir`
 to select the shim directory. Claude and Gemini hooks are installed by default
 and can be skipped with `--no-hooks`. `reql uninstall` removes REQL-owned skill
-files, version stamps, managed instruction sections, owned command shims, and
-automatic hooks while preserving unrelated content in shared files.
+files, version stamps, managed instruction sections, and automatic hooks while
+preserving unrelated content in shared files. The shared command shim is kept
+by default because other project or user integrations may still use it. Pass
+the same explicit `--command-dir` used during installation when the shim itself
+should also be removed.
 
 ## MCP Server
 

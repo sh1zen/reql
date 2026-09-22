@@ -73,8 +73,9 @@ reql install codex
 
 Replace `codex` with another supported agent platform, or let interactive
 install auto-detect one. The installed instructions make REQL part of the
-agent's normal repository workflow. The generated `SKILL.md` is a 20–30 line
-fast path, while bootstrap, query,
+agent's normal repository workflow. The generated `SKILL.md` is a concise
+coding workflow: REQL bounds discovery, while the checked-out source and tests
+remain authoritative. Bootstrap, query,
 update, reporting, document, and Agent Workspace details stay in routed
 `references/` files loaded only when their situation occurs.
 The commands below are the operations the agent integration uses to bootstrap
@@ -153,8 +154,7 @@ reads or modifies the canonical project graph.
 
 Context results use schema version 2. Alongside the query-specific
 `graph_revision`, they report the committed `source_revision` and freshness
-state (`current`, `refreshing`, `stale`, or `unknown`). Read commands fall back
-to a validated committed snapshot while a writer is active.
+state (`current`, `refreshing`, `stale`, or `unknown`).
 
 From a source checkout, `python cli.py ...` exposes the same command surface
 without requiring an editable install:
@@ -217,8 +217,8 @@ finish preserves the completed agent's private dashboard history.
   and external notes, public notes, completion messages, and finish messages.
   It contains no copied project, file, symbol, or canonical graph records.
 - Local block-file persistence with fixed-size pages, compressed records,
-  reader/writer lock diagnostics, safe stale-lock recovery, read-only snapshots,
-  transactions, compaction, and atomic clean rebuilds.
+  reader/writer lock diagnostics, safe stale-lock recovery, transactions,
+  compaction, and atomic clean rebuilds.
 - Incremental compilation cache with persistent compilation runs and graph deltas.
 - Artifact document parsing for Markdown, plain text, and PDF with graceful
   fallbacks.

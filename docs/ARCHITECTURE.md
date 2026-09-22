@@ -47,6 +47,12 @@ Routine operations should prefer bounded or indexed port methods:
 - `archive_nodes_by_artifact` for artifact deletion handling;
 - `bounded_neighborhood` for retrieval and graph exploration.
 
+Bulk node reads and neighbor traversal clone records by default for public
+callers. Internal read-only compile and retrieval stages may request borrowed
+views, but they must clone the final bounded result before crossing the public
+API boundary. This avoids repeated deep copies without exposing mutable store
+state.
+
 Full graph loads through `all_nodes` and `all_edges` are reserved for exports,
 reports, tests, and explicit administrative inspection.
 
@@ -121,6 +127,15 @@ enumerating every node in a scope. Matching metrics are computed once and reused
 by seed selection and graph expansion; identifier/path components and plural
 variants participate in the same deterministic ranking used by `SEARCH`,
 `query_context`, `query_graph`, `query_explore`, and `query_memories`.
+When the complete query is an indexed project-relative path, retrieval uses the
+path property index directly and constrains seeds to that file and source
+artifact before expansion. This keeps exact file intent ahead of incidental
+prose or shared-extension matches across context, graph, memory, and raw
+retrieval surfaces. Documentation-scoped and exact documentation-path queries
+use the general/document projection rather than the code-owner projection.
+Graph expansion traverses borrowed read-only neighbor views and copies only the
+final bounded nodes and edges returned to callers. Ranking, traversal limits,
+ordering, and defensive result isolation remain unchanged.
 
 Retrieval modules use explicit imports for their shared constants, helpers, and
 domain types. This keeps component dependencies visible and prevents additions
@@ -136,8 +151,7 @@ envelope serialization. Providers do not call retrieval components directly.
 `query_context_result` exposes the typed result. Python structured output, CLI
 JSON, and MCP serialize schema-v2 envelopes with the query-specific
 `graph_revision`, committed `source_revision`, explicit freshness metadata,
-`confidence`, and a nested `payload`. A locked reader may use a validated
-complete checkpoint/WAL snapshot rather than waiting for an active writer.
+`confidence`, and a nested `payload`.
 
 Agent context is built with `reql query_context --query ...`, dependency slices
 from `reql query_explore --query ...`, or the structured
@@ -213,6 +227,10 @@ and notes. The dashboard is the persistent coordination layer.
 The canonical CLI writes dashboard notes through `agent note TEXT`,
 `agent note --agent AGENT_ID TEXT`, and `agent note --public TEXT`.
 The dashboard owns cross-agent inspection and public coordination context.
+Its private task view renders task ids, lifecycle status, and completion
+messages so a later session can resume or audit work without opening raw graph
+records. Dashboard search accepts an exact phrase or all normalized query terms
+in any order, including across punctuation such as hyphenated identifiers.
 
 ## Maintenance
 

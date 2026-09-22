@@ -164,10 +164,10 @@ class MarkdownContextRendererMixin:
         def best_span(path: str, row: dict[str, Any]) -> tuple[Any, Any]:
             if row.get("line_start") is not None or row.get("line_end") is not None:
                 return row.get("line_start"), row.get("line_end")
-            for item in owner_candidates:
+            for item in targeted_reads:
                 if item.get("path") == path and (item.get("line_start") is not None or item.get("line_end") is not None):
                     return item.get("line_start"), item.get("line_end")
-            for item in targeted_reads:
+            for item in owner_candidates:
                 if item.get("path") == path and (item.get("line_start") is not None or item.get("line_end") is not None):
                     return item.get("line_start"), item.get("line_end")
             return None, None

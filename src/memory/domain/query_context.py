@@ -157,14 +157,12 @@ class GraphFreshness:
     """Availability and source-lag metadata for a committed graph read."""
 
     status: Literal["current", "refreshing", "stale", "unknown"] = "unknown"
-    snapshot_used: bool = False
     pending_paths: int = 0
     checked_at: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "status": self.status,
-            "snapshot_used": self.snapshot_used,
             "pending_paths": self.pending_paths,
             "checked_at": self.checked_at,
         }

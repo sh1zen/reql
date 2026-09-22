@@ -22,7 +22,7 @@ from memory.config import (
     load_effective_config,
     resolve_config_path,
 )
-from memory.domain.exceptions import REQLError, StorageError
+from memory.domain.exceptions import REQLError
 from memory.domain.query_context import (
     DEFAULT_MAX_DEPTH as DEFAULT_CONTEXT_MAX_DEPTH,
 )
@@ -788,17 +788,12 @@ def _reql_statement_requires_write(statement: str) -> bool:
 @contextmanager
 def _open_graph(storage_path: str, config: REQLConfig, *, read_only: bool = False) -> Iterator[MemoryGraph]:
     storage_path = str(validate_mcp_path(_required_path_text(storage_path, "storage_path"), name="storage_path"))
-    try:
-        graph = MemoryGraph.open(
-            Path(storage_path),
-            config=config,
-            read_only=read_only,
-            lock_timeout_seconds=0.05 if read_only else None,
-        )
-    except StorageError as exc:
-        if not read_only or "locked" not in str(exc).casefold():
-            raise
-        graph = MemoryGraph.open(Path(storage_path), config=config, read_only=True, snapshot=True)
+    graph = MemoryGraph.open(
+        Path(storage_path),
+        config=config,
+        read_only=read_only,
+        lock_timeout_seconds=0.05 if read_only else None,
+    )
     try:
         yield graph
     finally:
