@@ -1,4 +1,4 @@
 """Agent working graph support."""
-from .workspace import AgentWorkspace
+from .workspace import AgentIdentitySelectionError, AgentWorkspace
 
-__all__ = ["AgentWorkspace"]
+__all__ = ["AgentIdentitySelectionError", "AgentWorkspace"]

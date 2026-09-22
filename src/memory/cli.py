@@ -21,11 +21,8 @@ from .config import (
     ConfigError,
     REQLConfig,
     load_effective_config,
-    load_project_config_data,
-    normalize_scan_exclude_pattern,
-    parse_config_override_assignments,
     resolve_config_path,
-    resolve_scan_exclude_pattern,
+    set_local_config_option,
     write_sample_config,
 )
 from .diagnostics import PerformanceLogger
@@ -114,17 +111,75 @@ def _print_json(payload: object) -> None:
 def _format_storage_error(error: StorageError) -> str:
     message = str(error)
     if message.startswith(LOCKED_FOR_WRITE_PREFIX):
-        storage_path = message[len(LOCKED_FOR_WRITE_PREFIX) :].partition(";")[0].strip()
         return (
             "reql is locked for write: to fix any possible stale: "
-            f'reql --storage "{storage_path}" storage locks --recover-stale'
+            "reql storage locks --recover-stale"
         )
     return f"reql: {message}"
 
 
+def _agent_command_name(args: argparse.Namespace) -> str:
+    """Return the selected agent command path without its argument values."""
+
+    parts = ["agent", str(getattr(args, "agent_command", "")).strip()]
+    if args.agent_command == "task":
+        parts.append(str(getattr(args, "agent_task_command", "")).strip())
+    return " ".join(part for part in parts if part)
+
+
+def _agent_identity_error_payload(error: Any, args: argparse.Namespace) -> dict[str, Any]:
+    """Describe an ambiguous private-workspace selection and its required action."""
+
+    command_name = _agent_command_name(args)
+    action = command_name.removeprefix("agent ")
+    agent_ids = list(getattr(error, "agent_ids", ()))
+    required_action = f'Target an existing workspace: reql agent --agent "agent:AGENT_ID" {action}'
+    return {
+        "code": "ambiguous_agent_identity",
+        "message": "This command needs one private Agent Workspace, but no agent or activity identity was supplied.",
+        "context": {"active_agent_ids": agent_ids, "command": f"reql {command_name}"},
+        "next": [required_action],
+    }
+
+
+def _print_agent_identity_error(error: Any, args: argparse.Namespace) -> None:
+    """Render an ambiguous identity error as guidance rather than a traceback."""
+
+    payload = _agent_identity_error_payload(error, args)
+    if getattr(args, "json", False):
+        _print_json({"error": payload})
+        return
+    context = payload["context"]
+    agents = context["active_agent_ids"]
+    print(f"Cannot select a private Agent Workspace for {context['command']}.", file=sys.stderr)
+    print(f"Why: {payload['message']}", file=sys.stderr)
+    print(f"Context: active agents: {', '.join(agents) if agents else 'unknown'}.", file=sys.stderr)
+    print(f"Action: {payload['next'][0]}", file=sys.stderr)
+
+
+def _print_agent_command_error(error: ValueError, args: argparse.Namespace) -> None:
+    """Render an agent command validation error with its focused help command."""
+
+    command = f"reql {_agent_command_name(args)}"
+    if getattr(args, "json", False):
+        _print_json(
+            {
+                "error": {
+                    "code": "invalid_agent_command",
+                    "message": str(error),
+                    "context": {"command": command},
+                    "next": [f"Read command help: {command} --help"],
+                }
+            }
+        )
+        return
+    print(f"Cannot complete `{command}`: {error}", file=sys.stderr)
+    print(f"Next: read command help: {command} --help", file=sys.stderr)
+
+
 def _agent_progress_label(args: argparse.Namespace) -> str:
     parts = ["agent", str(args.agent_command)]
-    for field in ("agent_task_command", "agent_decision_command", "agent_finding_command", "agent_session_command"):
+    for field in ("agent_task_command",):
         value = getattr(args, field, None)
         if value:
             parts.append(str(value))
@@ -470,11 +525,10 @@ def _print_agent_status(payload: dict[str, Any]) -> None:
     print(f"Identity selection: {payload.get('selection_source') or 'unknown'}")
     print(f"Concurrency safe: {str(bool(payload.get('concurrency_safe'))).lower()}")
     print(f"Agent storage: {payload['agent_storage']}")
-    print(f"Agent bus: {payload.get('bus_storage') or ''}")
+    print(f"Public dashboard: {payload.get('dashboard_storage') or ''}")
     if payload.get("initialized_at"):
         print(f"Initialized at: {payload['initialized_at']}")
     print(f"Items: {payload['agent_nodes']}")
-    print(f"Relationships: {payload['relations']}")
     if payload.get("current_session_id"):
         open_tasks = int(payload.get("current_session_open_tasks") or 0)
         title = payload.get("current_session_title") or ""
@@ -489,232 +543,31 @@ def _print_agent_node(payload: dict[str, Any]) -> None:
     print(f"{node['id']}\t{node['type']}\t{node.get('status') or ''}\t{node.get('title') or node.get('content') or ''}")
 
 
-def _print_agent_list(payload: dict[str, Any]) -> None:
-    for node in payload.get("nodes", []):
-        print(f"{node['updated_at']}\t{node['id']}\t{node['type']}\t{node.get('status') or ''}\t{node.get('title') or ''}")
-    for edge in payload.get("relations", []):
-        print(f"{edge['updated_at']}\t{edge['id']}\t{edge['relation']}\t{edge['from_id']} -> {edge['to_id']}")
-
-
-def _print_agent_relations(payload: dict[str, Any]) -> None:
-    relations = payload.get("relations", [])
-    if not relations and "relation" in payload:
-        relations = [payload["relation"]]
-    for relation in relations:
-        print(f"{relation['id']}\t{relation['relation']}\t{relation['from_id']} -> {relation['to_id']}")
-
-
-def _print_agent_search(payload: dict[str, Any]) -> None:
-    for item in payload.get("results", []):
-        node = item["node"]
-        print(f"{float(item['score']):.3f}\t{node['id']}\t{node['type']}\t{node.get('status') or ''}\t{node.get('title') or ''}")
-
-
-def _print_agent_map(payload: dict[str, Any]) -> None:
-    filters = payload.get("filters") or {}
-    if filters:
-        print("Filters:")
-        for key, value in sorted(filters.items()):
-            print(f"  {key}: {value}")
-    context = payload.get("context") or {}
-    print("Agent memory:")
-    learned = context.get("learned") or {}
-    learned_items = [
-        item
-        for node_type in ("decisions", "findings", "notes", "risks", "plans")
-        for item in learned.get(node_type, [])
-    ]
-    if not learned_items:
-        print("  none")
-    for node in learned_items:
-        print(f"  {node['id']}\t{node.get('type') or ''}\t{node.get('title') or node.get('content') or ''}")
-
-    sessions = context.get("sessions") or {}
-    print("Current session:")
-    current_session = sessions.get("current")
-    if current_session:
-        print(f"  {current_session['id']}\t{current_session.get('status') or ''}\t{current_session.get('title') or ''}")
-    else:
-        print("  none")
-    print("Previous sessions:")
-    previous_sessions = sessions.get("previous", [])
-    if not previous_sessions:
-        print("  none")
-    for session in previous_sessions:
-        print(
-            f"  {session['id']}\t{session.get('status') or ''}\t{session.get('title') or ''} "
-            f"(completed={session.get('completed_task_count', 0)}, open={session.get('open_task_count', 0)})"
-        )
-        for item in session.get("highlights", []):
-            print(f"    {item.get('type') or ''}\t{item.get('title') or item.get('content') or ''}")
-
-    sections = [("Open tasks", payload.get("open_tasks", []))]
-    if "completed_tasks" in payload:
-        sections.insert(1, ("Completed tasks", payload.get("completed_tasks", [])))
-    for title, nodes in sections:
-        print(f"{title}:")
-        if not nodes:
-            print("  none")
-            continue
-        for node in nodes:
-            print(f"  {node['id']}\t{node.get('status') or ''}\t{node.get('title') or node.get('content') or ''}")
-    print("Relations:")
-    relations = payload.get("relations", [])
-    if not relations:
-        print("  none")
-    for edge in relations:
-        print(f"  {edge['id']}\t{edge['relation']}\t{edge['from_id']} -> {edge['to_id']}")
-
-
-def _print_agent_bus(payload: dict[str, Any]) -> None:
-    print(f"Agent bus: {payload.get('bus_storage') or ''}")
-    print(f"Current agent: {payload.get('current_agent_id') or 'none'}")
-    print("Agents:")
-    agents = payload.get("agents", [])
-    if not agents:
-        print("  none")
-    for agent in agents:
-        print(f"  {agent.get('agent_id') or ''}\t{agent.get('status') or ''}\t{agent.get('agent_storage') or ''}")
-    print("Messages:")
-    messages = payload.get("messages", [])
-    if not messages:
-        print("  none")
-    for message in messages:
-        print(f"  {message['updated_at']}\t{message.get('agent_id') or ''} -> {message.get('target_agent_id') or ''}\t{message.get('content') or ''}")
-    print("Handoffs:")
-    handoffs = payload.get("handoffs", [])
-    if not handoffs:
-        print("  none")
-    for handoff in handoffs:
-        print(f"  {handoff['updated_at']}\t{handoff.get('agent_id') or ''} -> {handoff.get('target_agent_id') or ''}\t{handoff.get('title') or ''}")
-
-
 def _print_agent_dashboard(payload: dict[str, Any]) -> None:
-    """Render the compact coordination view without storage metadata or timestamps."""
-
-    session = payload.get("session") or {}
-    print(
-        f"agent {payload.get('agent_id') or ''} | "
-        f"session {session.get('title') or '-'} | "
-        f"open {len(payload.get('work') or [])} | working {len(payload.get('working_agents') or [])}"
-    )
-    previous = payload.get("previous_session") or {}
-    if previous:
-        print(
-            f"previous {previous.get('id') or ''} | {previous.get('title') or ''} | "
-            f"done {previous.get('completed_task_count') or 0} open {previous.get('open_task_count') or 0}"
-        )
-    for item in payload.get("work") or []:
-        print(f"work {item.get('id') or ''} | {item.get('title') or ''}")
-    for item in payload.get("memory") or []:
-        print(f"memory {item.get('type') or ''} {item.get('id') or ''} | {item.get('title') or ''}")
-    for item in payload.get("working_agents") or []:
-        if item.get("agent_id") == payload.get("agent_id"):
-            continue
-        print(
-            f"working {item.get('agent_id') or ''} | "
-            f"activity {item.get('activity_id') or '-'}"
-        )
-    for item in payload.get("finished_agents") or []:
-        print(f"finished {item.get('agent_id') or ''}")
-    for item in payload.get("agent_details") or []:
-        detail_session = item.get("current_session") or {}
-        print(
-            f"detail {item.get('agent_id') or ''} | {item.get('status') or ''} | "
-            f"open {len(item.get('open_tasks') or [])} | {detail_session.get('title') or '-'}"
-        )
-    for section, label in (("messages", "msg"), ("handoffs", "handoff")):
-        for item in payload.get(section) or []:
-            print(
-                f"{label} {item.get('id') or ''} | {item.get('from') or ''}>{item.get('to') or ''} | "
-                f"{item.get('text') or ''}"
-            )
-    for item in payload.get("drilldowns") or []:
-        print(f"drill {item.get('reason') or ''} | {item.get('command') or ''}")
-
-
-def _load_agent_batch_file(path: str) -> list[dict[str, Any]]:
-    if path == "-":
-        raw = sys.stdin.read()
-        source = "<stdin>"
-    else:
-        source = path
-        raw = Path(path).read_text(encoding="utf-8")
-    try:
-        payload = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        raise ValueError(f"Invalid agent batch JSON in {source}: {exc}") from exc
-    operations = payload.get("operations") if isinstance(payload, dict) else payload
-    if not isinstance(operations, list):
-        raise ValueError("Agent batch JSON must be an array or an object with an operations array")
-    for index, operation in enumerate(operations):
-        if not isinstance(operation, dict):
-            raise ValueError(f"Agent batch operation {index} must be an object")
-    return operations
-
-
-def _agent_batch_entry(value: str, *, op: str, text_key: str) -> dict[str, Any]:
-    text = value.strip()
-    if not text:
-        raise ValueError(f"Agent batch {op} text must not be empty")
-    operation: dict[str, Any] = {"op": op, text_key: text}
-    alias, content = _split_agent_batch_alias(text)
-    if alias is not None:
-        operation[text_key] = content
-        operation["as"] = alias
-    return operation
-
-
-def _split_agent_batch_alias(value: str) -> tuple[str | None, str]:
-    alias, separator, content = value.partition("=")
-    if not separator:
-        return None, value
-    alias = alias.strip()
-    content = content.strip()
-    if not alias or not content:
-        return None, value
-    if not (alias[0].isalpha() or alias[0] == "_"):
-        return None, value
-    if any(not (char.isalnum() or char in {"_", "-"}) for char in alias):
-        return None, value
-    return alias, content
-
-
-def _split_agent_batch_targets(value: str) -> list[str]:
-    targets = [item.strip() for item in value.split(",") if item.strip()]
-    if not targets:
-        raise ValueError("Agent batch link targets must not be empty")
-    return targets
-
-
-def _agent_batch_operations_from_args(args: argparse.Namespace) -> list[dict[str, Any]]:
-    operations: list[dict[str, Any]] = []
-    if getattr(args, "file", None):
-        operations.extend(_load_agent_batch_file(args.file))
-    for value in getattr(args, "note", []) or []:
-        operations.append(_agent_batch_entry(value, op="note.add", text_key="text"))
-    for value in getattr(args, "task", []) or []:
-        operations.append(_agent_batch_entry(value, op="task.add", text_key="description"))
-    for value in getattr(args, "decision", []) or []:
-        operations.append(_agent_batch_entry(value, op="decision.add", text_key="text"))
-    for value in getattr(args, "finding", []) or []:
-        operations.append(_agent_batch_entry(value, op="finding.add", text_key="text"))
-    for value in getattr(args, "done", []) or []:
-        task_id = value.strip()
-        if not task_id:
-            raise ValueError("Agent batch done id must not be empty")
-        operations.append({"op": "task.done", "id": task_id})
-    for from_id, relation, to_id in getattr(args, "link", []) or []:
-        operations.append({"op": "link", "from": from_id, "to": to_id, "relation": relation})
-    for from_id, relation, targets in getattr(args, "link_many", []) or []:
-        operations.append({"op": "link-many", "from": from_id, "to": _split_agent_batch_targets(targets), "relation": relation})
-    if not operations:
-        raise ValueError("Agent batch requires a JSON file or at least one inline operation")
-    return operations
+    """Render the public dashboard followed by the selected private dashboard."""
+    public = payload.get("public", payload)
+    private = payload.get("private")
+    print("Agents:")
+    for agent in public.get("agents") or []:
+        print(f"  {agent.get('agent_id')}\t{agent.get('status')}\t{agent.get('last_activity_at') or '-'}")
+    print("Active Tasks:")
+    for task in public.get("active_tasks") or []:
+        print(f"  {task.get('agent_id')}\t{task.get('content')}\t{task.get('updated_at') or '-'}")
+    print("Context:")
+    for entry in public.get("context") or []:
+        print(f"  {entry.get('timestamp')}\t{entry.get('agent_id')}\t{entry.get('message_type')}\t{entry.get('content')}")
+    print("Drill:")
+    for item in public.get("drill") or []:
+        print(f"  {item.get('label')}: {item.get('command')}")
+    if private is not None:
+        print(f"Private dashboard: {private.get('agent', {}).get('agent_id')}")
+        for section, label in (("tasks", "Tasks"), ("private_notes", "Private Notes"), ("external_notes", "External Notes")):
+            print(f"{label}:")
+            for item in private.get(section) or []:
+                print(f"  {item.get('updated_at')}\t{item.get('title') or item.get('content')}")
 
 
 def _configure_project_explain_parser(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("path", nargs="?", default=".", help="Registered project path; defaults to the current working directory")
     parser.add_argument("--focus", default=None, help="Feature, behavior, or business concept used to rank change guidance")
     parser.add_argument("--max-capabilities", type=int, default=12, help="Maximum business capabilities to return")
     parser.add_argument("--max-workflows", type=int, default=8, help="Maximum inferred workflows to return")
@@ -741,7 +594,6 @@ def _handle_project_explain(context: CommandContext) -> int:
 
 
 def _configure_project_pipeline_parser(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("path", nargs="?", default=".", help="Registered project path; defaults to the current working directory")
     formats = parser.add_mutually_exclusive_group()
     formats.add_argument("--code", action="store_true", help="Write Mermaid source to pipeline.mmd")
     formats.add_argument("--html", action="store_true", help="Write an interactive pipeline.html visualization (default)")
@@ -773,7 +625,6 @@ def _handle_project_pipeline(context: CommandContext) -> int:
 
 
 def _configure_project_compile_parser(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("path", nargs="?", default=".", help="Project path to compile; defaults to the current working directory")
     parser.add_argument("--max-file-size-mb", type=float, default=None)
     parser.add_argument("--watch", action="store_true", help="Monitor the project filesystem and compile dirty artifacts automatically")
     parser.add_argument("--watch-interval", type=float, default=0.5, help="Maximum seconds to wait between bounded watchdog checks")
@@ -781,42 +632,31 @@ def _configure_project_compile_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--watch-iterations", type=int, default=None, help="Stop after this many watch checks; default is until interrupted")
 
 
-def _configure_project_update_parser(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("path", nargs="?", default=".", help="Project path to update; defaults to the current working directory")
-    parser.add_argument("--max-file-size-mb", type=float, default=None)
-
-
 def _configure_project_status_parser(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("path")
     parser.add_argument("--json", action="store_true", help="Print structured JSON result")
 
 
 def _configure_project_history_parser(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("path", nargs="?", default=".", help="Registered project path; defaults to the current working directory")
     parser.add_argument("--limit", type=int, default=20, help="Maximum revisions to show")
     parser.add_argument("--json", action="store_true", help="Print structured JSON result")
 
 
 def _configure_project_diff_parser(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("path", nargs="?", default=".", help="Registered project path; defaults to the current working directory")
     parser.add_argument("--revision", default=None, help="Revision id; defaults to the latest project revision")
     parser.add_argument("--json", action="store_true", help="Print structured JSON result")
 
 
 def _configure_project_report_parser(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("path")
     parser.add_argument("--output", default=None, help="Output directory for GRAPH_REPORT.md, GRAPH_DELTAS.md, and CACHE_REPORT.md")
     parser.add_argument("--json", action="store_true", help="Print structured JSON result")
 
 
 def _configure_cache_status_parser(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("path", nargs="?", default=".", help="Project path; defaults to the current working directory")
     parser.add_argument("--max-file-size-mb", type=float, default=None)
     parser.add_argument("--json", action="store_true", help="Print structured JSON result")
 
 
 def _configure_cache_clear_parser(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("path", nargs="?", default=".", help="Project path; defaults to the current working directory")
     parser.add_argument("--json", action="store_true", help="Print structured JSON result")
 
 
@@ -880,10 +720,7 @@ def _handle_project_compile(context: CommandContext) -> int:
             print("Watch stopped")
             return 130
         return exit_code
-    if args.project_command == "update":
-        result = graph.update_project(args.path, **compile_kwargs)
-    else:
-        result = graph.compile_project(args.path, **compile_kwargs)
+    result = graph.compile_project(args.path, **compile_kwargs)
     _print_compile_result(result)
     return 0 if not result.run.errors else 1
 
@@ -1288,19 +1125,18 @@ def _command_access_mode(args: argparse.Namespace) -> AccessMode:
 
 def _open(args: argparse.Namespace, config: REQLConfig, profile_logger: PerformanceLogger | None = None) -> MemoryGraph:
     read_only_command = _command_access_mode(args) is AccessMode.READ_ONLY
-    snapshot = bool(getattr(args, "snapshot", False))
     defer_lexical_index = (
         str(getattr(args, "command", "")) == "project"
-        and str(getattr(args, "project_command", "")) in {"compile", "update"}
+        and str(getattr(args, "project_command", "")) == "compile"
     )
     if read_only_command:
         if profile_logger:
             profile_logger.event("storage.open.start", category="lifecycle", path=str(args.storage), read_only=True)
             try:
                 with profile_logger.span("storage.open", path=str(args.storage), read_only=True):
-                    return MemoryGraph.open(Path(args.storage), config=config, profile_logger=profile_logger, read_only=True, snapshot=snapshot, lock_timeout_seconds=0.05)
+                    return MemoryGraph.open(Path(args.storage), config=config, profile_logger=profile_logger, read_only=True, lock_timeout_seconds=0.05)
             except StorageError as exc:
-                if "locked" in str(exc).casefold() and not snapshot:
+                if "locked" in str(exc).casefold():
                     return MemoryGraph.open(Path(args.storage), config=config, profile_logger=profile_logger, read_only=True, snapshot=True)
                 if "missing REQL storage" not in str(exc):
                     raise
@@ -1310,9 +1146,9 @@ def _open(args: argparse.Namespace, config: REQLConfig, profile_logger: Performa
                 _checkpoint_opened_store_if_needed(graph, profile_logger)
                 return graph
         try:
-            return MemoryGraph.open(Path(args.storage), config=config, read_only=True, snapshot=snapshot, lock_timeout_seconds=0.05)
+            return MemoryGraph.open(Path(args.storage), config=config, read_only=True, lock_timeout_seconds=0.05)
         except StorageError as exc:
-            if "locked" in str(exc).casefold() and not snapshot:
+            if "locked" in str(exc).casefold():
                 return MemoryGraph.open(Path(args.storage), config=config, read_only=True, snapshot=True)
             if "missing REQL storage" not in str(exc):
                 raise
@@ -1359,9 +1195,6 @@ def _default_storage_path(build_path: str | Path = ".") -> Path:
 
 
 def _resolve_storage_arg(args: argparse.Namespace) -> str:
-    explicit = getattr(args, "storage", None)
-    if explicit:
-        return str(explicit)
     build_path: str | Path = "."
     if getattr(args, "command", None) in {"project", "cache"} or (
         getattr(args, "command", None) == "storage" and getattr(args, "storage_command", None) == "clear"
@@ -1380,7 +1213,7 @@ def _config_start_dir(args: argparse.Namespace) -> str | Path | None:
 
 def _effective_config_path(args: argparse.Namespace) -> Path | None:
     return resolve_config_path(
-        getattr(args, "config", None),
+        None,
         start_dir=_config_start_dir(args),
         env=os.environ,
     )
@@ -1487,7 +1320,6 @@ def _add_reql_statement_arguments(parser: argparse.ArgumentParser) -> None:
 def _add_agent_filters(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--type", dest="node_type", default=None, help="Filter by agent node type")
     parser.add_argument("--status", default=None, help="Filter by node status")
-    parser.add_argument("--relation", default=None, help="Filter by relation type")
     parser.add_argument("--since", default=None, help="Filter by ISO updated_at timestamp")
     parser.add_argument("--limit", type=int, default=50, help="Maximum items to print")
     parser.add_argument("--json", action="store_true", help="Print structured JSON result")
@@ -1549,14 +1381,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         snapshot=False,
         help="Scan and incrementally compile dirty artifacts",
         configure_parser=_configure_project_compile_parser,
-        handler=_handle_project_compile,
-    ),
-    CommandSpec(
-        path=("project", "update"),
-        access=AccessMode.MUTATING,
-        snapshot=False,
-        help="Incrementally update a previously compiled project",
-        configure_parser=_configure_project_update_parser,
         handler=_handle_project_compile,
     ),
     CommandSpec(
@@ -1707,21 +1531,6 @@ def build_parser() -> argparse.ArgumentParser:
         prog="reql",
         description="Relational Entities Query Language memory graph engine",
     )
-    parser.add_argument(
-        "--storage",
-        default=None,
-        help="REQL block storage path. Defaults to <build path>/.reql/memory.reql for project/cache commands, otherwise ./.reql/memory.reql",
-    )
-    parser.add_argument("--config", default=None, help="Path to a project reql.conf")
-    parser.add_argument(
-        "--set",
-        dest="config_overrides",
-        action="append",
-        default=[],
-        metavar="SECTION.OPTION=VALUE",
-        help="Override a config value after loading the internal defaults and reql.conf; list values are joined",
-    )
-
     sub = parser.add_subparsers(dest="command", required=True)
 
     install = sub.add_parser("install", help="Install REQL agent instructions for coding assistants")
@@ -1753,7 +1562,7 @@ def build_parser() -> argparse.ArgumentParser:
     uninstall.add_argument("--dry-run", action="store_true", help="Print planned removals without writing them")
     uninstall.add_argument("--json", action="store_true", help="Print structured JSON result")
 
-    agent = sub.add_parser("agent", help="Private operational memory for agent decisions, tasks, sessions, and plans")
+    agent = sub.add_parser("agent", help="Dashboard-centric agent sessions, tasks, and notes")
     agent.add_argument("--agent", dest="agent_id", default=None, help="Use an agent id; defaults to REQL_AGENT_ID, then a stable activity-derived id")
     agent.add_argument(
         "--activity",
@@ -1762,127 +1571,81 @@ def build_parser() -> argparse.ArgumentParser:
         help="Select a stable private workspace and session; defaults to REQL_AGENT_ACTIVITY_ID or CODEX_THREAD_ID",
     )
     agent.add_argument("--no-progress", action="store_true", help="Disable Agent Workspace progress messages on stderr")
-    parser.add_argument(
-        "--snapshot",
-        action="store_true",
-        help="Open read-only commands from the latest complete storage snapshot even while a writer lock is active",
-    )
     agent_sub = agent.add_subparsers(dest="agent_command", required=True)
-    agent_init = agent_sub.add_parser("init", help="Initialize private operational memory for this agent")
+    agent_init = agent_sub.add_parser("init", help="Create or resume this agent's active session")
+    agent_init.add_argument("--name", default=None, help="Name for a newly created session")
     agent_init.add_argument("--json", action="store_true", help="Print structured JSON result")
     agent_status = agent_sub.add_parser("status", help="Show private agent-memory status")
     agent_status.add_argument("--json", action="store_true", help="Print structured JSON result")
     agent_reset = agent_sub.add_parser("reset", help="Discard and recreate this agent's operational memory")
     agent_reset.add_argument("--json", action="store_true", help="Print structured JSON result")
-    agent_note = agent_sub.add_parser("note", help="Note commands: add")
-    agent_note_sub = agent_note.add_subparsers(dest="agent_note_command", required=True)
-    agent_note_add = agent_note_sub.add_parser("add", help="Record a durable operational note")
-    agent_note_add.add_argument("text")
-    agent_note_add.add_argument("--json", action="store_true", help="Print structured JSON result")
-    agent_task = agent_sub.add_parser("task", help="Task commands: add, done")
+    agent_note = agent_sub.add_parser("note", help="Add a private, directed, or public dashboard note")
+    agent_note.add_argument("text", nargs="?", help="General note text")
+    agent_note.add_argument("--agent", dest="target_agent_id", default=None, help="Deliver the note to another agent's private dashboard")
+    agent_note.add_argument("--public", action="store_true", help="Publish the note to shared dashboard context")
+    agent_note.add_argument("--json", action="store_true", help="Print structured JSON result")
+    agent_task = agent_sub.add_parser("task", help="Task commands: add, done, list")
     agent_task_sub = agent_task.add_subparsers(dest="agent_task_command", required=True)
     agent_task_add = agent_task_sub.add_parser("add", help="Add an agent task")
     agent_task_add.add_argument("description")
     agent_task_add.add_argument("--json", action="store_true", help="Print structured JSON result")
     agent_task_done = agent_task_sub.add_parser("done", help="Mark an agent task as done")
     agent_task_done.add_argument("id")
+    agent_task_done.add_argument("message", help="Completion message published to shared dashboard context")
     agent_task_done.add_argument("--json", action="store_true", help="Print structured JSON result")
-    agent_decision = agent_sub.add_parser("decision", help="Decision commands: add")
-    agent_decision_sub = agent_decision.add_subparsers(dest="agent_decision_command", required=True)
-    agent_decision_add = agent_decision_sub.add_parser("add", help="Record a decision")
-    agent_decision_add.add_argument("decision")
-    agent_decision_add.add_argument("--json", action="store_true", help="Print structured JSON result")
-    agent_finding = agent_sub.add_parser("finding", help="Finding commands: add")
-    agent_finding_sub = agent_finding.add_subparsers(dest="agent_finding_command", required=True)
-    agent_finding_add = agent_finding_sub.add_parser("add", help="Record an observation or finding")
-    agent_finding_add.add_argument("observation")
-    agent_finding_add.add_argument("--json", action="store_true", help="Print structured JSON result")
-    agent_session = agent_sub.add_parser("session", help="Session commands: start")
-    agent_session_sub = agent_session.add_subparsers(dest="agent_session_command", required=True)
-    agent_session_start = agent_session_sub.add_parser("start", help="Start a new current agent session")
-    agent_session_start.add_argument("title")
-    agent_session_start.add_argument("--json", action="store_true", help="Print structured JSON result")
-    agent_link = agent_sub.add_parser("link", help="Relate two agent-owned planning or history items")
-    agent_link.add_argument("id1")
-    agent_link.add_argument("id2")
-    agent_link.add_argument("--relation", required=True, help="Relation type")
-    agent_link.add_argument("--json", action="store_true", help="Print structured JSON result")
-    agent_batch = agent_sub.add_parser("batch", help="Apply operational-memory updates from a JSON file or inline options")
-    agent_batch.add_argument("file", nargs="?", default=None, help="Optional JSON file path, or '-' to read from stdin")
-    agent_batch.add_argument("--note", action="append", default=[], metavar="[ALIAS=]TEXT", help="Add an operational note; may be repeated")
-    agent_batch.add_argument("--task", action="append", default=[], metavar="[ALIAS=]TEXT", help="Add an open task; may be repeated")
-    agent_batch.add_argument("--decision", action="append", default=[], metavar="[ALIAS=]TEXT", help="Add a decision; may be repeated")
-    agent_batch.add_argument("--finding", action="append", default=[], metavar="[ALIAS=]TEXT", help="Add a finding; may be repeated")
-    agent_batch.add_argument("--done", action="append", default=[], metavar="TASK_ID", help="Mark a task done; may be repeated")
-    agent_batch.add_argument("--link", action="append", nargs=3, metavar=("FROM", "RELATION", "TO"), default=[], help="Create one relation; aliases may be referenced as $alias")
-    agent_batch.add_argument("--link-many", dest="link_many", action="append", nargs=3, metavar=("FROM", "RELATION", "TARGETS"), default=[], help="Create relations from one source to comma-separated targets")
-    agent_batch.add_argument("--json", action="store_true", help="Print structured JSON result")
-    agent_search = agent_sub.add_parser("search", help="Search private operational memory")
+    agent_task_list = agent_task_sub.add_parser("list", help="List open agent tasks")
+    agent_task_list.add_argument("--all", dest="all_tasks", action="store_true", help="Include completed tasks")
+    agent_task_list.add_argument("--json", action="store_true", help="Print structured JSON result")
+    agent_search = agent_sub.add_parser("search", help="Search public and private dashboard history")
     agent_search.add_argument("query")
     agent_search.add_argument("--type", dest="node_type", default=None, help="Filter by agent node type")
     agent_search.add_argument("--status", default=None, help="Filter by node status")
     agent_search.add_argument("--limit", type=int, default=20, help="Maximum matches")
     agent_search.add_argument("--metadata", action="store_true", help="Include timestamps and stored operational metadata")
     agent_search.add_argument("--json", action="store_true", help="Print structured JSON result")
-    agent_show = agent_sub.add_parser("show", help="Show an agent-owned item or relationship")
+    agent_show = agent_sub.add_parser("show", help="Show an agent-owned item")
     agent_show.add_argument("id")
     agent_show.add_argument("--json", action="store_true", help="Print structured JSON result")
-    agent_list = agent_sub.add_parser("list", help="List recent operational-memory items")
-    _add_agent_filters(agent_list)
-    agent_map = agent_sub.add_parser("map", help="Summarize current agent decisions, tasks, plans, and sessions")
-    agent_map.add_argument("--task", dest="task_id", default=None, help="Focus the map on one agent task and related agent items")
-    agent_map.add_argument("--session", default=None, help="Focus the map on an agent session id, or 'current'")
-    agent_map.add_argument("--since", default=None, help="Only include agent items or relations updated at or after this ISO timestamp")
-    agent_map.add_argument("--completed", action="store_true", help="Include completed tasks for a session summary")
-    agent_map.add_argument("--metadata", action="store_true", help="Include timestamps and stored operational metadata")
-    agent_map.add_argument("--json", action="store_true", help="Print structured JSON result")
-    agent_bus = agent_sub.add_parser("bus", help="Read the shared internal agent bus")
-    agent_bus.add_argument("--limit", type=int, default=50, help="Maximum agents, messages, and handoffs")
-    agent_bus.add_argument("--include-payloads", action="store_true", help="Include full handoff payload snapshots")
-    agent_bus.add_argument("--json", action="store_true", help="Print structured JSON result")
-    agent_dashboard = agent_sub.add_parser("dashboard", help="Read compact coordination signals and optionally post one update")
-    agent_dashboard.add_argument("--post", default=None, help="Publish a shared update of at most 240 characters before reading")
-    agent_dashboard.add_argument("--kind", default="status", help="Kind assigned to --post; defaults to status")
-    agent_dashboard.add_argument("--target", default="all", help="Target assigned to --post; defaults to all")
+    agent_list = agent_sub.add_parser("list", help="List active agents")
+    agent_list.add_argument("--all", dest="all_agents", action="store_true", help="Include finished and terminated agents")
+    agent_list.add_argument("--json", action="store_true", help="Print structured JSON result")
+    agent_dashboard = agent_sub.add_parser("dashboard", help="Read shared and selected private dashboards")
     agent_dashboard.add_argument("--limit", type=int, default=5, help="Maximum items per dashboard section (1-20)")
-    agent_dashboard.add_argument("--agents", action="store_true", help="Include detailed cross-store agent state (may wait on busy stores)")
     agent_dashboard.add_argument("--json", action="store_true", help="Print structured JSON result")
     agent_finish = agent_sub.add_parser("finish", help="Publish final context, close the session, and mark this agent completed")
-    agent_finish.add_argument("summary", nargs="?", default=None, help="Compact final outcome stored with the handoff")
+    agent_finish.add_argument("summary", help="Final message published to shared dashboard context")
     agent_finish.add_argument("--json", action="store_true", help="Print structured JSON result")
-    agent_handoff = agent_sub.add_parser("handoff", help="Publish this agent's saved operational context to the master bus")
-    agent_handoff.add_argument("summary", nargs="?", default=None)
-    agent_handoff.add_argument("--target", default="master", help="Target agent id")
-    agent_handoff.add_argument("--json", action="store_true", help="Print structured JSON result")
+    agent_terminate = agent_sub.add_parser("terminate", help="Force-terminate a stale agent while preserving history")
+    agent_terminate.add_argument("agent_id")
+    agent_terminate.add_argument("--json", action="store_true", help="Print structured JSON result")
     agent_export = agent_sub.add_parser("export", help="Export private agent operational memory")
     agent_export.add_argument("--metadata", action="store_true", help="Include full workspace metadata and all stored nodes")
     agent_export.add_argument("--json", action="store_true", help="Print structured JSON result")
 
-    config = sub.add_parser("config", help="Configuration commands: show, init")
+    config = sub.add_parser("config", help="Configuration commands: show, init, set")
     config_sub = config.add_subparsers(dest="config_command", required=True)
     config_sub.add_parser("show", help="Print the effective configuration")
     config_init = config_sub.add_parser("init", help="Create a sample reql.conf if absent")
     config_init.add_argument("--path", default=PROJECT_CONFIG_FILENAME, help="Target project config file path")
+    config_set = config_sub.add_parser("set", help="Add or update an option in ./reql.conf")
+    config_set.add_argument("option", help="Dotted option name, such as scan.max_file_size_mb")
+    config_set.add_argument("value", help="Value as text, JSON, number, or boolean")
 
-    project = sub.add_parser("project", help="Compile, inspect, explain, and report on projects")
+    project = sub.add_parser("project", help="Compile, inspect, explain, and report on the current working directory")
+    project.set_defaults(path=".")
     project_sub = project.add_subparsers(dest="project_command", required=True)
 
     project_watch_status = project_sub.add_parser("watch-status", help="Check watcher liveness without opening the graph")
-    project_watch_status.add_argument("path", nargs="?", default=".", help="Project path; defaults to the current working directory")
     project_watch_status.add_argument("--json", action="store_true", help="Print structured JSON result")
 
-    project_exclude = project_sub.add_parser("exclude", help="Add scan.exclude patterns to a project config")
-    project_exclude.add_argument("patterns", nargs="+", help="One or more scan.exclude patterns to add")
-    project_exclude.add_argument("--path", default=".", help="Project directory whose config should be updated; defaults to the current working directory")
-    project_exclude.add_argument("--json", action="store_true", help="Print structured JSON result")
-
     cache = sub.add_parser("cache", help="Cache commands: status, clear")
+    cache.set_defaults(path=".")
     cache_sub = cache.add_subparsers(dest="cache_command", required=True)
 
     storage = sub.add_parser("storage", help="Storage commands: inspect, locks, compact, clear")
+    storage.set_defaults(path=".")
     storage_sub = storage.add_subparsers(dest="storage_command", required=True)
     storage_clear = storage_sub.add_parser("clear", help="Rebuild storage from the current project and discard historical graph state")
-    storage_clear.add_argument("path", nargs="?", default=".", help="Project directory to rebuild; defaults to the current working directory")
     storage_clear.add_argument("--json", action="store_true", help="Print structured JSON result")
     storage_compact = storage_sub.add_parser("compact", help="Rewrite the block store into a compact generation")
     storage_compact.add_argument("--json", action="store_true", help="Print structured JSON result")
@@ -1896,9 +1659,6 @@ def build_parser() -> argparse.ArgumentParser:
         {
             (): sub,
             ("agent",): agent_sub,
-            ("agent", "decision"): agent_decision_sub,
-            ("agent", "finding"): agent_finding_sub,
-            ("agent", "session"): agent_session_sub,
             ("agent", "task"): agent_task_sub,
             ("cache",): cache_sub,
             ("config",): config_sub,
@@ -1914,9 +1674,6 @@ def build_parser() -> argparse.ArgumentParser:
     _normalize_subparser_help(storage_sub)
     _normalize_subparser_help(agent_sub)
     _normalize_subparser_help(agent_task_sub)
-    _normalize_subparser_help(agent_decision_sub)
-    _normalize_subparser_help(agent_finding_sub)
-    _normalize_subparser_help(agent_session_sub)
 
     return parser
 
@@ -1926,135 +1683,6 @@ def _max_file_size_bytes(args: argparse.Namespace, config: REQLConfig) -> int:
     if value is None:
         value = config.scan.max_file_size_mb
     return max(0, int(float(value) * 1024 * 1024))
-
-
-def _append_config_exclude_patterns(project_path: str | Path, patterns: list[str]) -> dict[str, object]:
-    root = Path(project_path).expanduser().resolve(strict=False)
-    if root.exists() and not root.is_dir():
-        raise ValueError(f"project path is not a directory: {root}")
-    if not root.exists():
-        raise ValueError(f"project path does not exist: {root}")
-
-    normalized: list[str] = []
-    normalized_keys: set[str] = set()
-    for raw in patterns:
-        if not raw:
-            raise ValueError("exclude patterns must not be empty")
-        if "\n" in raw or "\r" in raw:
-            raise ValueError("exclude patterns must be single-line values")
-        resolve_scan_exclude_pattern(raw)
-        key = normalize_scan_exclude_pattern(raw)
-        if key not in normalized_keys:
-            normalized.append(raw)
-            normalized_keys.add(key)
-
-    config_path = root / PROJECT_CONFIG_FILENAME
-    created = False
-    if not config_path.exists():
-        write_sample_config(config_path)
-        created = True
-    project_data = load_project_config_data(config_path)
-    scan_data = project_data.get("scan", {})
-    project_excludes = list(scan_data.get("exclude", [])) if isinstance(scan_data, dict) else []
-    existing_rules = {normalize_scan_exclude_pattern(pattern) for pattern in project_excludes}
-    added = [pattern for pattern in normalized if normalize_scan_exclude_pattern(pattern) not in existing_rules]
-    skipped = [pattern for pattern in normalized if normalize_scan_exclude_pattern(pattern) in existing_rules]
-
-    if added:
-        current_text = config_path.read_text(encoding="utf-8")
-        exclude_patterns = [*project_excludes, *added]
-        _write_text_atomic(config_path, _replace_scan_exclude(current_text, exclude_patterns))
-
-    return {
-        "path": str(config_path),
-        "created": created,
-        "added": added,
-        "skipped": skipped,
-    }
-
-
-def _replace_scan_exclude(text: str, patterns: list[str]) -> str:
-    lines = text.splitlines()
-    scan_start = _top_level_section_line(lines, "scan")
-    rendered = _render_yaml_string_list("exclude", patterns)
-    if scan_start is None:
-        prefix = text.rstrip("\n")
-        separator = "\n\n" if prefix else ""
-        return f"{prefix}{separator}scan:\n{rendered}\n"
-
-    scan_end = _section_end(lines, scan_start)
-    exclude_start = _section_option_line(lines, scan_start + 1, scan_end, "exclude")
-    if exclude_start is None:
-        updated = [*lines[:scan_end], *rendered.splitlines(), *lines[scan_end:]]
-        return "\n".join(updated).rstrip("\n") + "\n"
-
-    exclude_end = exclude_start + 1
-    while exclude_end < scan_end:
-        line = lines[exclude_end]
-        stripped = line.strip()
-        indent = len(line) - len(line.lstrip(" "))
-        if stripped and indent <= 2 and not stripped.startswith("- "):
-            break
-        exclude_end += 1
-    updated = [*lines[:exclude_start], *rendered.splitlines(), *lines[exclude_end:]]
-    return "\n".join(updated).rstrip("\n") + "\n"
-
-
-def _top_level_section_line(lines: list[str], section: str) -> int | None:
-    marker = f"{section}:"
-    for index, line in enumerate(lines):
-        if line.strip() == marker and not line.startswith((" ", "\t")):
-            return index
-    return None
-
-
-def _section_end(lines: list[str], start: int) -> int:
-    for index in range(start + 1, len(lines)):
-        line = lines[index]
-        if line.strip() and not line.startswith((" ", "\t")):
-            return index
-    return len(lines)
-
-
-def _section_option_line(lines: list[str], start: int, end: int, option: str) -> int | None:
-    prefix = f"{option}:"
-    for index in range(start, end):
-        line = lines[index]
-        if len(line) - len(line.lstrip(" ")) == 2 and line.strip().startswith(prefix):
-            return index
-    return None
-
-
-def _render_yaml_string_list(key: str, values: list[str]) -> str:
-    if not values:
-        return f"  {key}: []"
-    lines = [f"  {key}:"]
-    lines.extend(f"    - {_render_yaml_string(value)}" for value in values)
-    return "\n".join(lines)
-
-
-def _render_yaml_string(value: str) -> str:
-    """Render a plain scalar when REQL's YAML subset can read it unchanged."""
-
-    requires_quotes = (
-        not value
-        or value != value.strip()
-        or value in {"true", "false", "[]", "{}"}
-        or value.startswith(("[", "{"))
-        or any(char in value for char in ("#", '"', "'", "\n", "\r"))
-    )
-    if not requires_quotes:
-        try:
-            float(value) if "." in value else int(value)
-        except ValueError:
-            return value
-    return json.dumps(value, ensure_ascii=False)
-
-
-def _write_text_atomic(path: Path, text: str) -> None:
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
-    os.replace(tmp, path)
 
 
 def _graph_html_path(raw_path: str | None) -> Path:
@@ -2108,20 +1736,7 @@ def _main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(raw_argv)
     profile_logger: PerformanceLogger | None = None
-
     command_spec = _selected_command_spec(args)
-    snapshot_allowed = (
-        command_spec.snapshot and command_spec.access_mode(args) is AccessMode.READ_ONLY
-        if command_spec is not None
-        else (
-            args.command == "project" and args.project_command == "watch-status"
-        ) or (
-            args.command == "storage" and args.storage_command in {"inspect", "locks"}
-        )
-    )
-    if args.snapshot and not snapshot_allowed:
-        print("--snapshot is only valid for read-only commands and storage inspection", file=sys.stderr)
-        return 2
 
     if args.command == "config" and args.config_command == "init":
         try:
@@ -2191,32 +1806,10 @@ def _main(argv: list[str] | None = None) -> int:
                 print(f"{action.status}\t{action.platform}\t{action.kind}\t{action.path}")
         return 0
 
-    if args.command == "project" and args.project_command == "exclude":
-        try:
-            result = _append_config_exclude_patterns(args.path, args.patterns)
-        except ValueError as exc:
-            print(str(exc), file=sys.stderr)
-            return 2
-        if args.json:
-            _print_json(result)
-        else:
-            action = "Created" if result["created"] else "Updated"
-            print(f"{action}: {result['path']}")
-            if result["added"]:
-                print("Added rules:")
-                for pattern in result["added"]:
-                    print(f"  {pattern}")
-            if result["skipped"]:
-                print("Already present:")
-                for pattern in result["skipped"]:
-                    print(f"  {pattern}")
-        return 0
-
     args.storage = _resolve_storage_arg(args)
 
     try:
-        overrides = parse_config_override_assignments(args.config_overrides)
-        config = load_effective_config(args.config, start_dir=_config_start_dir(args), overrides=overrides)
+        config = load_effective_config(start_dir=_config_start_dir(args))
     except ConfigError as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -2230,6 +1823,15 @@ def _main(argv: list[str] | None = None) -> int:
         _print_json(config.to_dict())
         return 0
 
+    if args.command == "config" and args.config_command == "set":
+        try:
+            path = set_local_config_option(args.option, args.value)
+        except ConfigError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        print(f"Updated {path}: {args.option}")
+        return 0
+
     if args.command == "project" and args.project_command == "watch-status":
         payload = _project_watch_status(args.storage, args.path)
         if args.json:
@@ -2239,10 +1841,42 @@ def _main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "agent":
-        from memory.agent import AgentWorkspace
+        from memory.agent import AgentIdentitySelectionError, AgentWorkspace
+
+        if args.agent_command == "list":
+            result = AgentWorkspace.list_registered_agents(args.storage, include_all=args.all_agents, config=config)
+            if args.json:
+                _print_json({"agents": result})
+            else:
+                for agent in result:
+                    print(f"{agent['agent_id']}\t{agent['status']}\t{agent.get('last_activity_at') or '-'}")
+            return 0
+        if args.agent_command == "terminate":
+            try:
+                result = AgentWorkspace.terminate_agent(args.storage, args.agent_id, config=config)
+            except ValueError as exc:
+                _print_agent_command_error(exc, args)
+                return 2
+            if args.json:
+                _print_json(result)
+            else:
+                print(f"Agent terminated: {result['agent_id']}")
+            return 0
+        if args.agent_command == "search":
+            result = AgentWorkspace.search_dashboards(args.storage, args.query, limit=args.limit, config=config)
+            if args.json:
+                _print_json(result)
+            else:
+                for item in result["results"]:
+                    print(f"{item.get('timestamp')}\t{item.get('agent_id')}\t{item.get('context')}")
+            return 0
 
         agent_id = args.agent_id or os.environ.get("REQL_AGENT_ID")
-        raw_workspace = AgentWorkspace(args.storage, agent_id=agent_id, activity_id=args.activity_id, config=config)
+        try:
+            raw_workspace = AgentWorkspace(args.storage, agent_id=agent_id, activity_id=args.activity_id, config=config)
+        except AgentIdentitySelectionError as exc:
+            _print_agent_identity_error(exc, args)
+            return 2
         workspace = ProgressingAgentWorkspace(
             raw_workspace,
             label=_agent_progress_label(args),
@@ -2250,13 +1884,15 @@ def _main(argv: list[str] | None = None) -> int:
         )
         try:
             if args.agent_command == "init":
-                result = workspace.init()
+                result = workspace.init(name=args.name)
                 if args.json:
                     _print_json(result)
                 else:
                     print(f"Agent id: {result['agent_id']}")
-                    print(f"Initialized agent memory: {result['agent_storage']}")
-                    print(f"Agent bus: {result['bus_storage']}")
+                    print(f"Initialized private dashboard: {result['agent_storage']}")
+                    print(f"Public dashboard: {result['dashboard_storage']}")
+                    if session := result.get("session"):
+                        print(f"Started session: {session['title']}")
                 return 0
             if args.agent_command == "status":
                 result = workspace.status()
@@ -2272,8 +1908,18 @@ def _main(argv: list[str] | None = None) -> int:
                 else:
                     print(f"Reset agent memory: {result['agent_storage']}")
                 return 0
-            if args.agent_command == "note" and args.agent_note_command == "add":
-                result = workspace.add_note(args.text)
+            if args.agent_command == "note":
+                if args.text is not None:
+                    if args.target_agent_id and args.public:
+                        parser.error("agent note accepts either --agent AGENT_ID or --public, not both")
+                    if args.target_agent_id:
+                        result = workspace.send_note(args.target_agent_id, args.text)
+                    elif args.public:
+                        result = workspace.publish_note(args.text)
+                    else:
+                        result = workspace.add_note(args.text)
+                else:
+                    parser.error("agent note requires TEXT")
                 if args.json:
                     _print_json(result)
                 else:
@@ -2288,112 +1934,29 @@ def _main(argv: list[str] | None = None) -> int:
                         _print_agent_node(result)
                     return 0
                 if args.agent_task_command == "done":
-                    result = workspace.complete_task(args.id)
+                    result = workspace.complete_task(args.id, args.message)
                     if args.json:
                         _print_json(result)
                     else:
                         _print_agent_node(result)
                     return 0
-            if args.agent_command == "decision" and args.agent_decision_command == "add":
-                result = workspace.add_decision(args.decision)
-                if args.json:
-                    _print_json(result)
-                else:
-                    _print_agent_node(result)
-                return 0
-            if args.agent_command == "finding" and args.agent_finding_command == "add":
-                result = workspace.add_finding(args.observation)
-                if args.json:
-                    _print_json(result)
-                else:
-                    _print_agent_node(result)
-                return 0
-            if args.agent_command == "session" and args.agent_session_command == "start":
-                result = workspace.start_session(args.title)
-                if args.json:
-                    _print_json(result)
-                else:
-                    _print_agent_node({"node": result["session"]})
-                return 0
-            if args.agent_command == "link":
-                result = workspace.link(args.id1, args.id2, args.relation)
-                if args.json:
-                    _print_json(result)
-                else:
-                    _print_agent_relations(result)
-                return 0
-            if args.agent_command == "batch":
-                result = workspace.batch(_agent_batch_operations_from_args(args))
-                if args.json:
-                    _print_json(result)
-                else:
-                    for item in result["results"]:
-                        if "node" in item or "task" in item:
-                            _print_agent_node(item)
-                        elif "relation" in item or "relations" in item:
-                            _print_agent_relations(item)
-                return 0
-            if args.agent_command == "search":
-                result = workspace.search(args.query, node_type=args.node_type, status=args.status, limit=args.limit, include_metadata=args.metadata)
-                if args.json:
-                    _print_json(result)
-                else:
-                    _print_agent_search(result)
-                return 0
+                if args.agent_task_command == "list":
+                    result = workspace.list_tasks(include_all=args.all_tasks)
+                    if args.json:
+                        _print_json(result)
+                    else:
+                        for task in result["tasks"]:
+                            _print_agent_node(task)
+                    return 0
             if args.agent_command == "show":
                 result = workspace.show(args.id)
                 if args.json:
                     _print_json(result)
                 else:
-                    if result["kind"] == "node":
-                        _print_agent_node({"node": result["node"]})
-                        for edge in [*result.get("outgoing", []), *result.get("incoming", [])]:
-                            print(f"{edge['id']}\t{edge['relation']}\t{edge['from_id']} -> {edge['to_id']}")
-                    else:
-                        edge = result["relation"]
-                        print(f"{edge['id']}\t{edge['relation']}\t{edge['from_id']} -> {edge['to_id']}")
-                return 0
-            if args.agent_command == "list":
-                result = workspace.list_items(
-                    node_type=args.node_type,
-                    status=args.status,
-                    relation=args.relation,
-                    since=args.since,
-                    limit=args.limit,
-                )
-                if args.json:
-                    _print_json(result)
-                else:
-                    _print_agent_list(result)
-                return 0
-            if args.agent_command == "map":
-                result = workspace.map(
-                    task_id=args.task_id,
-                    since=args.since,
-                    session=args.session,
-                    include_completed=args.completed,
-                    include_metadata=args.metadata,
-                )
-                if args.json:
-                    _print_json(result)
-                else:
-                    _print_agent_map(result)
-                return 0
-            if args.agent_command == "bus":
-                result = workspace.bus(limit=args.limit, include_payloads=args.include_payloads)
-                if args.json:
-                    _print_json(result)
-                else:
-                    _print_agent_bus(result)
+                    _print_agent_node({"node": result["node"]})
                 return 0
             if args.agent_command == "dashboard":
-                result = workspace.dashboard(
-                    post=args.post,
-                    kind=args.kind,
-                    target=args.target,
-                    limit=args.limit,
-                    include_agent_details=args.agents,
-                )
+                result = workspace.dashboard(limit=args.limit)
                 if args.json:
                     _print_json(result)
                 else:
@@ -2417,19 +1980,12 @@ def _main(argv: list[str] | None = None) -> int:
                             f"bytes_reclaimed={retention.get('bytes_reclaimed', 0)}"
                         )
                 return 0
-            if args.agent_command == "handoff":
-                result = workspace.handoff(args.summary, target=args.target)
-                if args.json:
-                    _print_json(result)
-                else:
-                    _print_agent_node({"node": result["handoff"]})
-                return 0
             if args.agent_command == "export":
                 result = workspace.export(include_metadata=args.metadata)
                 _print_json(result)
                 return 0
         except ValueError as exc:
-            print(str(exc), file=sys.stderr)
+            _print_agent_command_error(exc, args)
             return 2
 
     if args.command == "storage":
@@ -2457,7 +2013,7 @@ def _main(argv: list[str] | None = None) -> int:
         read_only = args.storage_command == "inspect"
         if profile_logger:
             profile_logger.event("storage.open.start", category="lifecycle", path=str(args.storage), read_only=read_only)
-        store = BlockGraphStore(Path(args.storage), read_only=read_only, snapshot=bool(args.snapshot and read_only))
+        store = BlockGraphStore(Path(args.storage), read_only=read_only, snapshot=read_only)
         try:
             if args.storage_command == "inspect":
                 if profile_logger:
@@ -2518,6 +2074,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except ConfigError as exc:
         print(str(exc), file=sys.stderr)
+        return 2
+    except ValueError as exc:
+        print(f"Cannot complete this command: {exc}", file=sys.stderr)
+        print("Next: run `reql --help` to review valid commands and arguments.", file=sys.stderr)
         return 2
 
 

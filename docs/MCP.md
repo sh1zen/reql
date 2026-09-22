@@ -192,7 +192,7 @@ Example after installation:
 
 Use bounded watchdog monitoring when the client wants to refresh memory after
 file changes without starting an unbounded MCP tool call. For continuous
-monitoring, run the CLI `reql project compile . --watch` from the workspace as
+monitoring, run the CLI `reql project compile --watch` from the workspace as
 monitor mode and do not call `reql_compile_project` repeatedly while that
 monitor is responsible for updates.
 

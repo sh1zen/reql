@@ -157,6 +157,28 @@ def write_sample_config(path: str | Path = PROJECT_CONFIG_FILENAME, *, overwrite
     return target
 
 
+def set_local_config_option(option: str, raw_value: str, *, start_dir: str | Path | None = None) -> Path:
+    """Add or replace one validated option in the local project config."""
+    target = Path(start_dir or Path.cwd()).expanduser().resolve(strict=False) / PROJECT_CONFIG_FILENAME
+    override = parse_config_override_assignment(f"{option}={raw_value}")
+    section, option_name = option.strip().split(".", 1)
+    value = override[option.strip()]
+
+    data = _load_yaml(target) if target.is_file() else {}
+    section_data = data.setdefault(section, {})
+    if not isinstance(section_data, dict):
+        raise ConfigError(f"Configuration section must be a mapping: {section}")
+    section_data[option_name] = value
+    try:
+        merge_config(default_config(), data)
+    except ValueError as exc:
+        raise ConfigError(str(exc)) from exc
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(_dump_basic_yaml(data), encoding="utf-8")
+    return target
+
+
 def merge_overrides(config: REQLConfig, overrides: Mapping[str, Any]) -> REQLConfig:
     return merge_config(config, overrides)
 
@@ -211,6 +233,30 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     """Parse the small YAML subset used by REQL config files without PyYAML."""
 
     return _parse_basic_yaml(path.read_text(encoding="utf-8"), path)
+
+
+def _dump_basic_yaml(data: Mapping[str, Any]) -> str:
+    """Serialize the supported project-config subset in deterministic YAML."""
+    lines: list[str] = []
+    for section, options in data.items():
+        if not isinstance(options, Mapping):
+            raise ConfigError(f"Configuration section must be a mapping: {section}")
+        lines.append(f"{section}:")
+        for option, value in options.items():
+            lines.append(f"  {option}: {_dump_yaml_value(value)}")
+    return "\n".join(lines) + "\n"
+
+
+def _dump_yaml_value(value: Any) -> str:
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    return json.dumps(value, ensure_ascii=False, sort_keys=True)
 
 
 YAML_ASSIGN_RE = re.compile(r"^([A-Za-z0-9_.-]+):(?:\s+(.*))?$")

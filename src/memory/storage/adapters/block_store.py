@@ -350,8 +350,8 @@ def _format_locked_message(target_path: Path, diagnostic: dict[str, Any]) -> str
         f"duration={float(diagnostic.get('duration_seconds', 0.0)):.3f}s; "
         f"process_alive={alive_text}; watcher={str(bool(diagnostic.get('watcher'))).lower()}; "
         f"stale={str(bool(diagnostic.get('stale'))).lower()}. "
-        f"Read commands may use --snapshot; inspect or recover locks with "
-        f"`reql --storage \"{target_path}\" storage locks --recover-stale`."
+        "Read commands automatically fall back to the latest complete snapshot; "
+        "inspect or recover locks with `reql storage locks --recover-stale`."
     )
 
 
@@ -393,7 +393,9 @@ def inspect_store_locks(target_path: str | Path, *, recover_stale: bool = False)
         "readers": readers,
         "recovered": recovered,
         "snapshot_available": snapshot_available,
-        "snapshot_hint": f'reql --storage "{target}" --snapshot <read-command>' if snapshot_available else None,
+        "snapshot_hint": "Read commands automatically use the latest complete snapshot when a writer is active."
+        if snapshot_available
+        else None,
     }
 
 

@@ -440,22 +440,17 @@ class GuidedMenu:
     def project_menu(self) -> int:
         actions = {
             "1": ("Compile project", self.project_compile),
-            "2": ("Update project", self.project_update),
-            "3": ("Project status", self.project_status),
-            "4": ("Cache status", self.cache_status),
-            "5": ("List deltas", self.delta_list),
-            "6": ("Project report", self.project_report),
-            "7": ("Watch project", self.project_watch),
+            "2": ("Project status", self.project_status),
+            "3": ("Cache status", self.cache_status),
+            "4": ("List deltas", self.delta_list),
+            "5": ("Project report", self.project_report),
+            "6": ("Watch project", self.project_watch),
         }
         return self._submenu("Project and code", actions)
 
     def project_compile(self) -> int:
         path = _prompt("Project path", ".")
         return self._compile_project_path(path)
-
-    def project_update(self) -> int:
-        path = _prompt("Project path", ".")
-        return self._update_project_path(path)
 
     def project_watch(self) -> int:
         path = _prompt("Project path", ".")
@@ -464,10 +459,6 @@ class GuidedMenu:
 
     def _compile_project_path(self, path: str) -> int:
         result = self.launcher.graph.compile_project(path, user_id=self.launcher.user_id)
-        return self._print_compile_result(result)
-
-    def _update_project_path(self, path: str) -> int:
-        result = self.launcher.graph.update_project(path, user_id=self.launcher.user_id)
         return self._print_compile_result(result)
 
     def _print_compile_result(self, result: Any) -> int:

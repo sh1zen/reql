@@ -32,8 +32,7 @@ so their fragments participate in `query_context --docs`.
 ## Flow
 
 ```text
-project compile PATH
-project update PATH
+project compile
   -> scan project read-only and hash candidate content
   -> open and validate the current graph storage
   -> compare artifacts with .reql/artifact-cache.json entries
@@ -50,10 +49,10 @@ project update PATH
   -> write CompilationRun and GraphDelta nodes
 ```
 
-`project update` and the public `update_project()` API use the same incremental
-compile pipeline. They do not maintain a separate update path.
+The public `update_project()` API uses the same incremental compile pipeline as
+`project compile`; it does not maintain a separate update path.
 
-One-shot CLI compile/update commands always open and validate `memory.reql`, and
+One-shot `project compile` commands always open and validate `memory.reql`, and
 always record their `CompilationRun` and `GraphDelta`, including clean runs. The
 disk cache is a compilation planner, not an integrity shortcut. The writable storage open defers
 the separate lexical-postings record and loads only the structural indexes used
@@ -79,7 +78,7 @@ uses the same focused semantics for API compatibility.
 Watch mode wraps the same flow:
 
 ```text
-project compile PATH --watch
+project compile --watch
   -> start a recursive Python watchdog observer
   -> run one initial verified compile
   -> wait for filesystem events
@@ -98,8 +97,8 @@ the watcher cannot trigger itself.
 Check watcher liveness without inspecting operating-system processes:
 
 ```bash
-reql project watch-status .
-reql project watch-status . --json
+reql project watch-status
+reql project watch-status --json
 ```
 
 The command reads the REQL lock sidecar without opening the graph and therefore

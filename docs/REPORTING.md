@@ -2,7 +2,7 @@
 
 REQL has one project Markdown reporting mode:
 
-- `reql project report PATH --output reports/` produces project-level
+- `reql project report --output reports/` produces project-level
   Markdown reports for a scanned or compiled project.
 
 Project reports are deterministic and do not call an LLM. They are built from
@@ -67,8 +67,8 @@ metadata.
 ## CLI
 
 ```bash
-reql project report . --output reports/
-reql project report . --output reports/ --json
+reql project report --output reports/
+reql project report --output reports/ --json
 ```
 
 The JSON form prints the generated file paths as `graph_report`,
@@ -96,8 +96,8 @@ the machine-readable graph files in the same output location.
 ## Project Pipeline Export
 
 ```bash
-reql project pipeline .
-reql project pipeline . --code
+reql project pipeline
+reql project pipeline --code
 ```
 
 This export is intentionally narrower than `reql export --html`: it follows

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -242,84 +243,82 @@ class ProjectPipelineTests(unittest.TestCase):
     def test_cli_writes_html_by_default_and_mermaid_on_request(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "project"
-            storage = Path(td) / "memory.reql"
+            storage = root / ".reql" / "memory.reql"
             graph = self._graph_with_shared_pipeline(root, storage)
             graph.close()
             (root / "pipeline.html").write_text("stale export", encoding="utf-8")
+            original_directory = Path.cwd()
+            try:
+                os.chdir(root)
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with patch.object(cli_mod.sys, "stdout", stdout), patch.object(cli_mod.sys, "stderr", stderr):
+                    result = cli_mod.main(["project", "pipeline"])
+                html_path = root / "pipeline.html"
+                self.assertEqual(result, 0, stderr.getvalue())
+                self.assertTrue(html_path.exists())
+                self.assertNotIn("stale export", html_path.read_text(encoding="utf-8"))
+                self.assertEqual(stdout.getvalue().strip(), str(html_path.resolve()))
 
-            stdout = io.StringIO()
-            stderr = io.StringIO()
-            with patch.object(cli_mod.sys, "stdout", stdout), patch.object(cli_mod.sys, "stderr", stderr):
-                result = cli_mod.main(["--storage", str(storage), "project", "pipeline", str(root)])
-            html_path = root / "pipeline.html"
-            self.assertEqual(result, 0, stderr.getvalue())
-            self.assertTrue(html_path.exists())
-            self.assertNotIn("stale export", html_path.read_text(encoding="utf-8"))
-            self.assertEqual(stdout.getvalue().strip(), str(html_path.resolve()))
-
-            output_dir = Path(td) / "exports"
-            stdout = io.StringIO()
-            stderr = io.StringIO()
-            with patch.object(cli_mod.sys, "stdout", stdout), patch.object(cli_mod.sys, "stderr", stderr):
-                result = cli_mod.main(
-                    ["--storage", str(storage), "project", "pipeline", str(root), "--code", "--out", str(output_dir)]
-                )
-            mermaid_path = output_dir / "pipeline.mmd"
-            self.assertEqual(result, 0, stderr.getvalue())
-            self.assertTrue(mermaid_path.exists())
-            self.assertIn("flowchart LR", mermaid_path.read_text(encoding="utf-8"))
-            self.assertEqual(stdout.getvalue().strip(), str(mermaid_path.resolve()))
+                output_dir = Path(td) / "exports"
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with patch.object(cli_mod.sys, "stdout", stdout), patch.object(cli_mod.sys, "stderr", stderr):
+                    result = cli_mod.main(["project", "pipeline", "--code", "--out", str(output_dir)])
+                mermaid_path = output_dir / "pipeline.mmd"
+                self.assertEqual(result, 0, stderr.getvalue())
+                self.assertTrue(mermaid_path.exists())
+                self.assertIn("flowchart LR", mermaid_path.read_text(encoding="utf-8"))
+                self.assertEqual(stdout.getvalue().strip(), str(mermaid_path.resolve()))
+            finally:
+                os.chdir(original_directory)
 
     def test_cli_rejects_conflicting_formats_and_incompatible_extensions(self) -> None:
         parser = cli_mod.build_parser()
         with self.assertRaises(SystemExit):
-            parser.parse_args(["project", "pipeline", ".", "--code", "--html"])
+            parser.parse_args(["project", "pipeline", "--code", "--html"])
 
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "project"
-            storage = Path(td) / "memory.reql"
+            storage = root / ".reql" / "memory.reql"
             graph = self._empty_project_graph(root, storage)
             graph.close()
-            stdout = io.StringIO()
-            stderr = io.StringIO()
-            with patch.object(cli_mod.sys, "stdout", stdout), patch.object(cli_mod.sys, "stderr", stderr):
-                result = cli_mod.main(
-                    ["--storage", str(storage), "project", "pipeline", str(root), "--code", "--out", str(Path(td) / "wrong.html")]
-                )
-            self.assertEqual(result, 2)
-            self.assertIn("must use one of", stderr.getvalue())
+            original_directory = Path.cwd()
+            try:
+                os.chdir(root)
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with patch.object(cli_mod.sys, "stdout", stdout), patch.object(cli_mod.sys, "stderr", stderr):
+                    result = cli_mod.main(["project", "pipeline", "--code", "--out", str(Path(td) / "wrong.html")])
+                self.assertEqual(result, 2)
+                self.assertIn("must use one of", stderr.getvalue())
 
-            html_file = cli_mod._project_pipeline_output_path(
-                str(Path(td) / "custom.htm"),
-                project_root=root,
-                output_format="html",
-            )
-            mermaid_file = cli_mod._project_pipeline_output_path(
-                str(Path(td) / "custom.mermaid"),
-                project_root=root,
-                output_format="mermaid",
-            )
-            self.assertEqual(html_file.suffix, ".htm")
-            self.assertEqual(mermaid_file.suffix, ".mermaid")
-
-            missing_output = Path(td) / "missing-output.html"
-            stdout = io.StringIO()
-            stderr = io.StringIO()
-            with patch.object(cli_mod.sys, "stdout", stdout), patch.object(cli_mod.sys, "stderr", stderr):
-                result = cli_mod.main(
-                    [
-                        "--storage",
-                        str(storage),
-                        "project",
-                        "pipeline",
-                        str(Path(td) / "not-registered"),
-                        "--out",
-                        str(missing_output),
-                    ]
+                html_file = cli_mod._project_pipeline_output_path(
+                    str(Path(td) / "custom.htm"),
+                    project_root=root,
+                    output_format="html",
                 )
-            self.assertEqual(result, 2)
-            self.assertIn("Project not found", stderr.getvalue())
-            self.assertFalse(missing_output.exists())
+                mermaid_file = cli_mod._project_pipeline_output_path(
+                    str(Path(td) / "custom.mermaid"),
+                    project_root=root,
+                    output_format="mermaid",
+                )
+                self.assertEqual(html_file.suffix, ".htm")
+                self.assertEqual(mermaid_file.suffix, ".mermaid")
+
+                missing_root = Path(td) / "not-registered"
+                missing_root.mkdir()
+                missing_output = Path(td) / "missing-output.html"
+                os.chdir(missing_root)
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with patch.object(cli_mod.sys, "stdout", stdout), patch.object(cli_mod.sys, "stderr", stderr):
+                    result = cli_mod.main(["project", "pipeline", "--out", str(missing_output)])
+                self.assertEqual(result, 2)
+                self.assertIn("Project not found", stderr.getvalue())
+                self.assertFalse(missing_output.exists())
+            finally:
+                os.chdir(original_directory)
 
     @classmethod
     def _graph_with_shared_pipeline(cls, root: Path, storage: Path) -> MemoryGraph:

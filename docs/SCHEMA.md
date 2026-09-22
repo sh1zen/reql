@@ -61,7 +61,7 @@ canonical edge record remains `from_id -> to_id`.
 - `RawEvent`: underlying document observation used as evidence for terms.
 - `ArtifactCacheEntry`: successful artifact compilation fingerprint.
 - `CompilationRun`: one incremental compilation invocation.
-- `GraphDelta`: change trace for a compile/update run.
+- `GraphDelta`: change trace for a compilation run.
 - `ProjectRevision`: immutable content-addressed project tree metadata with its
   parent id, manifest hashes, and changed paths.
 - `Community`: topological cluster written by deterministic community

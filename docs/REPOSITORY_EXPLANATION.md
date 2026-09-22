@@ -19,10 +19,10 @@ Compile the repository once, then request an overview or focus the explanation
 on a feature, behavior, or business concept:
 
 ```bash
-reql project compile .
-reql project explain .
-reql project explain . --focus "order refund"
-reql project explain . --focus "order refund" --json
+reql project compile
+reql project explain
+reql project explain --focus "order refund"
+reql project explain --focus "order refund" --json
 ```
 
 The Python facade exposes the same projection:

@@ -335,7 +335,7 @@ class BlockStorageTests(unittest.TestCase):
                 self.assertIn("duration=", message)
                 self.assertIn("process_alive=true", message)
                 self.assertIn("watcher=false", message)
-                self.assertIn("--snapshot", message)
+                self.assertIn("automatically fall back to the latest complete snapshot", message)
                 with self.assertRaises(StorageError):
                     BlockGraphStore(path, read_only=True, lock_timeout_seconds=0.0)
             finally:
@@ -376,7 +376,7 @@ class BlockStorageTests(unittest.TestCase):
                         "host": block_store_module.socket.gethostname(),
                         "token": "dead-owner",
                         "created_at": block_store_module.utcnow_iso(),
-                        "command": "reql project compile .",
+                        "command": "reql project compile",
                         "watcher": False,
                     }
                 ),

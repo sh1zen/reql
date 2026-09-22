@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 from pathlib import Path
 
 from memory.artifacts.scanner import ProjectScanner
-from memory.cli import _append_config_exclude_patterns
+from memory.cli import build_parser, main
 from memory.config import (
     ConfigError,
     default_config,
@@ -62,7 +65,7 @@ class ScanExcludeRuleTests(unittest.TestCase):
 
 class ProjectScannerExclusionTests(unittest.TestCase):
     def test_anchor_is_relative_to_config_directory_not_compile_root(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(dir=Path.cwd() / ".tmp") as td:
             project = Path(td) / "project"
             compiled_subpath = project / "service"
             compiled_subpath.mkdir(parents=True)
@@ -81,7 +84,7 @@ class ProjectScannerExclusionTests(unittest.TestCase):
             self.assertNotIn("everywhere.py", included)
 
     def test_anchoring_depth_and_final_suffix_share_one_matching_model(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(dir=Path.cwd() / ".tmp") as td:
             root = Path(td) / "project"
             root.mkdir()
             config_path = root / "reql.conf"
@@ -145,7 +148,7 @@ class ProjectScannerExclusionTests(unittest.TestCase):
             self.assertNotIn("scoped/deeper/root.cache", included)
 
     def test_nested_config_exclusions_apply_only_to_their_subtree(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(dir=Path.cwd() / ".tmp") as td:
             root = Path(td) / "project"
             module = root / "module"
             module.mkdir(parents=True)
@@ -201,7 +204,7 @@ class ProjectScannerExclusionTests(unittest.TestCase):
                 self.assertNotIn(path, included)
 
     def test_invalid_nested_config_stops_the_scan(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(dir=Path.cwd() / ".tmp") as td:
             root = Path(td) / "project"
             nested = root / "nested"
             nested.mkdir(parents=True)
@@ -219,12 +222,32 @@ class ProjectScannerExclusionTests(unittest.TestCase):
 
 
 class ConfigExclusionValidationTests(unittest.TestCase):
+    def test_config_set_creates_and_updates_the_local_config(self) -> None:
+        with tempfile.TemporaryDirectory(dir=Path.cwd() / ".tmp") as td:
+            root = Path(td)
+            original_directory = Path.cwd()
+            output = StringIO()
+            error = StringIO()
+            try:
+                os.chdir(root)
+                with redirect_stdout(output), redirect_stderr(error):
+                    self.assertEqual(main(["config", "set", "retention.agent_sessions", "7"]), 0)
+                    self.assertEqual(main(["config", "set", "retention.agent_sessions", "5"]), 0)
+                    self.assertEqual(main(["config", "set", "retention.unknown", "1"]), 2)
+            finally:
+                os.chdir(original_directory)
+
+            self.assertEqual(load_effective_config(root / "reql.conf", env={}).retention.agent_sessions, 5)
+            self.assertIn("Updated", output.getvalue())
+            self.assertIn("Unknown config option: retention.unknown", error.getvalue())
+
     def test_retention_defaults_and_overrides_are_validated(self) -> None:
         config = default_config()
 
         self.assertEqual(config.retention.commits, 20)
         self.assertEqual(config.retention.agent_sessions, 20)
         self.assertEqual(merge_config(config, {"retention.commits": 5}).retention.commits, 5)
+        self.assertEqual(merge_config(config, {"retention.agent_sessions": 5}).retention.agent_sessions, 5)
         with self.assertRaisesRegex(
             ValueError,
             "retention.commits must be greater than zero",
@@ -239,7 +262,7 @@ class ConfigExclusionValidationTests(unittest.TestCase):
             merge_config(config, {"retention.agent_sessions": -1})
 
     def test_config_merge_deduplicates_equivalent_rules_but_keeps_anchor(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(dir=Path.cwd() / ".tmp") as td:
             config_path = Path(td) / "reql.conf"
             config_path.write_text("scan:\n  exclude:\n    - .git\n    - ./.git/\n", encoding="utf-8")
 
@@ -249,24 +272,17 @@ class ConfigExclusionValidationTests(unittest.TestCase):
             self.assertIn("./.git/", config.scan.exclude)
 
     def test_root_config_rejects_unsupported_exclusion_format(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
+        with tempfile.TemporaryDirectory(dir=Path.cwd() / ".tmp") as td:
             config_path = Path(td) / "reql.conf"
             config_path.write_text("scan:\n  exclude:\n    - file?.py\n", encoding="utf-8")
 
             with self.assertRaisesRegex(ConfigError, "Invalid scan.exclude pattern"):
                 load_effective_config(config_path, env={})
 
-    def test_project_exclude_preserves_anchor_semantics_when_deduplicating(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            result = _append_config_exclude_patterns(td, ["dir/", "./dir", "*.tmp"])
-            self.assertEqual(result["added"], ["dir/", "./dir", "*.tmp"])
-
-            repeated = _append_config_exclude_patterns(td, ["dir", "./dir/"])
-            self.assertEqual(repeated["added"], [])
-            self.assertEqual(repeated["skipped"], ["dir", "./dir/"])
-
-            with self.assertRaisesRegex(ValueError, "Invalid scan.exclude pattern"):
-                _append_config_exclude_patterns(td, ["dir/**"])
+    def test_removed_project_commands_are_not_registered(self) -> None:
+        for arguments in (("project", "exclude", "dir/"), ("project", "update")):
+            with self.subTest(arguments=arguments), self.assertRaises(SystemExit):
+                build_parser().parse_args(list(arguments))
 
 
 if __name__ == "__main__":

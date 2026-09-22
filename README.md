@@ -17,7 +17,7 @@ Repository facts remain exclusively in the canonical project graph.
 repository discovery and more tokens on the actual change. Bounded retrieval
 returns the files, symbols, relationships, and source spans that matter for the
 current task, while Agent Workspace preserves the task map, decisions, risks,
-and handoffs needed to reason through complex or large implementations across
+and finish messages needed to reason through complex or large implementations across
 context windows.
 
 The important part is that REQL gives the agent deterministic repository memory
@@ -38,7 +38,7 @@ before and during edits:
 - every result can point back to paths, line ranges, relationships, evidence,
   and graph provenance instead of relying on broad source dumps;
 - `reql agent` maintains per-agent working memory for plans, findings,
-  decisions, tasks, risks, file links, and handoffs without changing the
+  decisions, tasks, risks, and finish messages without changing the
   canonical project graph;
 - compact context and saved working maps reduce repeated source reading, which
   helps preserve token budget and keeps large, multi-step tasks coherent;
@@ -81,10 +81,10 @@ The commands below are the operations the agent integration uses to bootstrap
 context, retrieve focused evidence, and keep working memory:
 
 ```bash
-reql project compile .
-reql project explain . --focus "payment workflow"
-reql project pipeline .
-reql project pipeline . --code
+reql project compile
+reql project explain --focus "payment workflow"
+reql project pipeline
+reql project pipeline --code
 reql query_context --query "payment service"
 reql query_memories --query "payment service" --limit 8 --json
 reql query_explore --query "payment service serialization" --view owners --view code
@@ -106,63 +106,50 @@ Agent Workspace commands store the agent's session-scoped working state while
 it implements, reviews, or documents a repository:
 
 ```bash
-reql agent init
+reql agent init --name "Focused implementation pass"
 reql agent dashboard
-reql agent dashboard --post "verify: focused tests passed" --kind stage
-reql agent session start "Focused implementation pass"
-reql agent note add "Read src/memory/cli.py and found the argparse command surface"
+reql agent note "Read src/memory/cli.py and found the argparse command surface"
+reql agent note --public "Parser API now returns a document result"
+reql agent note --agent agent:reviewer "Check the updated parser return type"
 reql agent task add "Implement the reset behavior"
-reql agent decision add "Keep agent memory in .reql/agent.reql"
-reql agent link TASK_ID DECISION_ID --relation implements
-reql agent batch --link-many TASK_ID depends_on DECISION_ID,RISK_ID
-reql agent batch --json agent-ops.json
-reql agent batch --task task="Patch CLI" --decision decision="Use one workspace lock" --link '$task' implements '$decision'
-reql agent handoff "Implementation notes ready for master review"
-reql agent export --json
-reql agent export --json --metadata
+reql agent task list
+reql agent task done TASK_ID "Reset behavior implemented and tests pass"
+reql agent finish "Implementation notes ready for master review"
+reql agent list
+reql agent terminate agent:stale-worker
+reql agent search "parser return type"
 ```
 
-`reql agent init` is idempotent and selects private memory from the stable
-activity or thread id supplied by the integration. Explicit
-`reql agent --agent AGENT_ID ...` or `REQL_AGENT_ID=AGENT_ID` takes precedence; all agents can
-read `reql agent bus`, publish shared messages, and use `reql agent handoff` to
-return a compact saved working-map snapshot to the master. `agent bus --json`
-omits handoff payload snapshots by default; pass `--include-payloads` only when
-the full saved handoff maps are needed. Use `agent map` only to recover context
-after compaction, a handoff, context loss, or a long pause; do not print it
-before and after routine edits. `agent map`, `agent search`, and `agent export`
-omit metadata by default. Pass `--metadata` only when timestamps or stored
-operational metadata are needed.
+`reql agent init` creates or resumes the selected private dashboard and marks
+the agent active. Explicit `reql agent --agent AGENT_ID ...` or
+`REQL_AGENT_ID=AGENT_ID` takes precedence over a stable activity or thread id.
+Use `reql agent dashboard` for the public dashboard and the selected private
+dashboard; use `reql agent --agent "agent:AGENT_ID" dashboard` to view another
+agent's private dashboard when permitted.
 
-`REQL_AGENT_ACTIVITY_ID`, `CODEX_THREAD_ID`, or `--activity` deterministically
-selects a project-scoped private workspace as well as its current session. If
-several agents are registered and no stable identity is available, REQL rejects
-the ambiguous invocation instead of using another agent's workspace. Use
-`reql agent dashboard --agents` only when detailed cross-store agent state is
-needed beyond the dashboard's compact active/finished roster.
+The public dashboard contains the agent roster, coordination-safe active-task
+summaries, shared context, and drill information. A private dashboard contains
+the complete task list, private notes, and directed external notes. Public
+notes, task-completion messages, and finish messages are all timestamped shared
+context. Private history remains intact after `finish` or `terminate`.
 
-`reql agent dashboard` is the routine compact coordination surface for
-intra-session, inter-session, and parallel work. It can publish one shared
-pipeline checkpoint with `--post`, then returns active work, the latest prior
-session, recent durable memory, currently working agents, relevant bus signals,
-and exact drill-down commands. Posts are capped at 240 characters; durable
-detail stays in tasks, decisions, findings, plans, and handoffs. Every agent
-runs `reql agent finish "<compact outcome>"` when its pass ends so peers see it
-leave the working roster. Finish deletes the private agent store after
-publishing its compact handoff; reuse of the same identity starts with
-`reql agent init`.
+`reql agent finish "<outcome>"` closes the current session, marks the agent
+finished, and publishes its supplied message as shared context. `reql agent
+terminate AGENT_ID` performs the same lifecycle cleanup for a stale agent,
+while preserving all task, note, and dashboard history.
 
-Detailed agent state, bus updates, and multi-target links use
-`dashboard --agents`, `dashboard --post`, and `batch --link-many` respectively.
-Operational notes use the typed `agent note add` command.
+`reql agent list` returns active agents by default; add `--all` for finished
+and terminated agents. `reql agent search QUERY` searches public context and
+permitted private dashboard history, returning timestamp, agent id, and enough
+context to explain each match.
 
-`reql agent reset` discards agent-created notes, tasks, decisions, findings,
-plans, risks, sessions, and their relationships. It never reads or modifies
-the canonical project graph.
+Use `agent note TEXT` for a private self-note, `agent note --agent AGENT_ID
+TEXT` to send a private note to another agent, and `agent note --public TEXT`
+to publish shared context. Tasks remain private to their owner; only a task's
+completion message becomes public.
 
-Recovery maps contain only durable knowledge recorded by the agent and compact
-summaries of the current and five most recent previous sessions. JSON consumers
-read these from `context.learned` and `context.sessions`.
+`reql agent reset` discards the selected agent's dashboard history. It never
+reads or modifies the canonical project graph.
 
 Context results use schema version 2. Alongside the query-specific
 `graph_revision`, they report the committed `source_revision` and freshness
@@ -173,7 +160,7 @@ From a source checkout, `python cli.py ...` exposes the same command surface
 without requiring an editable install:
 
 ```bash
-python cli.py project compile .
+python cli.py project compile
 python cli.py query_context --query "payment service"
 ```
 
@@ -199,22 +186,25 @@ Start MCP when an integration needs a tool server:
 reql-mcp --read-only
 ```
 
-Project/cache commands and `reql storage clear [PATH]` default storage to
-`<project>/.reql/memory.reql`; other commands default to
+Project/cache commands and `reql storage clear` default storage to
+`./.reql/memory.reql`; other commands default to
 `./.reql/memory.reql`. `storage clear` rebuilds that store from the current
-project tree and discards historical or archived graph state. Use `--storage`,
-`--config`, `--set`, and `--json` for automation. See [docs/CLI.md](docs/CLI.md)
+project tree and discards historical or archived graph state. Use `--json` for
+automation. See [docs/CLI.md](docs/CLI.md)
 for the complete command reference, query modes, install behavior, MCP startup,
 config lookup, reports, exports, and maintenance workflows.
 
+Use `reql config set OPTION VALUE` to add or update a validated setting in the
+local `./reql.conf`, for example `reql config set retention.agent_sessions 30`.
+
 Automatic project maintenance uses `retention.commits` from `reql.conf`
-(default `20`). A REQL commit is a successful compile/update that changes the
+(default `20`). A REQL commit is a successful compilation that changes the
 project manifest and creates a `ProjectRevision`; clean compile invocations do
 not advance retention. When the limit is exceeded, REQL removes history,
 archived records, and project-owned usage entries older than the oldest retained
 commit while preserving the active graph. Agent coordination records retain
 the latest `retention.agent_sessions` completed sessions (default `20`), and
-finish removes the completed agent's private store immediately.
+finish preserves the completed agent's private dashboard history.
 
 ## Features
 
@@ -223,9 +213,9 @@ finish removes the completed agent's private store immediately.
 - Compact `query_context`, `query_explore`, `query_graph`, and `query_memories`
   outputs for coding-agent workflows, including owner symbols, bounded source
   ranges, and associated test targets.
-- Separate `reql agent` operational memory for notes, tasks, decisions,
-  findings, plans, risks, sessions, and handoffs. It contains no copied project,
-  file, symbol, or canonical graph records.
+- Separate `reql agent` dashboard state for sessions, private tasks, private
+  and external notes, public notes, completion messages, and finish messages.
+  It contains no copied project, file, symbol, or canonical graph records.
 - Local block-file persistence with fixed-size pages, compressed records,
   reader/writer lock diagnostics, safe stale-lock recovery, read-only snapshots,
   transactions, compaction, and atomic clean rebuilds.
@@ -270,9 +260,9 @@ REQL works as a local repository index backed by a property graph:
 - `project pipeline` follows every detected entrypoint through project-local
   flow relations, collapses symbols into shared architectural components, and
   writes an interactive `pipeline.html` or Mermaid `pipeline.mmd`;
-- `project update` and watch mode reuse the same incremental compiler and write
-  `CompilationRun`, `GraphDelta`, and cache records for changed or deleted
-  artifacts.
+- `project compile` and watch mode reuse the same incremental compiler and
+  write `CompilationRun`, `GraphDelta`, and cache records for changed or
+  deleted artifacts.
 
 The core path is deterministic and local. Optional semantic adapters can exist
 at integration boundaries, but project compilation, storage, retrieval, reports,
@@ -309,7 +299,7 @@ The menu guides these workflows:
 For command-line automation, use `python cli.py ...` or `reql`:
 
 ```bash
-reql project compile .
+reql project compile
 reql query_memories --query "payment service" --limit 5 --json
 reql query "FIND nodes WHERE type = 'Function' LIMIT 10"
 ```

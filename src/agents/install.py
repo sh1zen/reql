@@ -821,16 +821,16 @@ def _gemini_hook() -> dict[str, object]:
 def _python_hook_command(platform_name: str) -> str:
     message = (
         f"{HOOK_ID}: REQL graph context may be available. "
-        "For repository context, run `reql project status .`, then build a query from the user request's own feature, "
+        "For repository context, run `reql project status`, then build a query from the user request's own feature, "
         "behavior, file, command, error, field, endpoint, API, or symbol terms; preserve the user's language, "
         "identifiers, and exact errors. Use commands such as "
         "`reql query_memories --query \"<terms from user request>\"`, "
         "`reql query_context --query \"<terms from user request>\"`, or "
         "`reql query_explore --query \"<terms from user request>\"` for repository context; do not duplicate that context with broad "
         "`rg`, recursive directory listings, or custom scanners. If status reports "
-        "`Project not found`, immediately run `reql project compile .` before broad raw file exploration. "
-        "For automatic memory updates during active work, run one `reql project compile . --watch` monitor from the workspace after approval. "
-        "If no watch process is running, run `reql project compile .` once after modifying project files before finishing."
+        "`Project not found`, immediately run `reql project compile` before broad raw file exploration. "
+        "For automatic memory updates during active work, run one `reql project compile --watch` monitor from the workspace after approval. "
+        "If no watch process is running, run `reql project compile` once after modifying project files before finishing."
     )
     if platform_name == "gemini":
         payload = {"decision": "allow", "additionalContext": message}

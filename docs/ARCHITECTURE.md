@@ -186,34 +186,33 @@ Mermaid or as an embedded-data `vis-network` HTML file.
 
 ## Agent Operational Memory
 
-`reql agent` is a separate operational-memory boundary for decisions, tasks,
-plans, findings, risks, sessions, and handoffs. It does not derive from, copy,
-query, or synchronize canonical project nodes. Relationships created through
-agent commands may connect only records owned by that same private agent store.
+`reql agent` is a separate dashboard-centric coordination boundary for agent
+sessions, private tasks, private notes, directed notes, and public context. It
+does not derive from, copy, query, or synchronize canonical project nodes.
 
 The canonical project graph remains the sole owner of repository identity,
 files, symbols, source spans, dependencies, and code relationships. Coding
 agents obtain those facts through the normal project query APIs, never through
 their operational memory.
 
-`reql agent dashboard` is a bounded read projection over the selected private
-store and shared bus. It may publish one short bus checkpoint before reading,
-but never persists a second dashboard model. The projection separates active
-and completed agent identities, carries one previous-session summary for
-inter-session continuity, and points deeper reads back to the authoritative
-private item, session map, handoff payload, or canonical project query.
-`reql agent finish` publishes the final handoff, closes the current session,
-changes the bus identity from active to completed, and deletes the private
-agent store and sidecars. The compact bus handoff remains available while its
-session is among the latest `retention.agent_sessions`; reusing the identity
-requires `agent init`. Init and finish also remove completed private stores and
-prune older completed-session bus records without touching active or
-unregistered stores.
+The public dashboard is persisted at `.reql/agent-dashboard.reql` and owns the
+registered-agent roster, coordination-safe active-task summaries, and shared
+context. Shared context records carry a timestamp, agent id, message type, and
+content; finish messages, public notes, and task-completion messages are all
+records in this section. Each agent's private dashboard remains under
+`.reql/agents/` and owns its complete tasks, private notes, external notes, and
+session history.
 
-The canonical CLI writes typed notes through `agent note add` and `note.add`
-batch operations. `dashboard --agents` owns explicit cross-store inspection,
-`dashboard --post` owns bus updates, and `batch --link-many` owns multi-target
-links.
+`reql agent init` creates or resumes the selected private dashboard, creates a
+session if necessary, and registers the agent as active. `reql agent finish
+MESSAGE` closes that session, marks the agent finished, and appends MESSAGE to
+public context without deleting private history. `reql agent terminate AGENT_ID`
+does the same lifecycle cleanup for stale agents while preserving their tasks
+and notes. The dashboard is the persistent coordination layer.
+
+The canonical CLI writes dashboard notes through `agent note TEXT`,
+`agent note --agent AGENT_ID TEXT`, and `agent note --public TEXT`.
+The dashboard owns cross-agent inspection and public coordination context.
 
 ## Maintenance
 
@@ -227,7 +226,7 @@ activation and usage signals
 Salience ranks project and source graph records from structural, retrieval, and
 usage signals.
 
-After each successful compile/update that creates a changed-manifest
+After each successful compilation that creates a changed-manifest
 `ProjectRevision`, project-scoped retention keeps the latest
 `retention.commits` REQL commits and removes run, delta, revision, archived
 graph, and usage-journal data before that commit boundary. It preserves the
@@ -241,6 +240,6 @@ Graph analysis remains deterministic: community detection, hub analysis, and
 cleanup findings are graph algorithms with no required LLM or external graph
 database. Project compilation stays on the parser and code/document graph path.
 
-`project compile . --watch` is a `watchdog` filesystem monitor over the same
+`project compile --watch` is a `watchdog` filesystem monitor over the same
 incremental compiler and cache. It uses the same compile pipeline as one-shot
 compile, so CLI, API, and MCP updates stay consistent.

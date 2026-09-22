@@ -17,6 +17,7 @@ from .loader import (
     parse_config_override_assignments,
     parse_config_overrides,
     resolve_config_path,
+    set_local_config_option,
     write_sample_config,
 )
 from .models import (
@@ -71,6 +72,7 @@ __all__ = [
     "parse_config_override_assignments",
     "parse_config_overrides",
     "resolve_config_path",
+    "set_local_config_option",
     "resolve_scan_exclude_pattern",
     "write_sample_config",
 ]

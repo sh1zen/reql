@@ -42,18 +42,21 @@ PROJECT_SKILL_SOURCE = SkillSource(
         "and load detailed guidance only when its trigger occurs."
     ),
     command_examples=(
-        CommandExample("project status .", "check whether this project has a compiled REQL graph"),
-        CommandExample("project compile .", "bootstrap or refresh the graph, including once after edits"),
+        CommandExample("project status", "check whether this project has a compiled REQL graph"),
+        CommandExample("project compile", "bootstrap or refresh the graph, including once after edits"),
         CommandExample('query_context --query "<terms from user request>"', "compact informative context"),
         CommandExample('query_context --query "<terms from user request>" --code', "compact code-scoped context with files, owner symbols, line ranges, and associated tests"),
-        CommandExample("agent status", "check whether optional durable planning is already initialized"),
+        CommandExample("agent dashboard", "read shared coordination context and the current private dashboard"),
+        CommandExample("agent list", "list active agents coordinating in this workspace"),
     ),
     workflow_steps=(
         (
-            "Run `{command_name} project status .`; if the graph is missing or stale, stop and use the matching route below."
+            "Run `{command_name} project status`; if the graph is missing or stale, stop and use the matching route below."
         ),
         (
-            "For nontrivial, resumed, or coordinated work, run `{command_name} agent dashboard`; use its compact intra/inter-session signals and follow only relevant drill-downs."
+            "For nontrivial, resumed, or coordinated work, run `{command_name} agent dashboard` before repository discovery. "
+            "On resumption, use the public Context and the relevant private dashboard to recover prior work before querying "
+            "only the relevant canonical code facts."
         ),
         (
             "On an active graph, run `{command_name} query_context --query \"<user terms>\"` with `--code`, `--docs`, or `--test` only when needed."
@@ -66,7 +69,7 @@ PROJECT_SKILL_SOURCE = SkillSource(
             "Edit the existing owner, preserve public contracts, and run the repository's documented tests."
         ),
         (
-            "After changing files, run `{command_name} project watch-status . --json`; if it reports `running`, wait for the watcher to refresh the graph, otherwise run `{command_name} project compile .` before the final response."
+            "After changing files, run `{command_name} project watch-status --json`; if it reports `running`, wait for the watcher to refresh the graph, otherwise run `{command_name} project compile` before the final response."
         ),
         (
             "Before ending any initialized Agent Workspace pass, run `{command_name} agent finish \"<compact outcome>\"` so other sessions stop treating this agent as active."
@@ -74,8 +77,8 @@ PROJECT_SKILL_SOURCE = SkillSource(
     ),
     rule_points=(
         (
-            "Prefer `{command_name}`; fall back to `{command_path}`, then `{fallback_command}`. Start with `project status .`; "
-            "bootstrap with `project compile .` only when the project is missing."
+            "Prefer `{command_name}`; fall back to `{command_path}`, then `{fallback_command}`. Start with `project status`; "
+            "bootstrap with `project compile` only when the project is missing."
         ),
         (
             "Query the active graph with terms from the user's request and let its paths, owners, spans, and associated tests define the "
@@ -83,16 +86,17 @@ PROJECT_SKILL_SOURCE = SkillSource(
         ),
         (
             "Only after the current task changes project files, run documented tests, then let an existing watcher refresh the graph or "
-            "run one `project compile .`. Skip both `watch-status` and compile for read-only tasks. Do not start watch mode unless "
+            "run one `project compile`. Skip both `watch-status` and compile for read-only tasks. Do not start watch mode unless "
             "continuous monitoring was requested."
         ),
         (
-            "In the final handoff, report versioned files, updated symbols, associated tests, and test results. Keep any required personal "
+            "In the final response, report versioned files, updated symbols, associated tests, and test results. Keep any required personal "
             "`config.json` action separate and never edit that file unless requested."
         ),
         (
-            "For nontrivial, resumed, or coordinated work, use `agent dashboard` as the compact entry point, persist durable pipeline "
-            "state in Agent Workspace, and follow dashboard drill-downs when more context is needed. Keep canonical project facts in the standard graph."
+            "For nontrivial, resumed, or coordinated work, use `agent dashboard` as the compact entry point before repository discovery. "
+            "On resumption, use public Context and the relevant private dashboard to recover the latest completed work before querying "
+            "canonical code facts. Persist durable pipeline state through agent tasks and notes, and keep canonical project facts in the standard graph."
         ),
         "Load only the generated `references/` file relevant to the current special case; do not preload or restate all references.",
     ),
@@ -192,7 +196,7 @@ def _reference_routing(source_name: str) -> str:
             "- Watch/compile troubleshooting, custom storage, cache, deltas, or special local configuration -> `references/update-watch.md`.",
             "- Reports, exports, hubs, communities, or MCP -> `references/reports-exports.md`.",
             "- Document ingestion or local processing -> `references/document-semantics.md`.",
-            "- Durable planning, compaction/handoff recovery, or `reql agent` -> `references/agent-workspace.md`.",
+            "- Durable planning, dashboard recovery, or `reql agent` -> `references/agent-workspace.md`.",
         ]
     )
 
@@ -223,7 +227,7 @@ Load this when checking whether a workspace already has REQL graph context, when
 Start repository discovery here:
 
 ```bash
-{command_name} project status .
+{command_name} project status
 ```
 
 If status succeeds, treat `.reql/memory.reql` as the repository context index. Do not rebuild just because the user asked a natural-language codebase question. Query the graph until it identifies the relevant paths and spans, then read exact files only when edits, debugging, or tests require them.
@@ -233,7 +237,7 @@ If status succeeds, treat `.reql/memory.reql` as the repository context index. D
 If status reports `Project not found`, run a one-shot compile from the runtime workspace root:
 
 ```bash
-{command_name} project compile .
+{command_name} project compile
 ```
 
 The one-shot bootstrap is allowed without asking again because the installed workflow selected REQL project mode. If compile fails, report the error briefly and continue from the smallest source locations implied by the request.
@@ -246,19 +250,15 @@ Once the graph identifies specific paths or spans, inspect only those locations 
 
 ## Exclusions
 
-Do not add exclusions before the first bootstrap compile unless the user asked for them or the path is an obvious dependency/cache/build-output directory such as `node_modules/`, `vendor/`, `.tmp/`, `dist/`, or `build/`.
-
-Use one command with all patterns:
-
-```bash
-{command_name} project exclude "path/or/*.suffix" "another/path/"
-```
-
-Use `./` only for rules anchored to the config directory; omit it to match at any depth. The only wildcard form is `*suffix` in the final segment. Never use workspace-wide patterns such as `*`, `**`, or `**/*`. Never exclude source/framework roots needed for the task just to make indexing smaller.
+Configure additional compile exclusions in the project's `reql.conf` under
+`scan.exclude`. Use `./` only for rules anchored to the config directory; omit
+it to match at any depth. The only wildcard form is `*suffix` in the final
+segment. Never use workspace-wide patterns such as `*`, `**`, or `**/*`. Never
+exclude source/framework roots needed for the task just to make indexing smaller.
 
 ## Configuration
 
-Project commands search for `reql.conf` from the target path upward and join its lists with protected internal defaults. Use `--config path/to/reql.conf` or repeated global `--set section.option=value` only when the task needs a different configuration. The core compile path must remain deterministic and usable without model providers.
+Project commands search for `reql.conf` from the target path upward and join its lists with protected internal defaults. Keep the core compile path deterministic and usable without model providers.
 
 Installed for: {platform_name} ({scope}).
 """
@@ -416,22 +416,22 @@ Load this only when post-edit refresh does not behave as expected, watcher statu
 Check watcher state through REQL rather than querying the operating-system process table:
 
 ```bash
-{command_name} project watch-status . --json
+{command_name} project watch-status --json
 ```
 
 If the result is `stopped`, refresh the graph with:
 
 ```bash
-{command_name} project compile .
+{command_name} project compile
 ```
 
 This refreshes only changed/deleted artifacts through the incremental cache. If the watcher is `running`, allow it to process the filesystem event instead of starting another compile. For `stale` or `unknown`, inspect the reported lock metadata and use `storage locks`; do not inspect `ps`, `Get-CimInstance`, or equivalent process listings.
 
-When monitor mode uses an explicit global `--storage`, pass the same option to `watch-status`.
+Monitor mode and `watch-status` use the same project-local `.reql/memory.reql` store.
 
 ## Final change classification
 
-Keep repository changes and machine-local setup separate in the handoff:
+Keep repository changes and machine-local setup separate in the final response:
 
 - Under `Versioned functional changes`, list only source, tests, documentation, examples, and versioned configuration templates that changed in the repository.
 - If the implementation adds a required configuration field, verify whether the user's personal `config.json` must supply it. If so, add a separate `Local configuration required` item naming the field path, the expected value or how to obtain it, and the relevant personal config location when known.
@@ -443,31 +443,31 @@ Keep repository changes and machine-local setup separate in the handoff:
 Use watch mode when the user asked for monitoring/continuous REQL updates or a long-running background process is appropriate:
 
 ```bash
-{command_name} project compile . --watch
+{command_name} project compile --watch
 ```
 
 The watcher performs an initial cache check, then compiles only dirty or deleted artifacts. Use bounded options for scripts and tests:
 
 ```bash
-{command_name} project compile . --watch --watch-iterations 1
-{command_name} project compile . --watch --watch-interval 2 --watch-debounce 0.5
+{command_name} project compile --watch --watch-iterations 1
+{command_name} project compile --watch --watch-interval 2 --watch-debounce 0.5
 ```
 
-At any time, `{command_name} project watch-status .` reports `running`, `stopped`, `stale`, or `unknown`, including PID and liveness when available. It reads the lock sidecar directly, so it works while the watcher owns the graph write lock.
+At any time, `{command_name} project watch-status` reports `running`, `stopped`, `stale`, or `unknown`, including PID and liveness when available. It reads the lock sidecar directly, so it works while the watcher owns the graph write lock.
 
-Ask before starting watch mode, manual `project update`, or `cache clear` unless the user explicitly requested that operation.
+Ask before starting watch mode or `cache clear` unless the user explicitly requested that operation.
 
 ## Cache and deltas
 
 Inspect cache state and recent compile changes with:
 
 ```bash
-{command_name} cache status .
+{command_name} cache status
 {command_name} query "DELTAS LIMIT 10"
 {command_name} query "DELTAS WHERE id = 'delta:...' LIMIT 1" --json
 ```
 
-Use `{command_name} project update .` only when the user explicitly asks for a manual incremental refresh of a previously compiled project. Prefer `project compile .` for bootstrap and normal after-edit refresh because it handles both first-time and incremental cases.
+Use `{command_name} project compile` for manual incremental refreshes as well as bootstrap and normal after-edit refreshes.
 """
     reports_exports = f"""# REQL reference: reports, graph analysis, exports, and MCP
 
@@ -478,7 +478,7 @@ Load this when the task needs project reports, graph analysis records, visual ex
 Write project reports with:
 
 ```bash
-{command_name} project report . --output reports/
+{command_name} project report --output reports/
 ```
 
 The report set includes `GRAPH_REPORT.md`, `GRAPH_DELTAS.md`, and `CACHE_REPORT.md`. Use it when the user asks for an audit-style project summary, cache/delta state, symbols, communities, or hubs.
@@ -526,7 +526,7 @@ Project compile is deterministic. Code is parsed structurally. Markdown, plain t
 Compile projects with:
 
 ```bash
-{command_name} project compile .
+{command_name} project compile
 ```
 
 Document fragments are linked back to source artifacts. REQL also runs a local deterministic document processor that emits ranked document terms, raw observation events, term co-occurrence edges, and code links when document text explicitly names code symbols.
@@ -565,188 +565,40 @@ def _agent_workspace_resource(
     usage = _command_usage(command_name=command_name, command_path=command_path, fallback_command=fallback_command)
     agent_workspace = f"""# REQL reference: Agent Workspace
 
-Load this when using `reql agent` to persist coding-agent decisions, tasks, plans, risks, sessions, and work history, or to recover/export/reset that operational memory.
+Load this when using `{command_name} agent` for durable task planning and coordination.
 
 ## Command resolution
 
 {usage}
 
-## Purpose
+## Dashboard model
 
-`{command_name} agent` writes private operational memory selected by explicit agent id or a stable activity/thread id. Worker memories live under `.reql/agents/AGENT_ID.reql`; ambiguous activity-less selection is rejected instead of following a global bus pointer. The canonical project graph remains `.reql/memory.reql` and is the only source of repository, file, symbol, and code-relation facts. Agent memory never copies or synchronizes those records.
+The public dashboard at `.reql/agent-dashboard.reql` is the shared coordination layer. It contains agents, active-task summaries, public context, and drill commands. Each agent has a private dashboard under `.reql/agents/` containing its complete tasks, private notes, external notes, and sessions. The canonical project graph remains the only source of repository facts.
 
-All agents share an internal bus at `.reql/agent-bus.reql`. The bus stores registered agents, short shared messages, and handoffs. Use it to coordinate workers without merging their private operational memories.
-
-Use normal REQL query commands for project facts. Use Agent Workspace mode only as the planning and work-history layer when requirements, choices, and implementation steps need durable memory.
-
-`agent dashboard` is the compact attention index for intra-session and inter-session coordination. It shows active work, the latest previous-session summary, recent durable memory, currently working agents, relevant bus signals, and exact `drill` commands. Read it at the start of nontrivial, resumed, or coordinated work, then follow a drill command only when that item affects the current task.
-
-Store only durable operational memory:
-
-- decisions and why they were made;
-- findings, assumptions, risks, and blockers;
-- tasks, plans, completed work, and follow-up work;
-- relationships among agent-owned tasks, decisions, findings, notes, plans, and risks.
-
-## Bootstrap
-
-Check state:
+## Workflow
 
 ```bash
-{command_name} agent status
-```
-
-Initialize private operational memory:
-
-```bash
-{command_name} agent init
+{command_name} agent init --name "Focused implementation pass"
+{command_name} agent task add "Patch serializer error handling"
+{command_name} agent note "Check caller contracts first"
+{command_name} agent note --agent AGENT_ID "The parser API now returns ParseResult"
+{command_name} agent note --public "Use parse_document_v2 for new work"
+{command_name} agent task done TASK_ID "Serializer fix completed and tests are passing."
 {command_name} agent dashboard
+{command_name} agent finish "Focused tests passed; serializer fix is ready."
 ```
 
-`agent init` is idempotent and registers the selected private memory on the shared bus. `REQL_AGENT_ID`/`--agent` has highest precedence; otherwise `REQL_AGENT_ACTIVITY_ID`, `CODEX_THREAD_ID`, or `--activity` derives a stable project-scoped id. Request detailed cross-store worker state only when the compact roster is insufficient:
+`init` creates or resumes the selected session and registers the agent active. `finish` closes the session, marks the agent finished, and publishes its message as public context without deleting private history. Use `agent terminate AGENT_ID` for stale sessions.
+
+`agent list` returns active agents; add `--all` for finished and terminated agents. `agent search QUERY` searches public context and permitted private dashboard history. `agent dashboard` shows the public dashboard plus the selected private dashboard; use `--agent "agent:AGENT_ID"` to open another agent's private dashboard.
+
+Tasks are private to their owner. Task completion messages, public notes, and finish messages are public context. Notes are private by default, directed with `note --agent`, and shared with `note --public`.
+
+Use normal query commands for code facts:
 
 ```bash
-{command_name} agent dashboard --agents
+{command_name} query_context --query "<task terms>" --code
 ```
-
-Initialization does not open, copy, or depend on the canonical project graph.
-
-## Required Agent Workflow
-
-Keep entries short and factual. Prefer one useful sentence over repeated status prose. Publish only meaningful stage transitions, blockers, changed decisions, verification outcomes, and handoffs.
-
-### 1. Plan
-
-Add information, choices, constraints, assumptions, risks, and blockers:
-
-```bash
-{command_name} agent dashboard
-{command_name} agent session start "Focused implementation pass"
-{command_name} agent note add "Read src/memory/cli.py; argparse owns command routing"
-{command_name} agent decision add "Keep .reql/agent.reql separate from .reql/memory.reql"
-{command_name} agent finding add "agent list should not dump standard relations"
-```
-
-### 2. Task Build
-
-Create the task list and link tasks to plan elements:
-
-```bash
-{command_name} agent task add "Patch context recovery output"
-{command_name} agent link AGENT_TASK_ID AGENT_DECISION_ID --relation implements
-{command_name} agent link AGENT_TASK_ID AGENT_FINDING_ID --relation depends_on
-{command_name} agent batch --task task="Patch context recovery" --decision decision="Use one workspace lock" --link '$task' implements '$decision'
-{command_name} agent batch --link-many AGENT_TASK_ID depends_on AGENT_DECISION_ID,AGENT_RISK_ID
-```
-
-Use task descriptions as executable work items, not summaries. Each task should point to the agent-owned plan item, constraint, decision, finding, or risk that explains it.
-When several items or links are known at once, prefer `{command_name} agent batch --json FILE` or inline `agent batch --task ... --link ...` so the Agent Workspace takes one lock.
-Do not run `agent map` before or after ordinary edits. The current model already knows the plan, task state, and files it just changed; printing the map there only repeats active context.
-
-### 3. Write
-
-Edit the project, then update task state:
-
-```bash
-{command_name} agent task done AGENT_TASK_ID
-{command_name} agent dashboard --post "verify: focused tests passed" --kind stage
-```
-
-Add new decisions or findings only when they change remaining work.
-Use dashboard posts as terse shared pipeline checkpoints such as `scope:`, `implement:`, `verify:`, or `blocked:`. Posts are limited to 240 characters; put durable detail in `note add`, `decision add`, `finding add`, tasks, or a handoff.
-
-### 4. Handoff To Master
-
-When a worker has saved the facts the master needs, publish a handoff:
-
-```bash
-{command_name} agent handoff "Worker finished parser review"
-{command_name} agent bus --json
-```
-
-The handoff snapshots the current saved operational state: open tasks, decisions, plans, risks, and essential relationships. The master can read it from the bus and decide the next step without opening the worker's private store directly.
-
-### 5. Finish
-
-Every agent must leave the working roster when its pass ends, including single-agent and intra-session work:
-
-```bash
-{command_name} agent finish "Focused tests passed; dashboard command ready"
-```
-
-`agent finish` snapshots a final handoff, closes the current session, marks the bus identity completed, and deletes the private agent store. The compact handoff remains on the bus while its session is among the latest `retention.agent_sessions`. Reuse the same identity with `agent init` before starting another session.
-
-## Dashboard Drill-down
-
-Treat dashboard output as a compact attention index, not a complete context dump. When it prints a `drill` line, follow that command only if the referenced task, session, handoff, or code question affects the current work. `agent show` expands one item, `agent map --session current` recovers the current plan, `agent bus --include-payloads` opens handoffs, and `query_context` retrieves canonical code facts.
-
-## Relate Agent Items
-
-Use only ids returned by `agent list`, `agent search`, or earlier `agent` write commands:
-
-```bash
-{command_name} agent link AGENT_TASK_ID AGENT_DECISION_ID --relation implements
-{command_name} agent link AGENT_FINDING_ID AGENT_DECISION_ID --relation explains
-{command_name} agent batch --link-many AGENT_TASK_ID depends_on AGENT_DECISION_ID,AGENT_RISK_ID
-```
-
-Supported relation types:
-
-- `depends_on`
-- `blocks`
-- `implements`
-- `touches`
-- `explains`
-- `derived_from`
-- `related_to`
-- `replaces`
-- `conflicts_with`
-
-## Recover Context
-
-Use the map only to recover after context loss, thread compaction, a handoff, or a long pause. Do not print it as a routine pre-edit or post-edit summary:
-
-```bash
-{command_name} agent map
-{command_name} agent map --session current
-{command_name} agent map --json
-```
-
-The map is intentionally operational and compact. Its context contains durable agent learning and bounded current/previous-session summaries. It never contains project, file, symbol, or canonical graph records.
-
-Search and inspect:
-
-```bash
-{command_name} agent list --type task --status open --json
-{command_name} agent search "reset behavior" --json
-{command_name} agent search "reset behavior" --json --metadata
-{command_name} agent show AGENT_TASK_ID --json
-{command_name} agent bus --json
-```
-
-`agent list` keeps relation output focused on agent-created relations and, when node filters are present, relations connected to the listed nodes.
-
-## Export and Reset
-
-Export for another coding agent:
-
-```bash
-{command_name} agent handoff "Summary for master"
-{command_name} agent export --json
-{command_name} agent export --json --metadata
-```
-
-Reset only when intentionally discarding session-scoped working memory:
-
-```bash
-{command_name} agent reset
-```
-
-Reset deletes agent-created notes, tasks, decisions, findings, plans, risks, sessions, and their relationships. It neither reads nor modifies `.reql/memory.reql`.
-
-## Concurrency
-
-Different agent ids write independent stores in parallel. Commands targeting the same private store serialize through its lock; `dashboard --agents` is a best-effort detailed view across those independent memories.
 
 Installed for: {platform_name} ({scope}).
 """

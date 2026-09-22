@@ -1,4 +1,4 @@
-﻿# Storage
+# Storage
 
 REQL uses a storage-agnostic `memory.storage.GraphStore` contract. The bundled local adapter is
 `memory.storage.adapters.BlockGraphStore`, re-exported as
@@ -60,7 +60,7 @@ Each checkpoint also stores a `root_index` record. It captures record locations,
 canonical node keys, edge patterns, incoming/outgoing adjacency, type/status
 buckets, selected property indexes, counters, and a block space map. Lexical
 postings live in a separate `lexical_index` record referenced by root-index
-version 3. Query sessions load both records; compile/update sessions defer the
+version 3. Query sessions load both records; compilation sessions defer the
 lexical record and append changed nodes to the WAL, so a small graph delta does
 not pay the full lexical-index startup cost. This also applies to a newly created
 store. Repeated updates to the same node are coalesced before the first query or
@@ -134,32 +134,31 @@ automatic checkpoints and bounded WAL replay are part of normal operation. The
 command reloads the logical graph, writes a fresh compact generation, and
 reports generation id, block count, record count, and byte size before and after
 compaction. It does not itself delete archived graph records. Successful
-compile/update operations that create a changed-manifest `ProjectRevision`
+compilation operations that create a changed-manifest `ProjectRevision`
 enforce the graph-level `retention.commits` policy and invoke compaction only
 when they actually remove graph records.
 
-Use `reql storage clear [PATH]` when archived records, compilation history, and
+Use `reql storage clear` when archived records, compilation history, and
 other state that no longer belongs to the current project tree must be removed.
 REQL compiles `PATH` into a temporary block store while holding the destination
 writer lock, compacts and validates that clean generation, and atomically
 replaces the old store only after a successful compile. The artifact cache is
 rebuilt in the same maintenance window; failures restore the previous cache and
 leave the old store untouched. A successful clear also removes the old WAL and
-usage journal. With `--storage`, the explicitly selected store is replaced in
-full and should therefore not be shared by unrelated projects.
+usage journal.
 
 ## Agent Memory Isolation
 
-Private agent files and the shared agent bus use the block adapter as a storage
+Private agent files and the shared agent dashboard use the block adapter as a storage
 implementation, but they are not project graph replicas. Agent stores contain
-only operational records and relationships between those records. They contain
-no project, file, symbol, source-fragment, or canonical relationship records,
-and initialization does not open the canonical store.
+only operational records. They contain no project, file, symbol,
+source-fragment, or canonical relationship records, and initialization does
+not open the canonical store.
 
 Completed agents do not retain private stores. `agent finish` publishes a
-compact bus handoff, closes the store, and removes its block file and sidecars.
-Agent init/finish reconcile known completed stores and retain bus identities,
-messages, and handoffs for the latest `retention.agent_sessions` completed
+compact public dashboard finish message, closes the store, and removes its block file and sidecars.
+Agent init/finish reconcile known completed stores and retain public dashboard identities,
+messages, and finish messages for the latest `retention.agent_sessions` completed
 sessions; active sessions and unregistered files are not removed.
 
 ## Reader/Writer Locking
@@ -206,17 +205,10 @@ exclusive file lock so concurrent readers do not interleave usage writes.
 payload; it raises `StorageError` instead of returning an empty graph for a
 missing or empty storage path.
 
-When a writer intentionally stays active, a read command can bypass lock
-waiting and open the latest complete on-disk generation plus complete WAL
-frames:
-
-```bash
-reql --snapshot query_context --query "payment service"
-reql --snapshot project status .
-```
-
-Snapshot mode is explicitly read-only and may lag changes still held in the
-writer's in-memory transaction.
+When a writer intentionally stays active, read commands automatically fall
+back to the latest complete on-disk generation plus complete WAL frames. This
+read-only snapshot may lag changes still held in the writer's in-memory
+transaction.
 
 CLI and MCP read commands automatically fall back to snapshot mode when a
 writer is active. Snapshot opening compares checkpoint and WAL boundaries

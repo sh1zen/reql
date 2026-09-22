@@ -8,15 +8,14 @@ the optional `reql-mcp` server.
 
 ```bash
 # Build or refresh the graph
-reql project compile .
-reql project update .
-reql project compile . --watch
-reql cache status .
-reql project history . --limit 5
-reql project diff .
-reql project explain . --focus "payment workflow"
-reql project pipeline .
-reql project pipeline . --code --out docs/architecture
+reql project compile
+reql project compile --watch
+reql cache status
+reql project history --limit 5
+reql project diff
+reql project explain --focus "payment workflow"
+reql project pipeline
+reql project pipeline --code --out docs/architecture
 
 # Retrieve context
 reql query_context --query "payment service"
@@ -27,20 +26,19 @@ reql query_memories --query "payment service" --limit 8 --json
 reql inspect --node-id NODE_ID --json
 
 # Coding-agent operational memory, with no copied project graph data
-reql agent init
+reql agent init --name "Serializer cleanup"
 reql agent dashboard
-reql agent session start "Serializer cleanup"
 # Optional explicit activity scope (Codex uses CODEX_THREAD_ID automatically)
-reql agent --agent AGENT_ID --activity TASK_ID session start "Serializer cleanup"
-reql agent note add "Read the payment service serializer"
+reql agent --agent AGENT_ID --activity TASK_ID init --name "Serializer cleanup"
+reql agent note "Read the payment service serializer"
 reql agent task add "Patch serializer error handling"
-reql agent decision add "Reuse the existing graph store"
-reql agent link TASK_ID DECISION_ID --relation implements
-reql agent batch --link-many TASK_ID depends_on DECISION_ID,RISK_ID
-reql agent batch --json agent-ops.json
-reql agent handoff "Serializer cleanup ready for review"
-reql agent export --json
-reql agent export --json --metadata
+reql agent task list
+reql agent task list --all
+reql agent note --public "The serializer owner is PaymentService"
+reql agent task done TASK_ID "Serializer error handling is ready for review"
+reql agent finish "Serializer cleanup ready for review"
+reql agent list
+reql agent search "serializer error handling"
 
 # Query, inspect, report, and export
 reql query "DELTAS LIMIT 10"
@@ -48,12 +46,12 @@ reql query "HUBS LIMIT 20"
 reql query "EXPLAIN HUB 'NODE_ID'" --json
 reql stats
 reql storage inspect --json
-reql project report . --output reports/
+reql project report --output reports/
 reql export --html --json --out reql-graph-out
 
 # Configuration and integrations
 reql config show
-reql --set project.id=team-a config show
+reql config set retention.agent_sessions 30
 reql install codex
 reql install codex --user
 reql uninstall codex,claude
@@ -63,9 +61,9 @@ reql-mcp --read-only
 ## Repository Explanation
 
 ```bash
-reql project explain .
-reql project explain . --focus "payment retries"
-reql project explain . --focus "payment retries" --max-capabilities 8 --max-workflows 4 --json
+reql project explain
+reql project explain --focus "payment retries"
+reql project explain --focus "payment retries" --max-capabilities 8 --max-workflows 4 --json
 ```
 
 `project explain` reads an already compiled project and returns a
@@ -82,16 +80,16 @@ The command is read-only. It computes the view on demand from deterministic
 graph facts and does not create capability nodes or require model calls. Use
 `--json` for the versioned structured payload or omit it for Markdown. Focus
 ranks workflow candidates but does not create triggers. If the project is
-missing, run `reql project compile .` first.
+missing, run `reql project compile` first.
 
 ## Project Pipeline Export
 
 ```bash
-reql project pipeline .
-reql project pipeline . --html
-reql project pipeline . --code
-reql project pipeline . --html --out reports/pipeline.html
-reql project pipeline . --code --out reports/
+reql project pipeline
+reql project pipeline --html
+reql project pipeline --code
+reql project pipeline --html --out reports/pipeline.html
+reql project pipeline --code --out reports/
 ```
 
 `project pipeline` reads an already compiled project and writes a deterministic
@@ -137,7 +135,7 @@ scripts and agent-facing command execution.
 
 Project and cache commands default to `<build path>/.reql/memory.reql`.
 Other commands default to `./.reql/memory.reql` from the current working
-directory. Pass `--storage` to override the graph store path.
+directory. The CLI always uses these project-local locations.
 
 Use `--json` on supported commands for machine-readable output. Top-level help
 lists canonical commands alphabetically, and nested command groups summarize
@@ -155,8 +153,8 @@ New leaf commands should be described by a `CommandSpec` in
 `src/memory/cli.py`. The spec supplies the command path, access mode, snapshot
 support, parser configurator, help text, and handler. `build_parser()` installs
 registered specs into their parent parser group, while execution uses the same
-selected spec to choose read-only versus mutating storage access, validate
-`--snapshot`, and invoke the handler.
+selected spec to choose read-only versus mutating storage access and invoke the
+handler.
 
 All commands that open `MemoryGraph` are registered this way. Commands with a
 different lifecycle, such as installation, configuration bootstrap, agent
@@ -167,8 +165,8 @@ dedicated execution paths without duplicating graph access classification.
 
 `reql agent` is the operational-memory layer used by REQL-aware coding-agent
 integrations. Each CLI agent gets its own private memory store under
-`.reql/agents/` and all agents share a small internal bus in
-`.reql/agent-bus.reql`. Explicit agent selection has highest precedence;
+`.reql/agents/` and all agents share a small internal public dashboard in
+`.reql/agent-dashboard.reql`. Explicit agent selection has highest precedence;
 otherwise a stable activity/thread id deterministically selects the private
 workspace. An implicit default workspace is used only when selection is
 unambiguous.
@@ -176,210 +174,85 @@ The canonical graph in `.reql/memory.reql` is the sole source of repository,
 file, symbol, and relationship facts. Agent memory never copies, derives, links,
 or synchronizes canonical graph records.
 
-When assistant instructions or a REQL skill are installed, these commands are
-normally invoked by the coding agent as part of its repository workflow. They
-let the agent keep plans, findings, decisions, open tasks, risks, sessions, and
-handoff summaries outside the model context window:
+`reql agent` gives each agent a private dashboard under `.reql/agents/` and
+provides one public dashboard at `.reql/agent-dashboard.reql`. It never owns or
+copies canonical project graph facts.
 
 ```bash
-reql project compile .
-reql agent init
+reql agent init --name "Focused implementation pass"
+reql agent task add "Patch serializer error handling"
+reql agent note "Check the serializer error path"
+reql agent note --public "The serializer owner is PaymentService"
+reql agent note --agent agent:reviewer "Please review the exception path"
+reql agent task done TASK_ID "Serializer error handling updated and tested"
 reql agent dashboard
-reql agent dashboard --post "scope: serializer owner identified" --kind stage
-reql agent status
-reql agent session start "Focused implementation pass"
+reql agent finish "Focused tests passed; serializer fix is ready"
 ```
 
-`reql agent status` reports the current session as active only when it still has
-open tasks. A completed or otherwise idle session is shown as the last idle
-session, which keeps old session titles visible for recovery without making
-them look like the current working focus.
+`init` creates or resumes the session and registers the agent as active.
+`finish MESSAGE` closes the session, marks the agent finished, and publishes
+MESSAGE to public dashboard context without deleting private history. Explicit
+`REQL_AGENT_ID` or `--agent` takes precedence over activity-derived identity.
+`task list` returns the current agent's private tasks; add `--all` for completed
+tasks. A task-completion message is published publicly, but the task stays
+private to its owner.
 
-`reql agent init` is idempotent: it never recreates an existing workspace.
-`REQL_AGENT_ID`/`--agent` wins over activity-derived selection. Parallel
-integrations normally need no manual flag because `REQL_AGENT_ACTIVITY_ID`,
-`CODEX_THREAD_ID`, or `--activity` produces a stable project-scoped agent id.
-Ambiguous activity-less selection fails clearly instead of following a global
-bus pointer. `reql agent dashboard` returns `reql-agent-dashboard-v1` as the
-routine attention index for intra-session, inter-session, and parallel work.
-It includes the current and latest previous session, active tasks, recent
-durable memory, currently working and recently finished agents, relevant bus
-signals, and exact commands for deeper inspection. `--post TEXT` publishes one
-checkpoint before the read and is limited to 240 characters. `dashboard
---agents` adds detailed cross-store state for each registered agent, including
-its current session, open tasks, and recent decisions. Because it opens private
-stores, this explicit option may wait on busy agents.
+The public dashboard contains Agents, Active Tasks, Context, and Drill. Its
+Context records include a timestamp, agent id, message type, and content.
+Public notes, finish messages, and task-completion messages all appear there.
+The private dashboard contains Agent, Tasks, Private Notes, and External Notes.
+Use `reql agent --agent "agent:AGENT_ID" dashboard` to open a selected private
+dashboard when permitted.
 
-Current sessions remain scoped by activity.
-REQL uses `REQL_AGENT_ACTIVITY_ID` first and `CODEX_THREAD_ID` second when
-available; other clients can pass `--activity ACTIVITY_ID` explicitly. Without
-an activity id, the agent has one current session.
-
-The agent saves observations while working:
+Use `agent dashboard` to inspect public coordination state and the selected
+private dashboard. Open a selected private dashboard, when permitted, with
+`reql agent --agent "agent:AGENT_ID" dashboard`.
 
 ```bash
-reql agent note add "Reviewed command routing and recorded the outcome"
-reql agent finding add "The current plan needs a compatibility test"
-reql agent decision add "Keep operational memory isolated per activity"
+reql agent dashboard
+reql agent --agent "agent:AGENT_ID" dashboard
+reql agent list
+reql agent list --all
+reql agent search "serializer exception path"
+reql agent terminate agent:stale-worker
 ```
 
-The agent may relate its own tasks, decisions, findings, notes, plans, and risks.
-Only IDs printed by `agent list`, `agent search`, or an earlier agent command
-are accepted:
+`agent list` returns active agents by default; `--all` includes finished and
+terminated agents. `agent search QUERY` searches the public dashboard, private
+dashboards, notes, tasks, and historical finish and completion messages. Each
+result includes timestamp, agent id, and surrounding context.
+
+Use `agent note TEXT` for a private self-note, `agent note --agent AGENT_ID
+TEXT` for a directed external note, and `agent note --public TEXT` for shared
+context. Notes are the dashboard communication mechanism.
+
+Every coding agent should finish its work pass:
 
 ```bash
-reql agent task add "Implement agent reset"
-reql agent link TASK_ID DECISION_ID --relation implements
-reql agent batch --link-many TASK_ID depends_on DECISION_ID,RISK_ID
+reql agent finish "Focused tests passed; serializer fix is ready"
 ```
 
-`agent session start "TITLE"` starts a new current working session and closes
-the previous current session. New notes, tasks, decisions, findings, and agent
-links are tagged with that session. Do not print `agent map` during normal
-planning, editing, or verification; the active model already holds that state.
-Use it only after context loss, compaction, a handoff, or a long pause:
+`agent finish` closes the active session, marks the agent finished, and makes
+its supplied final message public. Its private store and all historical tasks
+and notes are retained. Use `agent terminate AGENT_ID` when an agent is stale,
+stuck, or cannot finish itself.
 
-```bash
-reql agent map
-reql agent map --session current
-reql agent map --task TASK_ID
-reql agent map --since 2026-06-29T12:00:00+00:00
-```
+The public dashboard's Context section retains public notes, task-completion
+messages, and finish messages. The selected private dashboard shows its full
+tasks, self-notes, and external notes. These dashboards are the only agent
+coordination surfaces.
+Agent commands emit lifecycle progress on stderr while JSON stays on stdout.
+Use `reql agent --no-progress COMMAND ...` when a caller requires silent
+stderr.
 
-`agent map --session current` limits recovery to the current session. You can
-also pass a session id to recover an earlier session.
-
-Use `agent batch` when several notes, decisions, tasks, findings, or links
-should be written together under one Agent Workspace lock:
-
-```bash
-reql agent batch --json agent-ops.json
-reql agent batch --task task="Patch CLI" --decision decision="Batch agent writes" --link '$task' implements '$decision' --json
-```
-
-`agent-ops.json` may be a JSON array or an object with an `operations` array:
-
-```json
-{
-  "operations": [
-    {"op": "task.add", "description": "Patch CLI", "as": "task"},
-    {"op": "decision.add", "text": "Batch agent writes", "as": "decision"},
-    {"op": "link", "from": "$task", "to": "$decision", "relation": "implements"}
-  ]
-}
-```
-
-Aliases declared with `as` can be referenced later in the same batch as
-`$alias`. Supported operations are `note.add`, `task.add`, `task.done`,
-`decision.add`, `finding.add`, `link`, and `link-many`.
-
-For small planning batches, inline options avoid creating a temporary JSON
-file. `--note`, `--task`, `--decision`, and `--finding` accept either `TEXT` or
-`ALIAS=TEXT`; `--link FROM RELATION TO` creates one relation; `--link-many FROM
-RELATION TARGETS` accepts comma-separated agent-owned targets.
-Aliases from inline additions are referenced as `$alias` by later links.
-
-List, search, inspect, and export operational memory:
-
-```bash
-reql agent list --type task --status open
-reql agent search "reset behavior" --json
-reql agent search "reset behavior" --json --metadata
-reql agent show TASK_ID --json
-reql agent export --json
-reql agent export --json --metadata
-```
-
-Agents read or write the shared bus to coordinate without merging their private
-memories:
-
-```bash
-reql agent bus
-reql agent dashboard --post "Parser worker found the CLI owner" --target master
-reql agent handoff "Parser worker done; review payload in bus"
-```
-
-Prefer `agent dashboard` for routine pipeline checkpoints and attention
-routing. Publish terse `scope:`, `implement:`, `verify:`, or `blocked:` stage
-transitions, then follow a printed `drill` command only when that item affects
-the current task. Use `agent bus` for full bus listings and `dashboard
---agents` for a wider worker inventory.
-
-Every coding agent must run this when its work pass ends:
-
-```bash
-reql agent finish "Focused tests passed; serializer fix ready"
-```
-
-`agent finish` snapshots a final handoff to the shared bus, closes the current
-session, marks the agent completed so it disappears from the dashboard's
-working roster, and removes its private store and sidecars. The compact final
-handoff remains on the bus while its completed session is among the latest
-`retention.agent_sessions`. Reuse the identity with `agent init` before starting
-another session.
-
-`agent bus` lists registered agents, bus messages, and handoffs. Its JSON
-output omits handoff payload snapshots by default so old handoffs stay compact;
-pass `agent bus --include-payloads --json` only when you need the full saved
-working-map payloads. `dashboard --post` stores a short shared message. `agent
-handoff` snapshots this agent's current compact working map and publishes it to
-the master bus, so the master can make choices from saved open tasks,
-decisions, plans, risks, and essential relationships without opening the
-worker's private store directly.
-
-Use `dashboard --agents` for detailed agent state, `dashboard --post` for bus
-updates, and `batch --link-many` for multi-target links. Operational notes use
-typed `agent note add`; batch JSON uses `note.add`.
-
-`agent list` keeps relation output focused on agent-created relations and,
-when node filters are present, relations connected to the listed nodes.
-For recovery only, `agent map` separates two kinds of context:
-
-- `Agent memory` contains bounded decisions, findings, notes, risks, and plans,
-  with their originating session ids;
-- `Current session` and `Previous sessions` contain compact activity summaries,
-  counts, and up to six highlights instead of replaying raw session history.
-
-The JSON form exposes these domains under `context.learned` and
-`context.sessions`, identified by `context_format: reql-agent-context-v3`.
-Compact top-level `open_tasks`, `decisions`, and `relations` remain available.
-Timestamps and raw operational metadata remain
-omitted unless a command explicitly requests metadata.
-Use `agent map --task TASK_ID` to recover one task and agent items connected
-to it by agent-created relations. Use `agent map --session current` to recover
-the current working session without remembering a task id. Use `agent map
---session current --completed` only when recovering a completed session and its
-operational relations.
-Use `agent map --since TIMESTAMP` to show only agent items or relations updated
-inside a time window. If another process holds the agent store lock, commands
-retry briefly and then report that the Agent Workspace is busy, including the
-lock wait budget that was exhausted.
-
-Agent commands emit lifecycle progress on stderr: an immediate `started` line,
-periodic `still running` heartbeats, and a terminal `completed` or `failed`
-line with elapsed time. Completions after eight seconds are explicitly marked
-as late but final, so a slow storage open is not mistaken for an unfinished
-operation. JSON remains isolated on stdout. Use `reql agent --no-progress
-COMMAND ...` when a caller requires silent stderr.
-
-During recovery, use `agent map --metadata` only when timestamps or stored
-operational metadata are necessary. `agent search --metadata` and
-`agent export --metadata` expose the equivalent detailed fields for their own
-workflows.
-
-Reset discards agent-created notes, tasks, decisions, findings, plans, risks,
-sessions, and relationships without reading or changing the canonical graph:
+Reset discards the selected agent's dashboard history without reading or
+changing the canonical graph:
 
 ```bash
 reql agent reset
 ```
 
-Supported agent item types are `note`, `task`, `decision`, `finding`, `risk`,
-`plan`, and `session`. Supported agent relationship types are `depends_on`,
-`blocks`, `implements`, `touches`, `explains`, `derived_from`, `related_to`,
-`replaces`, and `conflicts_with`. Commands that return structured output support
-`--json`; list/search support filters such as `--type`, `--status`,
-`--relation`, `--since`, and `--limit` where relevant.
+The dashboard supports `--json`; search accepts `--limit` to bound its results.
 
 ## Retrieval Commands
 
@@ -493,16 +366,14 @@ edge.
 Query/retrieval commands write usage events to an append-only journal rather
 than rewriting canonical graph records. `project status`, `query_context`, and
 non-mutating `query` statements open a consistent read-only index snapshot, so
-parallel readers can run together. Compile/update writers wait for existing
+parallel readers can run together. Compile writers wait for existing
 readers and block new readers while opening the write session.
 Use `reql storage locks` to see the owning command, lock duration, process
 liveness, watcher state, stale status, and snapshot availability. Add
-`--recover-stale` for conservative cleanup of dead same-host owners. If a live
-writer must remain active, place the global `--snapshot` option before a
-read-only command, for example `reql --snapshot query_context --query "FAQ"`.
-Expected storage failures return exit code `1` without a Python traceback. A
-writer lock prints only one recovery command in the form `reql is locked for
-write: to fix any possible stale: reql --storage "PATH" storage locks
+`--recover-stale` for conservative cleanup of dead same-host owners. Read-only
+commands automatically fall back to the latest complete snapshot while a live
+writer remains active. Expected storage failures return exit code `1` without a
+Python traceback. A writer lock prints the recovery command `reql storage locks
 --recover-stale`.
 
 ## Inspection and Export
@@ -514,8 +385,8 @@ reql storage inspect --json
 reql storage locks
 reql storage locks --recover-stale
 reql storage compact
-reql storage clear [PATH]
-reql storage clear [PATH] --json
+reql storage clear
+reql storage clear --json
 reql export --out graph.json
 reql export --json --out reql-json
 reql export --html --out graph.html
@@ -527,7 +398,7 @@ counts, compression ratio, dense-node count, manifest fields, WAL status, and
 logical index sizes. `storage compact` rewrites the current logical graph into a
 new compact storage generation.
 
-When `project compile` or `project update` creates a changed-manifest
+When `project compile` creates a changed-manifest
 `ProjectRevision`, it is a REQL commit. REQL retains the latest
 `retention.commits` commits (default `20`) and automatically prunes older
 project-owned history, archived records, and usage events at that commit
@@ -536,14 +407,12 @@ current graph and retained commits' runs, deltas, and revisions remain
 available. Cleanup counts appear in JSON output and in human output when data
 was removed.
 
-`storage clear [PATH]` performs a clean build of the current project in a
+`storage clear` performs a clean build of the current project in a
 temporary store, then atomically replaces the selected `memory.reql` only after
 compilation succeeds. It regenerates `artifact-cache.json` and discards graph
 history, archived/deleted records, the old WAL, and the query-usage journal. A
 failed clean build preserves both the existing store and cache. `PATH` defaults
-to the current directory and controls the default
-`<PATH>/.reql/memory.reql`; an explicit `--storage` path is replaced in full, so
-do not target a store shared by unrelated projects.
+to the current directory and controls the default `<PATH>/.reql/memory.reql`.
 
 `export --html` writes a standalone browser view of the graph. If `--out`
 points to a directory or to a path without an `.html` suffix, the command writes
@@ -595,10 +464,10 @@ By default, installs write project-local files such as
 `.codex/skills/reql-agent/SKILL.md`, `.claude/CLAUDE.md`, `AGENTS.md`,
 `GEMINI.md`, `.cursor/rules/reql.mdc`, `.kilocode/rules/reql.md`,
 `.agents/skills/reql-agent/SKILL.md`, and agent-specific skill/rule
-directories. `reql-agent` covers compile/query/report/update workflows for the
+directories. `reql-agent` covers compile/query/report workflows for the
 standard project graph and Agent Workspace commands such as `reql agent init`,
-routine coordination through `agent dashboard`, `agent task add`, `agent link`,
-recovery via `agent map`, cleanup via `agent finish`, `agent export --json`, and
+routine coordination through `agent dashboard` and `agent task add`,
+recovery via `agent dashboard`, cleanup via `agent finish`, `agent export --json`, and
 `agent reset`. Pass `--project-dir` to target another project root. Pass
 `--user` to write to matching assistant profiles under the home directory.
 
@@ -645,8 +514,7 @@ durations and relevant counters.
 ```bash
 reql config init
 reql config show
-reql --set scan.max_file_size_mb=2 --set cache.enabled=false project compile .
-reql project compile . --watch
+reql project compile --watch
 ```
 
 `reql.conf` can configure scan limits, include globs, strict scoped exclusions, cache behavior,
@@ -693,15 +561,13 @@ ranges, or scores.
 ## Project Compilation
 
 ```bash
-reql project compile .
-reql project compile . --max-file-size-mb 5
-reql project exclude .tmp/ generated/*.json
-reql project exclude vendor/ --path PATH
-reql project status . --json
-reql project history . --limit 10
-reql project diff .
-reql project report . --output reports/
-reql project pipeline .
+reql project compile
+reql project compile --max-file-size-mb 5
+reql project status --json
+reql project history --limit 10
+reql project diff
+reql project report --output reports/
+reql project pipeline
 ```
 
 `project compile` scans read-only first, registers files as graph artifacts,
@@ -724,7 +590,7 @@ test files. Test associations come from compiled graph relationships and the
 conventional `tests/test_<module>.py` path when present. The complete structured
 summary is available as `CompileProjectResult.to_dict()["summary"]`.
 
-When `reql.conf` is present, project compile/update, watch mode, and cache
+When `reql.conf` is present, project compile, watch mode, and cache
 status apply configured `scan.include` and `scan.exclude` patterns. Compile
 exclusions should be listed in `scan.exclude`. With
 `compile.ingest_documents=true`, text documents become
@@ -741,18 +607,11 @@ code symbols when a fragment explicitly names a symbol. This path runs inside
 Nested subdirectories may define their own `reql.conf`; during a parent scan,
 their `scan.exclude` rules apply only to that subdirectory tree.
 
-`project exclude PATTERN [PATTERN ...]` creates or updates the selected
-project's `reql.conf` and appends patterns to `scan.exclude`. Use it only for
-explicit exclusions or obvious dependency/cache/build-output directories. It
-defaults to the current working directory, accepts `--path PATH` when the
-runtime project path is elsewhere, preserves existing config values, and skips
-rules that are already present. Generated YAML uses unquoted plain values when
-they are unambiguous. `./` is significant: it anchors a rule to that config's
-directory; without it, the rule matches at every depth. A trailing `/` is only
-presentation and does not affect duplicate detection. The only wildcard form
-is `*suffix` in the final segment (`*.json`, `generated/*.json`, or their
-`./`-anchored equivalents). Unsupported glob forms, absolute paths, `..`, empty
-segments, and backslashes are rejected.
+To exclude files from compilation, add rules to `scan.exclude` in `reql.conf`.
+`./` anchors a rule to that config's directory; without it, the rule matches at
+every depth. The only wildcard form is `*suffix` in the final segment
+(`*.json`, `generated/*.json`, or their `./`-anchored equivalents). Unsupported
+glob forms, absolute paths, `..`, empty segments, and backslashes are rejected.
 
 `project report` writes `GRAPH_REPORT.md`, `GRAPH_DELTAS.md`, and
 `CACHE_REPORT.md` to the selected output directory. The reports summarize
@@ -762,11 +621,10 @@ symbols, communities, hubs, and memory health.
 ## Incremental compilation
 
 ```bash
-reql project compile .
-reql project update .
-reql project watch-status .
-reql cache status .
-reql cache clear .
+reql project compile
+reql project watch-status
+reql cache status
+reql cache clear
 reql query "DELTAS LIMIT 10"
 reql query "DELTAS WHERE id = 'delta:...' LIMIT 1" --json
 ```
@@ -779,7 +637,8 @@ query/report inspection and recovery. Unchanged `Project`, `Directory`,
 compile into a complete indexed graph ready for query as soon as the command
 returns. Deleted files archive their `SourceArtifact`, `File`, and related
 fragment/code nodes. Use
-`project update` for a manual incremental refresh of the same path.
+`project compile` for a manual incremental refresh of the current working
+directory.
 Cache metadata for a compilation run is flushed once as an atomic batch, so
 cold compilation remains linear in the number of changed artifacts instead of
 rewriting the growing JSON cache once per file. Bounded `FIND` queries use the
@@ -790,15 +649,14 @@ Compile mode applies built-in default ignore rules for dependency, VCS, cache,
 build-output, and local database paths, then applies configured
 include/exclude patterns and file-size limits.
 
-`project watch-status [PATH]` checks a dedicated watcher lease without opening
+`project watch-status` checks the current working directory's dedicated watcher
+lease without opening
 the graph. Monitor mode opens the canonical graph only for a compile batch and
 releases it while idle, so readers and agents remain responsive. It
 reports `running`, `stopped`, `stale`, or `unknown`, plus PID, process liveness,
-start time, duration, and command when available. Add `--json` for automation;
-when monitor mode uses an explicit global `--storage`, pass the same option to
-`watch-status`.
+start time, duration, and command when available. Add `--json` for automation.
 
-Use `project compile . --watch` from the working directory while Codex, Claude, or
+Use `project compile --watch` from the working directory while Codex, Claude, or
 another coding agent is actively changing files. The watcher uses Python
 `watchdog` filesystem events, checks the same incremental cache, and runs
 compilation only when dirty or deleted artifacts are detected. This is monitor
@@ -826,7 +684,7 @@ Every compile invocation persists a `CompilationRun` node and a compilation
 graph cache entries for the project path. It does not delete or archive graph
 data, artifacts, or fragments.
 
-Use `storage clear [PATH]` when the desired result is instead equivalent to
+Use `storage clear` when the desired result is instead equivalent to
 deleting the project-local REQL store and compiling the current checkout from
 scratch.
 
