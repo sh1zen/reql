@@ -94,6 +94,9 @@ retention:
   ignore matcher are discarded, so the project lists replace them completely.
   In this mode, add operational paths such as `.reql/` and `.git/` explicitly
   when they must remain excluded.
+- Default exclusions also skip the project-local generated REQL skill at
+  `.codex/skills/reql-agent/` so installing agent guidance does not add it to
+  the repository graph.
 - `scan.use_gitignore: true` loads the `.gitignore` in the compiled project
   root. Its rules are joined with protected internal ignores and the effective
   `scan.exclude` list; protected and local exclusions cannot be negated by

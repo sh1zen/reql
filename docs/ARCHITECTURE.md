@@ -214,8 +214,8 @@ registered-agent roster, coordination-safe active-task summaries, and shared
 context. Shared context records carry a timestamp, agent id, message type, and
 content; finish messages, public notes, and task-completion messages are all
 records in this section. Each agent's private dashboard remains under
-`.reql/agents/` and owns its complete tasks, private notes, external notes, and
-session history.
+`.reql/agents/` and owns its complete tasks, private notes, external notes,
+rejected approaches with reasons, and session history.
 
 `reql agent init` creates or resumes the selected private dashboard, creates a
 session if necessary, and registers the agent as active. `reql agent finish
@@ -226,6 +226,12 @@ and notes. The dashboard is the persistent coordination layer.
 
 The canonical CLI writes dashboard notes through `agent note TEXT`,
 `agent note --agent AGENT_ID TEXT`, and `agent note --public TEXT`.
+`agent reject APPROACH REASON` stores a private operational record tied to the
+current session. The dashboard presents bounded rejected, done, and open lists,
+with a command to open `project overview` for the complete history. That read-only
+CLI view combines the canonical explanation for the working-directory project
+with operational records from every registered agent, attributed by agent id;
+neither store copies facts from the other.
 The dashboard owns cross-agent inspection and public coordination context.
 Its private task view renders task ids, lifecycle status, and completion
 messages so a later session can resume or audit work without opening raw graph

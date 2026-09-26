@@ -33,13 +33,14 @@ PROJECT_SKILL_SOURCE = SkillSource(
     name="reql-agent",
     title="REQL Coding Workflow",
     description=(
-        "Use when {platform_name} is working in a REQL-indexed repository and needs bounded code context, "
-        "dependency evidence, or durable task recovery. Guides focused retrieval, source verification, "
-        "optional Agent Workspace use, and graph refresh."
+        "Use for every {platform_name} task involving a REQL-indexed repository, including small edits and "
+        "read-only investigations. Start with REQL project status and focused graph retrieval to establish "
+        "repository context before inspecting source."
     ),
     summary=(
         "Use REQL to narrow repository discovery, not to replace source inspection. Retrieve enough graph evidence "
-        "to identify the likely owner and impact, then verify the current code and tests before changing anything."
+        "to identify the likely owner and impact, then verify the current code and tests before changing anything. "
+        "Keep the working set small and retain operational decisions so resumed work does not repeat broad scans."
     ),
     command_examples=(
         CommandExample("project status", "check whether this project has a compiled REQL graph"),
@@ -47,6 +48,8 @@ PROJECT_SKILL_SOURCE = SkillSource(
         CommandExample('query_context --query "<terms from user request>"', "compact informative context"),
         CommandExample('query_context --query "<terms from user request>" --code', "compact code-scoped context with files, owner symbols, line ranges, and associated tests"),
         CommandExample("agent dashboard", "read shared coordination context and the current private dashboard"),
+        CommandExample("project overview", "read project context and complete rejected, done, and open work across agents"),
+        CommandExample('agent reject "<approach tried>" "<reason rejected>"', "retain a failed approach for later sessions"),
         CommandExample("agent list", "list active agents coordinating in this workspace"),
     ),
     workflow_steps=(
@@ -55,8 +58,10 @@ PROJECT_SKILL_SOURCE = SkillSource(
             "or the graph is missing, use `references/bootstrap.md`; do not compile a healthy graph just to begin a task."
         ),
         (
-            "For multi-step, resumed, or coordinated work, run `{command_name} agent dashboard`. If it reports that Agent Workspace "
-            "is uninitialized, run `{command_name} agent init --name \"<task>\"` and retry the dashboard. Skip Agent Workspace for a small, self-contained task."
+            "For multi-step, resumed, or coordinated work, run `{command_name} project overview` from the project directory before choosing an approach; "
+            "it shows rejected, done, and open work across registered agents without selecting one. Then run `{command_name} agent dashboard` for the selected private view. "
+            "If the workspace is uninitialized, run `{command_name} agent init --name \"<task>\"` and retry the dashboard. "
+            "Skip Agent Workspace for a small, self-contained task."
         ),
         (
             "If a path is already known, use `{command_name} locate \"<path>\"`; otherwise run `{command_name} query_context --query \"<short literal terms>\"`. "
@@ -68,7 +73,8 @@ PROJECT_SKILL_SOURCE = SkillSource(
         ),
         (
             "If context is insufficient, make one narrower graph query or use a targeted exact-name/path search for the unresolved gap. "
-            "Do not loop on broad queries or treat REQL confidence as proof of correctness."
+            "Do not loop on broad queries, dump the full graph, or rescan the whole repository once the working set is known. "
+            "Treat REQL confidence as a lead, not proof of correctness."
         ),
         (
             "Edit the authoritative owner, update affected consumers and tests together, and run the repository's documented checks."
@@ -95,8 +101,13 @@ PROJECT_SKILL_SOURCE = SkillSource(
             "narrows work but does not replace code review, tests, or repository instructions."
         ),
         (
+            "Keep retrieval and source reads bounded: use short literal queries, read returned paths and spans, ask for JSON only when structured fields are needed, "
+            "and stop discovery once ownership, impact, and tests are clear. Avoid repeated project compile or workspace-wide scans on a healthy graph."
+        ),
+        (
             "Use Agent Workspace only for multi-step, resumed, or coordinated work. If `agent dashboard` is uninitialized, run `agent init --name \"<task>\"`; "
-            "finish only a pass that initialized or resumed an Agent Workspace session."
+            "read `project overview` from the project directory for cross-agent rejected, done, and open history. Record a discarded approach "
+            "with `agent reject \"<approach>\" \"<reason>\"`; finish only a pass that initialized or resumed an Agent Workspace session."
         ),
         (
             "After changed project files pass their documented checks, run `{command_name} project watch-status --json`; let a running watcher refresh the graph or run one "
@@ -203,7 +214,7 @@ def _reference_routing(source_name: str) -> str:
             "- Watch/compile troubleshooting, custom storage, cache, deltas, or special local configuration -> `references/update-watch.md`.",
             "- Reports, exports, hubs, communities, or MCP -> `references/reports-exports.md`.",
             "- Document ingestion or local processing -> `references/document-semantics.md`.",
-            "- Durable planning, dashboard recovery, or `reql agent` -> `references/agent-workspace.md`.",
+            "- Durable planning, dashboard recovery, `project overview`, or `reql agent` -> `references/agent-workspace.md`.",
         ]
     )
 
@@ -253,6 +264,8 @@ The one-shot bootstrap is allowed without asking again because the installed wor
 ## Graph-defined working set
 
 Use REQL results to establish a bounded discovery set: candidate files, symbols, owners, source fragments, line ranges, relationships, and associated tests. When the first result is incomplete, make one narrower query or follow a specific graph edge with `query_explore`, `query_graph`, `query_memories`, or `inspect`.
+
+For token-efficient work, request rendered context first and use `--json` only when its structured fields answer a specific next question. Keep source reads to the returned paths and spans plus callers, contracts, and tests needed for the change. Do not repeatedly compile a healthy graph or replace a narrow query with a whole-project file or text dump.
 
 Once the graph identifies specific paths or spans, inspect the current source plus the callers, contracts, and tests needed to verify the change. Use targeted exact-name or path searches when checking references the graph may not model, such as dynamic registrations. Stop discovery as soon as the owner, impact, edit locations, and test targets are clear.
 
@@ -360,6 +373,8 @@ Let graph queries establish a bounded discovery set, while still reading enough 
 ## Graph-led source inspection
 
 Start with `locate` for a known path or `query_context` for task terms. Use `query_explore`, `query_graph`, `query_memories`, `inspect`, or bounded raw REQL only when the first result leaves a specific relationship or location unresolved.
+
+Keep the working set in the task: record the owner, affected callers, contract, and test targets once, then reuse that map during implementation. Use Agent Workspace for durable task status and decisions when the work spans sessions. Its operational history complements graph evidence; it is not a copy of the project graph.
 
 After REQL returns candidate paths, symbols, owners, source fragments, or line ranges, inspect the current files for verification and implementation. If context is insufficient, make one narrower graph query or use a targeted exact-name/path search. Broad repository scans remain a last resort, but direct source inspection is part of the normal coding workflow.
 
@@ -585,28 +600,34 @@ Load this when using `{command_name} agent` for durable task planning and coordi
 
 ## Dashboard model
 
-The public dashboard at `.reql/agent-dashboard.reql` is the shared coordination layer. It contains agents, active-task summaries, public context, and drill commands. Each agent has a private dashboard under `.reql/agents/` containing its complete tasks, private notes, external notes, and sessions. The canonical project graph remains the only source of repository facts.
+The public dashboard at `.reql/agent-dashboard.reql` contains agents, active-task summaries, public context, and drill commands. Each agent has a private store under `.reql/agents/` with tasks, notes, rejected approaches, and sessions. `{command_name} agent dashboard` shows recent rejected, done, and open work for the selected agent and ends with `{command_name} project overview`.
 
-Use Agent Workspace only when durable planning or recovery is useful. For a small self-contained task, skip it. On a resumed pass, try `agent dashboard` first; if it reports that the workspace is uninitialized, initialize a named session and retry. Do not call `agent finish` unless this pass initialized or resumed a session.
+Run `{command_name} project overview` from the project directory when resuming work or coordinating with other agents. It needs no path or agent id and reads the complete rejected, done, and open history of every registered agent alongside the project explanation. Each operational record retains its agent and session; the canonical project graph remains the source of repository facts. Check rejected approaches and their reasons before repeating work. Use current source and tests to verify any code claims in the overview.
+
+Use Agent Workspace when durable planning or recovery is useful. For a small self-contained task, skip it. On a resumed pass, read `project overview` first, then try `agent dashboard`; if it reports that the workspace is uninitialized, initialize a named session and retry. If agent selection is ambiguous, select the intended private agent explicitly; `project overview` remains cross-agent. Do not call `agent finish` unless this pass initialized or resumed a session.
 
 ## Workflow
 
 ```bash
+{command_name} project overview
 {command_name} agent init --name "Focused implementation pass"
+{command_name} agent dashboard
 {command_name} agent task add "Patch serializer error handling"
 {command_name} agent note "Check caller contracts first"
+{command_name} agent reject "Cache every query" "Results stayed stale after source edits"
 {command_name} agent note --agent AGENT_ID "The parser API now returns ParseResult"
 {command_name} agent note --public "Use parse_document_v2 for new work"
 {command_name} agent task done TASK_ID "Serializer fix completed and tests are passing."
-{command_name} agent dashboard
 {command_name} agent finish "Focused tests passed; serializer fix is ready."
 ```
 
 `init` creates or resumes the selected session and registers the agent active. `finish` closes the session, marks the agent finished, and publishes its message as public context without deleting private history. Use `agent terminate AGENT_ID` for stale sessions.
 
-`agent list` returns active agents; add `--all` for finished and terminated agents. `agent search QUERY` searches public context and permitted private dashboard history. `agent dashboard` shows the public dashboard plus the selected private dashboard; use `--agent "agent:AGENT_ID"` to open another agent's private dashboard.
+`agent list` returns active agents; add `--all` for finished and terminated agents. `agent search QUERY` searches public context and permitted private dashboard history. `agent dashboard` shows the public dashboard plus the selected private dashboard; use `--agent "agent:AGENT_ID"` only when opening a particular private dashboard. The project overview always includes all registered agents.
 
-Tasks are private to their owner. Task completion messages, public notes, and finish messages are public context. Notes are private by default, directed with `note --agent`, and shared with `note --public`.
+Tasks and rejected approaches are stored with their owner. `agent reject APPROACH REASON` records what was tried and why it was discarded; give a concrete failure or constraint, not just a verdict. `agent task done TASK_ID MESSAGE` records the result of completed work. Task completion messages, public notes, and finish messages are public context. Notes are private by default, directed with `note --agent`, and shared with `note --public`.
+
+Keep Agent Workspace small and actionable: add tasks for distinct remaining outcomes, mark them done with the observed result, and record only decisions or rejected approaches that would prevent repeated work. Use `agent note` for short operational context that will matter after a session boundary. Do not paste source files, broad search output, or graph facts into notes; retrieve repository facts from the project graph and verify current source. This preserves useful continuity without making later agents reread bulky scans.
 
 Use normal query commands for code facts:
 
@@ -730,7 +751,7 @@ def _scope(project: bool) -> str:
 
 def _embedded_rule_points() -> tuple[str, ...]:
     return (
-        "When the user types `/reql`, use the generated `reql-agent` skill or this concise REQL rule to establish the repository working set.",
+        "For every task involving this REQL-indexed repository, use the generated `reql-agent` skill or this concise REQL rule to establish the repository working set. `/reql` also invokes it explicitly.",
         *PROJECT_SKILL_SOURCE.rule_points,
         PROJECT_SKILL_SOURCE.deterministic_requirement,
     )

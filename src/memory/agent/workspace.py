@@ -32,8 +32,8 @@ AGENT_LOCK_RETRY_DELAY_SECONDS = 0.25
 DASHBOARD_DEFAULT_LIMIT = 5
 DASHBOARD_MAX_LIMIT = 20
 DASHBOARD_POST_MAX_CHARS = 240
-AGENT_NODE_TYPES = {"private_note", "external_note", "task", "session"}
-LEARNED_NODE_TYPES = ("private_note", "external_note")
+AGENT_NODE_TYPES = {"private_note", "external_note", "rejected_approach", "task", "session"}
+LEARNED_NODE_TYPES = ("private_note", "external_note", "rejected_approach")
 
 
 class AgentIdentitySelectionError(ValueError):
@@ -252,6 +252,13 @@ class AgentWorkspace:
         """Add private working memory to this agent's dashboard."""
         return self.add_node("private_note", text)
 
+    def reject_approach(self, approach: str, reason: str) -> dict[str, Any]:
+        """Retain an attempted approach and why it was rejected across sessions."""
+        reason = reason.strip()
+        if not reason:
+            raise ValueError("Rejected approach reason must not be empty")
+        return self.add_node("rejected_approach", approach, metadata={"reason": reason})
+
     def add_external_note(self, text: str, *, sender_agent_id: str) -> dict[str, Any]:
         """Store a note sent by another agent."""
         return self.add_node("external_note", text, metadata={"sender_agent_id": sender_agent_id})
@@ -447,7 +454,7 @@ class AgentWorkspace:
 
     def export(self, *, include_metadata: bool = False) -> dict[str, Any]:
         if not include_metadata:
-            return self.private_dashboard()
+            return self.operational_overview()
         graph = self._require_agent(read_only=True)
         try:
             payload = graph.export_json()
@@ -563,6 +570,9 @@ class AgentWorkspace:
                     if node.id == WORKSPACE_NODE_ID:
                         continue
                     content = str(node.properties.get("content") or node.text or "")
+                    if node.type == "rejected_approach":
+                        reason = str((node.properties.get("metadata") or {}).get("reason") or "")
+                        content = f"{content} — {reason}"
                     if cls._dashboard_search_matches(content, needle):
                         results.append({
                             "timestamp": node.updated_at or node.created_at,
@@ -600,13 +610,27 @@ class AgentWorkspace:
         if limit < 1 or limit > DASHBOARD_MAX_LIMIT:
             raise ValueError(f"Agent dashboard limit must be between 1 and {DASHBOARD_MAX_LIMIT}")
         return {
-            "format": "reql-agent-dashboard-v2",
+            "format": "reql-agent-dashboard-v3",
             "public": self.public_dashboard(limit=limit),
             "private": self.private_dashboard(limit=limit),
+            "overview_command": "reql project overview",
         }
 
     def private_dashboard(self, *, limit: int = 50) -> dict[str, Any]:
-        """Return the selected agent's complete private planning view."""
+        """Return bounded orientation: what failed, what finished, and what remains."""
+        overview = self.operational_overview()
+        return {
+            "format": "reql-agent-private-dashboard-v3",
+            "agent": overview["agent"],
+            "open": overview["open_tasks"][:limit],
+            "done": overview["done_tasks"][:limit],
+            "rejected": overview["rejected_approaches"][:limit],
+            "private_notes": overview["private_notes"][:limit],
+            "external_notes": overview["external_notes"][:limit],
+        }
+
+    def operational_overview(self) -> dict[str, Any]:
+        """Return complete private task and rejection history for project overview."""
         graph = self._require_agent(read_only=True)
         try:
             workspace = graph.get_node(WORKSPACE_NODE_ID)
@@ -614,18 +638,33 @@ class AgentWorkspace:
             tasks = [self._node_payload(node) for node in nodes if node.type == "task"]
             private_notes = [self._node_payload(node) for node in nodes if node.type in {"private_note", "note"}]
             external_notes = [self._node_payload(node) for node in nodes if node.type == "external_note"]
-            for section in (tasks, private_notes, external_notes):
+            rejected_approaches = [self._node_payload(node) for node in nodes if node.type == "rejected_approach"]
+            for section in (tasks, private_notes, external_notes, rejected_approaches):
                 section.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
             status = self._current_session_status_payload(nodes, workspace)
             return {
-                "format": "reql-agent-private-dashboard-v2",
                 "agent": {"agent_id": self.agent_id, "status": self._agent_status(), **status},
-                "tasks": tasks[:limit],
-                "private_notes": private_notes[:limit],
-                "external_notes": external_notes[:limit],
+                "open_tasks": [task for task in tasks if task["status"] != "done"],
+                "done_tasks": [task for task in tasks if task["status"] == "done"],
+                "private_notes": private_notes,
+                "external_notes": external_notes,
+                "rejected_approaches": rejected_approaches,
             }
         finally:
             graph.close()
+
+    @classmethod
+    def project_operational_overview(
+        cls, standard_storage: str | Path, *, config: REQLConfig | None = None
+    ) -> dict[str, Any]:
+        """Collect complete operational history from every registered agent."""
+        dashboard_storage = cls.default_dashboard_storage(standard_storage)
+        agents = []
+        for agent_id in cls._registered_agent_ids(dashboard_storage):
+            workspace = cls(standard_storage, agent_id=agent_id, config=config)
+            if workspace.exists():
+                agents.append(workspace.operational_overview())
+        return {"agents": agents}
 
     def finish(self, summary: str | None = None) -> dict[str, Any]:
         """Close the current session and publish its final message as shared context."""
@@ -1117,7 +1156,7 @@ class AgentWorkspace:
     def _node_payload(self, node: MemoryNode, *, include_metadata: bool = True) -> dict[str, Any]:
         if not include_metadata:
             return self._compact_node_payload(node)
-        return {
+        payload = {
             "id": node.id,
             "type": node.type,
             "title": node.properties.get("title") or node.label,
@@ -1130,6 +1169,12 @@ class AgentWorkspace:
             "session_id": node.properties.get("session_id"),
             "session_title": node.properties.get("session_title"),
         }
+        if node.type == "rejected_approach":
+            payload["reason"] = payload["metadata"].get("reason")
+        if node.type == "task" and node.status == "done":
+            payload["completion_message"] = node.properties.get("completion_message")
+            payload["completed_at"] = node.properties.get("completed_at")
+        return payload
 
     def _compact_node_payload(self, node: MemoryNode) -> dict[str, Any]:
         title = str(node.properties.get("title") or node.label or node.id)

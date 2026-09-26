@@ -78,6 +78,10 @@ coding workflow: REQL bounds discovery, while the checked-out source and tests
 remain authoritative. Bootstrap, query,
 update, reporting, document, and Agent Workspace details stay in routed
 `references/` files loaded only when their situation occurs.
+For resumed work, the generated skill directs agents to check `project overview`
+for cross-agent rejected, done, and open work before choosing an approach. It
+keeps discovery bounded to relevant graph results and source spans so agents do
+not repeatedly scan the whole project.
 The commands below are the operations the agent integration uses to bootstrap
 context, retrieve focused evidence, and keep working memory:
 
@@ -109,7 +113,9 @@ it implements, reviews, or documents a repository:
 ```bash
 reql agent init --name "Focused implementation pass"
 reql agent dashboard
+reql project overview
 reql agent note "Read src/memory/cli.py and found the argparse command surface"
+reql agent reject "Cache every query" "Results stayed stale after source edits"
 reql agent note --public "Parser API now returns a document result"
 reql agent note --agent agent:reviewer "Check the updated parser return type"
 reql agent task add "Implement the reset behavior"
@@ -128,9 +134,11 @@ Use `reql agent dashboard` for the public dashboard and the selected private
 dashboard; use `reql agent --agent "agent:AGENT_ID" dashboard` to view another
 agent's private dashboard when permitted.
 
-The public dashboard contains the agent roster, coordination-safe active-task
-summaries, shared context, and drill information. A private dashboard contains
-the complete task list, private notes, and directed external notes. Public
+The private dashboard lists recent rejected, done, and open work, then gives an
+exact `project overview` command for the complete project explanation and history
+across registered agents. Rejections retain their reasons and originating sessions across work
+sessions. The public dashboard contains the agent roster, coordination-safe
+active-task summaries, shared context, and drill information. Public
 notes, task-completion messages, and finish messages are all timestamped shared
 context. Private history remains intact after `finish` or `terminate`.
 

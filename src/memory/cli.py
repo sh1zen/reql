@@ -556,18 +556,53 @@ def _print_agent_dashboard(payload: dict[str, Any]) -> None:
         print(f"  {item.get('label')}: {item.get('command')}")
     if private is not None:
         print(f"Private dashboard: {private.get('agent', {}).get('agent_id')}")
-        for section, label in (("tasks", "Tasks"), ("private_notes", "Private Notes"), ("external_notes", "External Notes")):
+        for section, label in (("rejected", "Rejected"), ("done", "Done"), ("open", "Open"), ("private_notes", "Private Notes"), ("external_notes", "External Notes")):
             print(f"{label}:")
             for item in private.get(section) or []:
-                if section == "tasks":
+                if section in {"done", "open"}:
                     completion = item.get("completion_message")
                     suffix = f"\t{completion}" if completion else ""
                     print(
                         f"  {item.get('updated_at')}\t{item.get('id')}\t{item.get('status')}\t"
-                        f"{item.get('title') or item.get('content')}{suffix}"
+                        f"{item.get('content')}{suffix}"
                     )
                 else:
-                    print(f"  {item.get('updated_at')}\t{item.get('title') or item.get('content')}")
+                    suffix = (
+                        f"\t{item.get('reason')}"
+                        if section == "rejected" else ""
+                    )
+                    content = item.get("content") if section == "rejected" else item.get("title") or item.get("content")
+                    print(f"  {item.get('updated_at')}\t{content}{suffix}")
+    print(f"Project overview: {payload.get('overview_command')}")
+
+
+def _configure_project_overview_parser(parser: argparse.ArgumentParser) -> None:
+    """Configure the working-directory project overview command."""
+    parser.add_argument("--json", action="store_true", help="Print structured JSON result")
+
+
+def _handle_project_overview(context: CommandContext) -> int:
+    """Combine the current project's explanation with every agent's history."""
+    from memory.agent import AgentWorkspace
+
+    args = context.args
+    explanation = context.graph.explain_project(args.path)
+    operational = AgentWorkspace.project_operational_overview(args.storage, config=context.config)
+    if args.json:
+        _print_json({"format": "reql-project-overview-v1", "project": explanation.to_dict(), "operational": operational})
+        return 0
+    print(explanation.to_markdown())
+    print("\n## Operational history")
+    if not operational["agents"]:
+        print("No Agent Workspace history for this project.")
+        return 0
+    for section, label in (("rejected_approaches", "Rejected approaches"), ("done_tasks", "Done"), ("open_tasks", "Open")):
+        print(f"\n### {label}")
+        for agent in operational["agents"]:
+            for item in agent[section]:
+                detail = item.get("reason") if section == "rejected_approaches" else item.get("completion_message")
+                print(f"- {item['content']}" + (f" — {detail}" if detail else "") + f" ({agent['agent']['agent_id']}, {item.get('session_title') or '-'}, {item['updated_at']})")
+    return 0
 
 
 def _configure_project_explain_parser(parser: argparse.ArgumentParser) -> None:
@@ -1396,6 +1431,13 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         handler=_handle_project_explain,
     ),
     CommandSpec(
+        path=("project", "overview"),
+        access=AccessMode.READ_ONLY,
+        help="Show repository explanation and all registered agents' operational history",
+        configure_parser=_configure_project_overview_parser,
+        handler=_handle_project_overview,
+    ),
+    CommandSpec(
         path=("project", "pipeline"),
         access=AccessMode.MUTATING,
         help="Export all detected project flows as Mermaid or interactive HTML",
@@ -1565,6 +1607,10 @@ def build_parser() -> argparse.ArgumentParser:
     agent_note.add_argument("--agent", dest="target_agent_id", default=None, help="Deliver the note to another agent's private dashboard")
     agent_note.add_argument("--public", action="store_true", help="Publish the note to shared dashboard context")
     agent_note.add_argument("--json", action="store_true", help="Print structured JSON result")
+    agent_reject = agent_sub.add_parser("reject", help="Record an attempted approach and why it was rejected")
+    agent_reject.add_argument("approach", help="Approach that was tried")
+    agent_reject.add_argument("reason", help="Reason it was rejected")
+    agent_reject.add_argument("--json", action="store_true", help="Print structured JSON result")
     agent_task = agent_sub.add_parser("task", help="Task commands: add, done, list")
     agent_task_sub = agent_task.add_subparsers(dest="agent_task_command", required=True)
     agent_task_add = agent_task_sub.add_parser("add", help="Add an agent task")
@@ -1906,6 +1952,14 @@ def _main(argv: list[str] | None = None) -> int:
                     _print_json(result)
                 else:
                     _print_agent_node(result)
+                return 0
+            if args.agent_command == "reject":
+                result = workspace.reject_approach(args.approach, args.reason)
+                if args.json:
+                    _print_json(result)
+                else:
+                    _print_agent_node(result)
+                    print(f"Reason: {result['node']['reason']}")
                 return 0
             if args.agent_command == "task":
                 if args.agent_task_command == "add":

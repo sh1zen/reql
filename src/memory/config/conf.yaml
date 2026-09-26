@@ -9,6 +9,7 @@ scan:
   exclude:
     - .git/
     - .reql/
+    - .codex/skills/reql-agent/
     - .cache/
     - .venv/
     - venv/

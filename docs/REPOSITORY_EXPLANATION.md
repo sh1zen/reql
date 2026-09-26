@@ -23,7 +23,14 @@ reql project compile
 reql project explain
 reql project explain --focus "order refund"
 reql project explain --focus "order refund" --json
+reql project overview
 ```
+
+`project overview` uses the current working directory and adds every registered
+agent's rejected approaches, completed tasks, and open tasks to the repository
+explanation. It reads the project graph and private Agent Workspace stores
+separately; `--json` returns both sections as structured data. The dashboard
+prints the exact command at the end.
 
 The Python facade exposes the same projection:
 

@@ -28,6 +28,7 @@ reql inspect --node-id NODE_ID --json
 # Coding-agent operational memory, with no copied project graph data
 reql agent init --name "Serializer cleanup"
 reql agent dashboard
+reql project overview
 # Optional explicit activity scope (Codex uses CODEX_THREAD_ID automatically)
 reql agent --agent AGENT_ID --activity TASK_ID init --name "Serializer cleanup"
 reql agent note "Read the payment service serializer"
@@ -182,6 +183,7 @@ copies canonical project graph facts.
 reql agent init --name "Focused implementation pass"
 reql agent task add "Patch serializer error handling"
 reql agent note "Check the serializer error path"
+reql agent reject "Cache every query" "Results stayed stale after source edits"
 reql agent note --public "The serializer owner is PaymentService"
 reql agent note --agent agent:reviewer "Please review the exception path"
 reql agent task done TASK_ID "Serializer error handling updated and tested"
@@ -200,7 +202,11 @@ private to its owner.
 The public dashboard contains Agents, Active Tasks, Context, and Drill. Its
 Context records include a timestamp, agent id, message type, and content.
 Public notes, finish messages, and task-completion messages all appear there.
-The private dashboard contains Agent, Tasks, Private Notes, and External Notes.
+The private dashboard contains Agent, Rejected, Done, Open, Private Notes, and
+External Notes. It ends with `reql project overview`. Run that command from the
+project directory to combine its explanation with complete operational history
+from every registered agent, including each rejection's reason and originating
+session and each completed task's result. History remains available after `finish`.
 Use `reql agent --agent "agent:AGENT_ID" dashboard` to open a selected private
 dashboard when permitted.
 
@@ -469,14 +475,18 @@ By default, installs write project-local files such as
 directories. `reql-agent` uses the project graph to bound repository discovery,
 then directs the coding agent to verify the current source, callers, contracts,
 and tests. For multi-step or resumed work it also covers Agent Workspace
-commands such as `reql agent init`, recovery and coordination through `agent
-dashboard` and `agent task add`, cleanup via `agent finish`, `agent export
---json`, and `agent reset`. Small self-contained tasks skip Agent Workspace.
+commands such as `reql agent init`, cross-agent recovery through `reql project
+overview`, coordination through `agent dashboard` and `agent task add`,
+recording discarded approaches with `agent reject`, and cleanup through
+`agent finish`, `agent export --json`, and `agent reset`. Small self-contained
+tasks skip Agent Workspace.
 Pass `--project-dir` to target another project root. Pass
 `--user` to write to matching assistant profiles under the home directory.
 
 Generated `SKILL.md` files keep a concise fast path for status, bounded
-retrieval, source verification, edits, tests, refresh, and routing. Bootstrap, query variants,
+retrieval, source verification, edits, tests, refresh, and routing. Agents reuse
+the graph-defined working set and avoid repeated full-project scans. Bootstrap,
+query variants,
 graph refresh, reports, documents, and Agent Workspace guidance live only in
 routed `references/` files and are loaded when that situation occurs. Platform rules
 for Cursor, Copilot, Kilo, and shared instruction files are rendered from the
