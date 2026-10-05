@@ -6,18 +6,11 @@ from pathlib import Path
 
 
 @dataclass(frozen=True)
-class CommandExample:
-    command: str
-    description: str
-
-
-@dataclass(frozen=True)
 class SkillSource:
     name: str
     title: str
     description: str
     summary: str
-    command_examples: tuple[CommandExample, ...]
     workflow_steps: tuple[str, ...]
     rule_points: tuple[str, ...]
     deterministic_requirement: str
@@ -38,54 +31,19 @@ PROJECT_SKILL_SOURCE = SkillSource(
         "repository context before inspecting source."
     ),
     summary=(
-        "Use REQL to narrow repository discovery, not to replace source inspection. Retrieve enough graph evidence "
-        "to identify the likely owner and impact, then verify the current code and tests before changing anything. "
-        "Keep the working set small and retain operational decisions so resumed work does not repeat broad scans."
-    ),
-    command_examples=(
-        CommandExample("project status", "check whether this project has a compiled REQL graph"),
-        CommandExample("project compile", "bootstrap or refresh the graph, including once after edits"),
-        CommandExample('query_context --query "<terms from user request>"', "compact informative context"),
-        CommandExample('query_context --query "<terms from user request>" --code', "compact code-scoped context with files, owner symbols, line ranges, and associated tests"),
-        CommandExample("agent dashboard", "read shared coordination context and the current private dashboard"),
-        CommandExample("project overview", "read project context and complete rejected, done, and open work across agents"),
-        CommandExample('agent reject "<approach tried>" "<reason rejected>"', "retain a failed approach for later sessions"),
-        CommandExample("agent list", "list active agents coordinating in this workspace"),
+        "REQL combines a source-backed repository graph with durable engineering work: goals, tasks, decisions, "
+        "constraints, failures and checkpoints. Retrieve local evidence and project direction, then verify current source. "
+        "Shared work survives agents and sessions; private notes are disposable scratch."
     ),
     workflow_steps=(
-        (
-            "Follow the repository's own instructions, then run `{command_name} project status`. If the command is unavailable "
-            "or the graph is missing, use `references/bootstrap.md`; do not compile a healthy graph just to begin a task."
-        ),
-        (
-            "For multi-step, resumed, or coordinated work, run `{command_name} project overview` from the project directory before choosing an approach; "
-            "it shows rejected, done, and open work across registered agents without selecting one. Then run `{command_name} agent dashboard` for the selected private view. "
-            "If the workspace is uninitialized, run `{command_name} agent init --name \"<task>\"` and retry the dashboard. "
-            "Skip Agent Workspace for a small, self-contained task."
-        ),
-        (
-            "If a path is already known, use `{command_name} locate \"<path>\"`; otherwise run `{command_name} query_context --query \"<short literal terms>\"`. "
-            "Add `--code` for implementation work and other scope flags only when they improve the result."
-        ),
-        (
-            "Use returned owners, paths, spans, relationships, and tests as a bounded discovery set. Inspect the relevant source, callers, contracts, and tests; "
-            "the current files are authoritative when graph evidence is incomplete or stale."
-        ),
-        (
-            "If context is insufficient, make one narrower graph query or use a targeted exact-name/path search for the unresolved gap. "
-            "Do not loop on broad queries, dump the full graph, or rescan the whole repository once the working set is known. "
-            "Treat REQL confidence as a lead, not proof of correctness."
-        ),
-        (
-            "Edit the authoritative owner, update affected consumers and tests together, and run the repository's documented checks."
-        ),
-        (
-            "After changing tracked project files, run `{command_name} project watch-status --json`; let a running watcher refresh the graph, otherwise run one "
-            "`{command_name} project compile`. Skip refresh for read-only work."
-        ),
-        (
-            "If this pass initialized Agent Workspace, close it with `{command_name} agent finish \"<outcome and validation>\"`."
-        ),
+        "Follow repository instructions. Run `{command_name} project status`; use `references/bootstrap.md` if the graph is missing or unusable. Do not compile a healthy graph to begin.",
+        "For substantial or resumed work, read `{command_name} project overview` first: goals, direction, workstreams, completed/active work, blockers and next ready outcomes. Drill with `project context --query \"<terms>\" --file <path>` or `agent show <id> --json`. These reads need no agent selection.",
+        "Use `{command_name} locate \"<path>\"` for a known file or `query_context --query \"<short literal terms>\" --code`. Context includes scoped engineering decisions, failures and dependencies. Read returned owners, spans, callers and tests; source is authoritative. If needed, refine once or use a targeted exact-name search. Do not rescan the whole repository once the working set is known.",
+        "For multi-step work, run `{command_name} agent init --name \"<outcome>\"` and `agent dashboard`. Use the host thread identity, or an explicit `--agent`/`--activity` when ambiguous. Reuse existing work ids before creating outcomes; read `references/agent-workspace.md` for structured commands.",
+        "Persist only changes that affect later reasoning: goal/outcome, decision with why, failed approach, constraint, unresolved question, or tested change with relevant files. `agent record <kind> <text>` stores shared work; `--parent`, `--depends-on` and `--workstream` connect it. Update by `--id` and `--revision` from `agent show`, rather than appending contradictory notes. Replace obsolete approaches with `--supersedes <id> --why <reason>`.",
+        "Keep execution current at natural boundaries: claim a task as `in_progress`, record `blocked` with why, complete it with `agent task done <id> <result and checks>`. Dependencies derive readiness and flag obsolete/conflicting assumptions. Reconcile before proceeding; never mark unfinished work done. Private `agent note` is scratch, not durable knowledge. Do not store secrets, source dumps or repetitive tool output.",
+        "Change the owning implementation and affected consumers, then run documented checks. After source changes, run `{command_name} project watch-status --json`; let a running watcher refresh or run one `project compile`. Skip refresh for read-only work.",
+        "At a substantial boundary, reconcile records and save an `agent record checkpoint` with outcome, evidence and next action. If this pass initialized or resumed a session, close it with `{command_name} agent finish \"<outcome, checks, unresolved work>\"`; it creates a checkpoint and releases private scratch while preserving shared work."
     ),
     rule_points=(
         (
@@ -106,7 +64,7 @@ PROJECT_SKILL_SOURCE = SkillSource(
         ),
         (
             "Use Agent Workspace only for multi-step, resumed, or coordinated work. If `agent dashboard` is uninitialized, run `agent init --name \"<task>\"`; "
-            "read `project overview` from the project directory for cross-agent rejected, done, and open history. Record a discarded approach "
+            "read `project overview` from the project directory for durable goals, direction, blockers and ready work. Reuse structured work ids with `agent record --id ID --revision N`; Record a discarded approach "
             "with `agent reject \"<approach>\" \"<reason>\"`; finish only a pass that initialized or resumed an Agent Workspace session."
         ),
         (
@@ -118,7 +76,7 @@ PROJECT_SKILL_SOURCE = SkillSource(
             "never edit them unless requested."
         ),
     ),
-    deterministic_requirement="Keep REQL deterministic and local; the project graph stores repository facts, while Agent Workspace stores only operational task state.",
+    deterministic_requirement="Keep REQL deterministic and local; the graph owns repository facts, shared work owns engineering intent and execution, and private notes are scratch.",
 )
 
 def skill_markdowns(
@@ -140,6 +98,10 @@ def skill_markdowns(
                 command_path=command_path,
                 fallback_command=fallback_command,
             ),
+        ),
+        (
+            "reql-context-compact",
+            context_compact_skill(platform_name),
         ),
     )
 
@@ -169,7 +131,32 @@ def skill_resources(
     return (
         *(tuple((PROJECT_SKILL_SOURCE.name, item.path, item.content) for item in project_resources)),
         (PROJECT_SKILL_SOURCE.name, agent_workspace.path, agent_workspace.content),
+        (
+            "reql-context-compact",
+            "agents/openai.yaml",
+            "policy:\n  allow_implicit_invocation: false\n",
+        ),
     )
+
+
+def context_compact_skill(platform_name: str) -> str:
+    """Generate the explicit-only, cross-agent transcript compaction skill."""
+    manual_policy = "disable-model-invocation: true\n" if platform_name != "codex" else ""
+    return f"""---
+name: reql-context-compact
+description: Run only when the user invokes /reql-context-compact to compact an exported coding-agent transcript with deterministic, exact-duplicate tool-output removal.
+{manual_policy}---
+
+# REQL context compact
+
+Run only for an explicit `/reql-context-compact` invocation. Never activate during ordinary REQL use or automatically before a host's native compaction.
+
+If the current host exposes an exported JSON transcript and accepts a replacement message list, pass the transcript through `python -m agents.context_compact` using stdin and apply its stdout only after validating the output. The input is a JSON message array or an object with a `messages` array. Each tool result must have `role: "tool"`, a nonempty `name`, and string `content`. The command has no network or model dependency and writes no files.
+
+The algorithm retains every message, all metadata, every instruction and user/assistant turn, marked error results, the latest four messages, and the first full copy of each tool result. It only replaces old tool-result content of at least 512 characters when an earlier result from the same named tool is byte-identical. The replacement points to that retained message and includes its SHA-256 digest. If the host cannot supply or replace the active transcript, report that limitation; do not claim to have compacted the live context. Do not invoke a model-based `/compact` as a substitute.
+
+For a harness with a JSON transcript file, a shell pipeline such as `python -m agents.context_compact < transcript.json > compacted.json` produces a reviewable copy. The host must explicitly choose to use it for subsequent turns. Never overwrite the source transcript or edit private host session files.
+"""
 
 
 def skill_markdown(
@@ -182,7 +169,7 @@ def skill_markdown(
     fallback_command: str,
 ) -> str:
     workflow = _numbered(source.workflow_steps, command_name=command_name)
-    reference_routing = _reference_routing(source.name)
+    reference_routing = _reference_routing()
     return f"""---
 name: {source.name}
 description: {source.description.format(platform_name=platform_name)}
@@ -206,7 +193,7 @@ description: {source.description.format(platform_name=platform_name)}
 """
 
 
-def _reference_routing(source_name: str) -> str:
+def _reference_routing() -> str:
     return "\n".join(
         [
             "- Missing/stale graph, compile, exclusions, command fallback -> `references/bootstrap.md`.",
@@ -231,7 +218,7 @@ def _project_skill_resources(
     openai_yaml = """interface:
   display_name: "REQL Coding Workflow"
   short_description: "Narrow coding work with REQL graph evidence."
-  default_prompt: "Use $reql-agent to narrow repository discovery, verify the current source and tests before editing, use Agent Workspace only for multi-step or resumed work, and refresh the graph once after changed project files."
+  default_prompt: "Use $reql-agent to retrieve source evidence and project direction, reconcile durable work at meaningful boundaries, verify source and tests, and refresh after edits."
 """
     bootstrap = f"""# REQL reference: bootstrap and project state
 
@@ -598,42 +585,35 @@ Load this when using `{command_name} agent` for durable task planning and coordi
 
 {usage}
 
-## Dashboard model
+## Mental model
 
-The public dashboard at `.reql/agent-dashboard.reql` contains agents, active-task summaries, public context, and drill commands. Each agent has a private store under `.reql/agents/` with tasks, notes, rejected approaches, and sessions. `{command_name} agent dashboard` shows recent rejected, done, and open work for the selected agent and ends with `{command_name} project overview`.
+The compiled graph owns source facts; `.reql/agent-dashboard.reql` owns durable engineering work. Private session stores under `.reql/agents/` hold only scratch notes and session lifecycle. Shared records survive finish, reset and agent roster retention. Old private tasks/decisions/rejections migrate on resume or cleanup; already-deleted private history cannot be recovered.
 
-Run `{command_name} project overview` from the project directory when resuming work or coordinating with other agents. It needs no path or agent id and reads the complete rejected, done, and open history of every registered agent alongside the project explanation. Each operational record retains its agent and session; the canonical project graph remains the source of repository facts. Check rejected approaches and their reasons before repeating work. Use current source and tests to verify any code claims in the overview.
+`project overview` needs no path or agent id. It shows bounded goals, direction, workstreams, completed/active work, blockers, failures and next ready outcomes. `project explain` drills into source-backed architecture; `project overview --details` includes full legacy history. `project context --query TERMS --file PATH --task ID --workstream NAME` ranks text/file anchors and traverses dependencies, parent goals, conflicts and replacements. Use only applicable flags. Default retrieval omits obsolete records; add `--history` to audit earlier approaches. `agent show ID --json` retrieves full evidence and the last eight revisions.
 
-Use Agent Workspace when durable planning or recovery is useful. For a small self-contained task, skip it. On a resumed pass, read `project overview` first, then try `agent dashboard`; if it reports that the workspace is uninitialized, initialize a named session and retry. If agent selection is ambiguous, select the intended private agent explicitly; `project overview` remains cross-agent. Do not call `agent finish` unless this pass initialized or resumed a session.
+## Record outcomes, not a running diary
 
-## Workflow
-
-```bash
-{command_name} project overview
-{command_name} agent init --name "Focused implementation pass"
-{command_name} agent dashboard
-{command_name} agent task add "Patch serializer error handling"
-{command_name} agent note "Check caller contracts first"
-{command_name} agent reject "Cache every query" "Results stayed stale after source edits"
-{command_name} agent note --agent AGENT_ID "The parser API now returns ParseResult"
-{command_name} agent note --public "Use parse_document_v2 for new work"
-{command_name} agent task done TASK_ID "Serializer fix completed and tests are passing."
-{command_name} agent finish "Focused tests passed; serializer fix is ready."
-```
-
-`init` creates or resumes the selected session and registers the agent active. `finish` closes the session, marks the agent finished, and publishes its message as public context without deleting private history. Use `agent terminate AGENT_ID` for stale sessions.
-
-`agent list` returns active agents; add `--all` for finished and terminated agents. `agent search QUERY` searches public context and permitted private dashboard history. `agent dashboard` shows the public dashboard plus the selected private dashboard; use `--agent "agent:AGENT_ID"` only when opening a particular private dashboard. The project overview always includes all registered agents.
-
-Tasks and rejected approaches are stored with their owner. `agent reject APPROACH REASON` records what was tried and why it was discarded; give a concrete failure or constraint, not just a verdict. `agent task done TASK_ID MESSAGE` records the result of completed work. Task completion messages, public notes, and finish messages are public context. Notes are private by default, directed with `note --agent`, and shared with `note --public`.
-
-Keep Agent Workspace small and actionable: add tasks for distinct remaining outcomes, mark them done with the observed result, and record only decisions or rejected approaches that would prevent repeated work. Use `agent note` for short operational context that will matter after a session boundary. Do not paste source files, broad search output, or graph facts into notes; retrieve repository facts from the project graph and verify current source. This preserves useful continuity without making later agents reread bulky scans.
-
-Use normal query commands for code facts:
+Use `agent init --name "<outcome>"` before writing. The host thread id selects the session where supported; otherwise use explicit `agent --agent ID --activity SESSION init`. Different sessions can edit the same shared work id. Query existing work first. A repeated identical record is a no-op; changed content under an existing key requires its revision. Only kind/content are needed for a simple outcome; add files, why and links when meaningful.
 
 ```bash
-{command_name} query_context --query "<task terms>" --code
+{command_name} agent record goal "<desired outcome>" --key <stable-name>
+{command_name} agent record task "<remaining outcome>" --parent GOAL_ID --workstream <name> --file src/module.py
+{command_name} agent record decision "<chosen approach>" --why "<reason>" --parent TASK_ID
+{command_name} agent record task "<outcome>" --id TASK_ID --revision 1 --status in_progress
+{command_name} agent record question "<unresolved contract>" --parent TASK_ID --next "<how to resolve>"
+{command_name} agent record decision "<replacement>" --supersedes OLD_ID --why "<why the plan changed>"
+{command_name} agent task done TASK_ID "<what changed; checks and observed results>"
+{command_name} agent reject "<approach tried>" "<failure and why it matters>"
+{command_name} agent finish "<implemented outcome; checks; unfinished work>"
 ```
+
+Supported kinds: goal, task, decision, constraint, failure, question, change, observation, checkpoint. States: active/open/in_progress/blocked, done/resolved, superseded/invalidated/abandoned. For blocked or obsolete work and reopening, provide `--why`. Decisions and failures always need why. `--depends-on ID` derives waiting/ready state; dependencies on replaced work require review, rather than pretending the old assumptions still hold. `--contradicts ID` exposes both sides of a conflict. Repeated link flags accept multiple ids. The Python API accepts empty lists to clear reconciled links.
+
+On a revision conflict, reread and reconcile; do not blindly retry. Update current knowledge by id/revision. `--supersedes` atomically retires the old record and retains the reason and replacement id. When an approach changes, reconcile affected tasks explicitly. REQL flags obsolete dependencies but never assumes that old work transfers to a new approach.
+
+At natural boundaries (decision, failed attempt, completed group, interruption), update affected records with relevant paths, rationale and `--next`. Finish creates a shared checkpoint containing the session's work ids, evidence paths and remaining tasks. Ending a session never completes its tasks. `agent note` is private scratch; `note --public` is a retained message, useful for announcements but not an authoritative decision or plan. Do not paste source files, broad search output, credentials or personal data into work records.
+
+Unreferenced terminal work retains the latest 200 outcomes; live work and referenced causal evidence remain. Revision history is bounded to eight versions per record. `retention.agent_sessions` bounds legacy public messages/roster only. Finish removes the private store and sidecars once no activity remains. Record useful engineering knowledge before finish; private scratch is deliberately disposable.
 
 Installed for: {platform_name} ({scope}).
 """
@@ -661,7 +641,7 @@ def instruction_section(
     return f"""{section_start}
 ## REQL
 
-REQL is installed ({scope}) as the deterministic memory graph for this workspace.
+REQL is installed ({scope}) for source context and durable engineering coordination.
 This generated section is shared by supported coding assistants: {supported_clients}.
 
 {body}
@@ -761,14 +741,6 @@ def _command_usage(*, command_name: str, command_path: Path, fallback_command: s
     return (
         f"Prefer `{command_name}` for REQL commands. If it is not on `PATH`, use the installed shim at "
         f"`{command_path}`. If that is unavailable, use `{fallback_command}`."
-    )
-
-
-def _format_examples(source: SkillSource, command_name: str) -> str:
-    width = max(len(f"{command_name} {example.command}") for example in source.command_examples) + 2
-    return "\n".join(
-        f"{command_name} {example.command}".ljust(width) + f"# {example.description}"
-        for example in source.command_examples
     )
 
 

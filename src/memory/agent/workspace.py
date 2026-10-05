@@ -4,7 +4,8 @@ from __future__ import annotations
 import os
 import re
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -12,11 +13,12 @@ from uuid import uuid4
 
 from api.memory_graph import MemoryGraph
 from memory.config import REQLConfig, default_config
+from memory.services.coordination import CoordinationStore, KINDS, TERMINAL
 from memory.domain.exceptions import StorageError
 from memory.domain.ids import stable_id
 from memory.domain.models import MemoryNode
 from memory.domain.timeutils import parse_dt, utcnow_iso
-from memory.storage import BlockGraphStore, StoreLease, inspect_store_locks
+from memory.storage import BlockGraphStore, StoreLease, exclusive_store_lock
 
 AGENT_STORAGE_FILE = "agent.reql"
 AGENT_DASHBOARD_STORAGE_FILE = "agent-dashboard.reql"
@@ -32,8 +34,7 @@ AGENT_LOCK_RETRY_DELAY_SECONDS = 0.25
 DASHBOARD_DEFAULT_LIMIT = 5
 DASHBOARD_MAX_LIMIT = 20
 DASHBOARD_POST_MAX_CHARS = 240
-AGENT_NODE_TYPES = {"private_note", "external_note", "rejected_approach", "task", "session"}
-LEARNED_NODE_TYPES = ("private_note", "external_note", "rejected_approach")
+AGENT_NODE_TYPES = {"private_note", "external_note", "session"}
 
 
 class AgentIdentitySelectionError(ValueError):
@@ -95,6 +96,8 @@ class AgentWorkspace:
             else self.agent_storage_for(standard_path, self.agent_id),
             dashboard_storage=resolved_dashboard_storage,
         )
+        if len({self.paths.standard_storage, self.paths.agent_storage, self.paths.dashboard_storage}) != 3:
+            raise ValueError("Project, private agent, and public dashboard stores must use distinct paths")
         self.config = config or default_config()
 
     @staticmethod
@@ -148,18 +151,21 @@ class AgentWorkspace:
         if session_name == "":
             raise ValueError("Agent session name must not be empty")
         init_lease = self.paths.agent_storage.with_name(f"{self.paths.agent_storage.name}.init")
-        with StoreLease(init_lease, timeout_seconds=AGENT_READ_LOCK_TIMEOUT_SECONDS):
+        with self._lifecycle_lease(), StoreLease(init_lease, timeout_seconds=AGENT_READ_LOCK_TIMEOUT_SECONDS):
             already_initialized = self.exists()
             result = self._initialized_workspace() if already_initialized else self._recreate(remove_existing=False)
-        result["already_initialized"] = already_initialized
-        self._register_agent(status="active")
-        if not self._active_session_id():
-            result["session"] = self.start_session(session_name or "Agent session")["session"]
+            result["already_initialized"] = already_initialized
+            self._migrate_work()
+            self._register_agent(status="active")
+            if not self._active_session_id():
+                result["session"] = self.start_session(session_name or "Agent session")["session"]
+            result["retention"] = self._prune_completed_agents()
         return result
 
     def reset(self) -> dict[str, Any]:
-        result = self._recreate()
-        self._register_agent(status="active")
+        with self._lifecycle_lease():
+            result = self._recreate()
+            self._register_agent(status="active")
         return result
 
     def _initialized_workspace(self) -> dict[str, Any]:
@@ -197,12 +203,13 @@ class AgentWorkspace:
                 "nodes": 0,
                 "agent_nodes": 0,
             }
+        shared = self.coordination.records()
         graph = self._open_agent(read_only=True)
         try:
             workspace = graph.get_node(WORKSPACE_NODE_ID)
             nodes = graph.store.all_nodes()
             agent_nodes = [node for node in nodes if node.id != WORKSPACE_NODE_ID]
-            session_status = self._current_session_status_payload(nodes, workspace)
+            session_status = self._current_session_status_payload(nodes, workspace, shared)
             return {
                 "exists": True,
                 "agent_id": self.agent_id,
@@ -220,7 +227,7 @@ class AgentWorkspace:
         finally:
             graph.close()
 
-    def _current_session_status_payload(self, nodes: list[MemoryNode], workspace: MemoryNode | None) -> dict[str, Any]:
+    def _current_session_status_payload(self, nodes: list[MemoryNode], workspace: MemoryNode | None, work: list[dict[str, Any]]) -> dict[str, Any]:
         session_id = self._current_session_id(workspace) if workspace is not None else ""
         if not session_id:
             return {
@@ -233,13 +240,8 @@ class AgentWorkspace:
         session = next((node for node in nodes if node.id == session_id and node.type == "session"), None)
         session_title = session.properties.get("title") if session is not None else None
         started_at = session.properties.get("started_at") if session is not None else None
-        open_tasks = [
-            node
-            for node in nodes
-            if node.type == "task"
-            and node.status != "done"
-            and node.properties.get("session_id") == session_id
-        ]
+        open_tasks = [item for item in work if item["kind"] == "task"
+                      and item["status"] not in TERMINAL and item["session_id"] == session_id]
         return {
             "current_session_id": session_id,
             "current_session_title": session_title,
@@ -257,7 +259,11 @@ class AgentWorkspace:
         reason = reason.strip()
         if not reason:
             raise ValueError("Rejected approach reason must not be empty")
-        return self.add_node("rejected_approach", approach, metadata={"reason": reason})
+        if not approach.strip():
+            raise ValueError("Agent node content must not be empty")
+        result = self.record("failure", approach, rationale=reason)
+        result["node"] = self._work_payload(result["node"])
+        return result
 
     def add_external_note(self, text: str, *, sender_agent_id: str) -> dict[str, Any]:
         """Store a note sent by another agent."""
@@ -336,43 +342,82 @@ class AgentWorkspace:
         self._register_agent(status="active")
         return result
 
-    def add_task(self, description: str) -> dict[str, Any]:
-        result = self.add_node("task", description, status="open")
-        self._sync_active_task(result["node"])
-        return result
+    @property
+    def coordination(self) -> CoordinationStore:
+        """Access the authoritative project work store without opening it."""
+        return CoordinationStore(self.paths.dashboard_storage)
 
-    def complete_task(self, node_id: str, message: str) -> dict[str, Any]:
-        completion_message = message.strip()
-        if not completion_message:
-            raise ValueError("Task completion message must not be empty")
-        graph = self._require_agent()
-        try:
-            result = self._complete_task_in_graph(graph, node_id, completion_message)
-        finally:
-            graph.close()
-        self._sync_active_task(result["task"])
-        context = self._publish(completion_message, kind="task_completion", target="public", task_id=node_id)
-        return {**result, "context": context["context"]}
-
-    def list_tasks(self, *, include_all: bool = False) -> dict[str, Any]:
-        """Return this agent's tasks, defaulting to unfinished work."""
+    def record(self, kind: str, content: str, **fields: Any) -> dict[str, Any]:
+        """Persist engineering state with the current agent/session provenance."""
+        session_id = self._active_session_id()
+        if not session_id:
+            raise ValueError("No active session. Run `reql agent init` first.")
         graph = self._require_agent(read_only=True)
         try:
-            tasks = [
-                self._node_payload(node)
-                for node in graph.store.all_nodes()
-                if node.type == "task" and (include_all or node.status == "open")
-            ]
-            tasks.sort(key=lambda item: (str(item.get("updated_at") or ""), str(item.get("id") or "")), reverse=True)
-            return {"tasks": tasks}
+            session = graph.get_node(session_id)
+            title = str(session.label or "") if session else ""
         finally:
             graph.close()
+        result = self.coordination.put(kind, content, agent_id=self.agent_id,
+                                       session_id=session_id, session_title=title, **fields)
+        if result["changed"]:
+            self._touch_agent()
+        return result
 
-    def add_decision(self, text: str) -> dict[str, Any]:
-        return self.add_node("decision", text)
+    def _migrate_work(self) -> None:
+        """Move old tasks/decisions/failures out of private scratch on resume."""
+        source = self._require_agent()
+        try:
+            target = self._ensure_public_dashboard()
+            try:
+                moved = CoordinationStore.migrate(target.store, source.store.all_nodes(), self.agent_id)
+            finally:
+                target.close()
+            with source.store.transaction():
+                for item_id in moved:
+                    source.store.remove_node(item_id)
+        finally:
+            source.close()
 
-    def add_finding(self, text: str) -> dict[str, Any]:
-        return self.add_node("finding", text)
+    def add_task(self, description: str, **fields: Any) -> dict[str, Any]:
+        """Create a durable outcome; identical requests reuse the same record."""
+        return self.record("task", description, **fields)
+
+    def complete_task(self, node_id: str, message: str) -> dict[str, Any]:
+        """Complete shared work with evidence, preserving its dependencies."""
+        if not message.strip():
+            raise ValueError("Task completion message must not be empty")
+        task = self.coordination.show(node_id)
+        if task["kind"] != "task":
+            raise ValueError(f"Agent node is not a task: {node_id}")
+        result = self.record("task", task["content"], record_id=node_id,
+                             expected_revision=task["revision"], status="done", rationale=message)
+        context = self._publish(message, kind="task_completion", target="public", task_id=node_id)
+        return {"task": self._work_payload(result["node"]), "context": context["context"]}
+
+    def list_tasks(self, *, include_all: bool = False) -> dict[str, Any]:
+        """Return owned work, including unfinished outcomes from previous sessions."""
+        return {"tasks": [self._work_payload(item) for item in self.coordination.records()
+                          if item["kind"] == "task" and item["agent_id"] == self.agent_id
+                          and (include_all or item["status"] not in TERMINAL)]}
+
+    def add_decision(self, text: str, *, rationale: str, **fields: Any) -> dict[str, Any]:
+        """Record a shared decision and why it holds."""
+        return self.record("decision", text, rationale=rationale, **fields)
+
+    def add_finding(self, text: str, **fields: Any) -> dict[str, Any]:
+        """Record a scoped discovery for later work."""
+        return self.record("observation", text, **fields)
+
+    @staticmethod
+    def _work_payload(item: dict[str, Any]) -> dict[str, Any]:
+        """Adapt durable records to supported dashboard/task output fields."""
+        payload = dict(item)
+        if item["kind"] == "failure":
+            payload.update(type="rejected_approach", reason=item["rationale"])
+        if item["kind"] == "task" and item["status"] == "done":
+            payload.update(completion_message=item["rationale"], completed_at=item["updated_at"])
+        return payload
 
     def add_node(
         self,
@@ -383,6 +428,9 @@ class AgentWorkspace:
         status: str = "active",
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        if node_type in KINDS or node_type in {"finding", "rejected_approach"}:
+            kind = {"finding": "observation", "rejected_approach": "failure"}.get(node_type, node_type)
+            return self.record(kind, content, status=status, rationale=(metadata or {}).get("reason"))
         graph = self._require_agent()
         try:
             return self._create_agent_node(graph, node_type, content, title=title, status=status, metadata=metadata)
@@ -398,6 +446,7 @@ class AgentWorkspace:
         limit: int = 20,
         include_metadata: bool = False,
     ) -> dict[str, Any]:
+        shared_matches = self.coordination.context(query, limit=min(40, max(1, limit)), include_history=True)["records"]
         graph = self._require_agent(read_only=True)
         try:
             node_types = {node_type} if node_type else None
@@ -411,11 +460,19 @@ class AgentWorkspace:
                 items.append({"score": score, "node": self._node_payload(node, include_metadata=include_metadata)})
                 if len(items) >= limit:
                     break
-            return {"query": query, "results": items}
+            for item in shared_matches:
+                work = self._work_payload(item)
+                if item["agent_id"] == self.agent_id and (not node_type or work["type"] == node_type) and (not status or item["status"] == status):
+                    items.append({"score": item["score"], "node": work})
+            items.sort(key=lambda item: item["score"], reverse=True)
+            return {"query": query, "results": items[:limit]}
         finally:
             graph.close()
 
     def show(self, item_id: str) -> dict[str, Any]:
+        for item in self.coordination.records():
+            if item["id"] == item_id:
+                return {"kind": "node", "node": self._work_payload(item)}
         graph = self._require_agent(read_only=True)
         try:
             node = graph.get_node(item_id)
@@ -433,7 +490,8 @@ class AgentWorkspace:
         since: str | None = None,
         limit: int = 50,
     ) -> dict[str, Any]:
-        graph = self._require_agent()
+        shared = [self._work_payload(item) for item in self.coordination.records() if item["agent_id"] == self.agent_id]
+        graph = self._require_agent(read_only=True)
         try:
             since_dt = parse_dt(since) if since else None
             nodes: list[dict[str, Any]] = []
@@ -447,6 +505,9 @@ class AgentWorkspace:
                 if since_dt and (parse_dt(node.updated_at) or parse_dt(node.created_at)) < since_dt:
                     continue
                 nodes.append(self._node_payload(node))
+            nodes.extend(item for item in shared if (not node_type or item["type"] == node_type)
+                         and (not status or item["status"] == status)
+                         and (not since_dt or parse_dt(item["updated_at"]) >= since_dt))
             nodes.sort(key=lambda item: (str(item.get("updated_at") or ""), str(item.get("id") or "")), reverse=True)
             return {"nodes": nodes[:limit]}
         finally:
@@ -455,6 +516,7 @@ class AgentWorkspace:
     def export(self, *, include_metadata: bool = False) -> dict[str, Any]:
         if not include_metadata:
             return self.operational_overview()
+        shared = [self._work_payload(item) for item in self.coordination.records() if item["agent_id"] == self.agent_id]
         graph = self._require_agent(read_only=True)
         try:
             payload = graph.export_json()
@@ -465,7 +527,7 @@ class AgentWorkspace:
                 "agent_storage": str(self.paths.agent_storage),
                 "dashboard_storage": str(self.paths.dashboard_storage),
                 "initialized_at": workspace.properties.get("initialized_at") if workspace else None,
-                "nodes": [self._node_payload(MemoryNode.from_dict(item), include_metadata=True) for item in payload["nodes"]],
+                "nodes": [self._node_payload(MemoryNode.from_dict(item), include_metadata=True) for item in payload["nodes"]] + shared,
             }
         finally:
             graph.close()
@@ -485,7 +547,12 @@ class AgentWorkspace:
         try:
             nodes = [node for node in graph.store.all_nodes() if node.id != PUBLIC_DASHBOARD_NODE_ID]
             agents = [self._dashboard_agent_payload(node) for node in nodes if node.type == "agent"]
-            tasks = [self._dashboard_context_payload(node) for node in nodes if node.type == "active_task" and node.status == "active"]
+            active_agents = {item["agent_id"] for item in agents if item["status"] == "active"}
+            active_sessions = {session_id for node in nodes if node.type == "agent" and node.status == "active"
+                               for session_id in node.properties.get("active_session_ids", [])}
+            tasks = [self._work_payload(CoordinationStore._payload(node)) for node in nodes if node.type == "work_record"
+                     and (item := node.properties)["kind"] == "task" and item["status"] not in TERMINAL
+                     and item["agent_id"] in active_agents and item["session_id"] in active_sessions]
             context = [self._dashboard_context_payload(node) for node in nodes if node.type == "context"]
             agents.sort(key=lambda item: (str(item.get("last_activity_at") or ""), str(item["agent_id"])), reverse=True)
             tasks.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
@@ -513,36 +580,36 @@ class AgentWorkspace:
     def terminate_agent(
         cls, standard_storage: str | Path, agent_id: str, *, config: REQLConfig | None = None
     ) -> dict[str, Any]:
-        """Terminate a stale agent while retaining all private dashboard history."""
+        """Terminate a stale agent and release its private operational store."""
         workspace = cls(standard_storage, agent_id=agent_id, config=config)
-        dashboard = workspace.public_dashboard(limit=500)
-        if not any(item["agent_id"] == workspace.agent_id for item in dashboard["agents"]):
-            raise ValueError(f"Agent is not registered: {workspace.agent_id}")
-        closed_session = None
-        if workspace.exists():
-            graph = workspace._require_agent()
-            try:
-                with graph.store.transaction():
-                    root = graph.get_node(WORKSPACE_NODE_ID)
-                    session_id = workspace._current_session_id(root)
-                    if session_id:
-                        session = graph.get_node(session_id)
-                        if session is not None and session.status == "active":
-                            now = utcnow_iso()
-                            properties = dict(session.properties)
-                            properties.update({"ended_at": now, "is_current": False, "termination": "forced"})
-                            graph.store.update_node_fields(session.id, status="terminated", properties=properties, updated_at=now)
-                            closed_session = session.id
-                        root_props = dict(root.properties) if root is not None else {}
-                        current = dict(root_props.get("current_session_ids") or {})
-                        current.pop(workspace._session_scope_key(), None)
+        with workspace._lifecycle_lease():
+            dashboard = workspace.public_dashboard(limit=10_000)
+            if not any(item["agent_id"] == workspace.agent_id for item in dashboard["agents"]):
+                raise ValueError(f"Agent is not registered: {workspace.agent_id}")
+            closed_sessions: list[str] = []
+            if workspace.exists():
+                graph = workspace._require_agent()
+                try:
+                    with graph.store.transaction():
+                        root = graph.get_node(WORKSPACE_NODE_ID)
+                        now = utcnow_iso()
+                        for session in graph.store.all_nodes():
+                            if session.type == "session" and session.status == "active":
+                                properties = dict(session.properties)
+                                properties.update({"ended_at": now, "is_current": False, "termination": "forced"})
+                                graph.store.update_node_fields(session.id, status="terminated", properties=properties, updated_at=now)
+                                closed_sessions.append(session.id)
                         if root is not None:
-                            root_props["current_session_ids"] = current
-                            graph.store.update_node_fields(root.id, properties=root_props)
-            finally:
-                graph.close()
-        workspace._register_agent(status="terminated", session_id=closed_session)
-        return {"agent_id": workspace.agent_id, "status": "terminated", "closed_session_id": closed_session}
+                            properties = dict(root.properties)
+                            properties["current_session_ids"] = {}
+                            graph.store.update_node_fields(root.id, properties=properties)
+                finally:
+                    graph.close()
+            closed_session = closed_sessions[-1] if closed_sessions else None
+            workspace._publish(f"Agent terminated: {workspace.agent_id}", kind="termination", target="public", session_id=closed_session)
+            workspace._register_agent(status="terminated", session_id=closed_session)
+            retention = workspace._prune_completed_agents()
+        return {"agent_id": workspace.agent_id, "status": "terminated", "closed_session_id": closed_session, "retention": retention}
 
     @classmethod
     def search_dashboards(
@@ -583,6 +650,9 @@ class AgentWorkspace:
                         })
             finally:
                 graph.close()
+        for item in reader.coordination.context(needle, limit=min(40, max(1, limit)), include_history=True)["records"]:
+            results.append({"timestamp": item["updated_at"], "agent_id": item["agent_id"],
+                            "context": item["content"] + " — " + item["rationale"], "scope": "work", "id": item["id"]})
         results.sort(key=lambda item: str(item.get("timestamp") or ""), reverse=True)
         return {"query": query, "results": results[:limit]}
 
@@ -631,20 +701,22 @@ class AgentWorkspace:
 
     def operational_overview(self) -> dict[str, Any]:
         """Return complete private task and rejection history for project overview."""
+        shared = [self._work_payload(item) for item in self.coordination.records() if item["agent_id"] == self.agent_id]
+        agent_status = self._agent_status()
         graph = self._require_agent(read_only=True)
         try:
             workspace = graph.get_node(WORKSPACE_NODE_ID)
             nodes = [node for node in graph.store.all_nodes() if node.id != WORKSPACE_NODE_ID]
-            tasks = [self._node_payload(node) for node in nodes if node.type == "task"]
+            tasks = [item for item in shared if item["kind"] == "task"]
             private_notes = [self._node_payload(node) for node in nodes if node.type in {"private_note", "note"}]
             external_notes = [self._node_payload(node) for node in nodes if node.type == "external_note"]
-            rejected_approaches = [self._node_payload(node) for node in nodes if node.type == "rejected_approach"]
+            rejected_approaches = [item for item in shared if item["kind"] == "failure"]
             for section in (tasks, private_notes, external_notes, rejected_approaches):
                 section.sort(key=lambda item: str(item.get("updated_at") or ""), reverse=True)
-            status = self._current_session_status_payload(nodes, workspace)
+            status = self._current_session_status_payload(nodes, workspace, shared)
             return {
-                "agent": {"agent_id": self.agent_id, "status": self._agent_status(), **status},
-                "open_tasks": [task for task in tasks if task["status"] != "done"],
+                "agent": {"agent_id": self.agent_id, "status": agent_status, **status},
+                "open_tasks": [task for task in tasks if task["status"] not in TERMINAL],
                 "done_tasks": [task for task in tasks if task["status"] == "done"],
                 "private_notes": private_notes,
                 "external_notes": external_notes,
@@ -655,16 +727,18 @@ class AgentWorkspace:
 
     @classmethod
     def project_operational_overview(
-        cls, standard_storage: str | Path, *, config: REQLConfig | None = None
+        cls, standard_storage: str | Path, *, config: REQLConfig | None = None, limit: int = 5, include_private: bool = True
     ) -> dict[str, Any]:
         """Collect complete operational history from every registered agent."""
         dashboard_storage = cls.default_dashboard_storage(standard_storage)
         agents = []
-        for agent_id in cls._registered_agent_ids(dashboard_storage):
+        for agent_id in cls._registered_agent_ids(dashboard_storage) if include_private else []:
             workspace = cls(standard_storage, agent_id=agent_id, config=config)
             if workspace.exists():
                 agents.append(workspace.operational_overview())
-        return {"agents": agents}
+        dashboard = cls.read_public_dashboard(standard_storage, limit=10_000, config=config)
+        work = CoordinationStore(dashboard_storage).overview(limit=limit)
+        return {"agents": agents, "context": dashboard["context"], "work": work}
 
     def finish(self, summary: str | None = None) -> dict[str, Any]:
         """Close the current session and publish its final message as shared context."""
@@ -674,44 +748,57 @@ class AgentWorkspace:
         summary_text = (summary or "").strip()
         if not summary_text:
             raise ValueError("Finish message must not be empty")
-        graph = self._require_agent()
-        closed_session = None
-        try:
-            with graph.store.transaction():
-                workspace = graph.get_node(WORKSPACE_NODE_ID)
-                if workspace is None:
-                    raise ValueError("Agent workspace is not initialized. Run `reql agent init` first.")
-                session_id = self._current_session_id(workspace)
-                if session_id:
-                    session = graph.get_node(session_id)
-                    if session is not None and session.type == "session":
-                        now = utcnow_iso()
-                        properties = dict(session.properties)
-                        properties.update({"ended_at": now, "is_current": False})
-                        graph.store.update_node_fields(
-                            session.id,
-                            status="completed",
-                            updated_at=now,
-                            properties=properties,
-                        )
-                        closed_session = session.id
+        with self._lifecycle_lease():
+            session_id = self._active_session_id()
+            work = [item for item in self.coordination.records() if item["session_id"] == session_id]
+            work.sort(key=lambda item: item["updated_at"], reverse=True)
+            work.sort(key=lambda item: item["status"] in TERMINAL)
+            existing_checkpoint = next((item for item in work if item["id"] == stable_id("work", "checkpoint", "", session_id or "")), None)
+            checkpoint_fields = {"record_id": existing_checkpoint["id"], "expected_revision": existing_checkpoint["revision"]} if existing_checkpoint else {}
+            self.record("checkpoint", summary_text, key=session_id, **checkpoint_fields,
+                        status="done", files=sorted({path for item in work for path in item["files"]})[:64],
+                        summarizes=[item["id"] for item in work if item["kind"] != "checkpoint"][:32],
+                        next_action="; ".join(item["next_action"] or item["content"] for item in work if item["kind"] == "task" and item["status"] not in TERMINAL)[:4000])
+            graph = self._require_agent()
+            closed_session = None
+            remaining_sessions: dict[str, str] = {}
+            try:
+                with graph.store.transaction():
+                    workspace = graph.get_node(WORKSPACE_NODE_ID)
+                    if workspace is None:
+                        raise ValueError("Agent workspace is not initialized. Run `reql agent init` first.")
+                    session_id = self._current_session_id(workspace)
+                    session = graph.get_node(session_id) if session_id else None
+                    if session is None or session.type != "session" or session.status != "active":
+                        raise ValueError("No current agent session. Run `reql agent init --name \"...\"` first.")
+                    now = utcnow_iso()
+                    properties = dict(session.properties)
+                    properties.update({"ended_at": now, "is_current": False})
+                    graph.store.update_node_fields(session.id, status="completed", updated_at=now, properties=properties)
+                    closed_session = session.id
                     workspace_properties = dict(workspace.properties)
-                    current_by_activity = dict(workspace_properties.get("current_session_ids") or {})
-                    current_by_activity.pop(self._session_scope_key(), None)
-                    workspace_properties["current_session_ids"] = current_by_activity
+                    remaining_sessions = dict(workspace_properties.get("current_session_ids") or {})
+                    remaining_sessions.pop(self._session_scope_key(), None)
+                    workspace_properties["current_session_ids"] = remaining_sessions
                     graph.store.update_node_fields(workspace.id, properties=workspace_properties)
-        finally:
-            graph.close()
-        context = self._publish(summary_text, kind="finish", target="public")
-        self._register_agent(status="finished", session_id=closed_session)
+            finally:
+                graph.close()
+            context = self._publish(summary_text, kind="finish", target="public", session_id=closed_session)
+            status = "active" if remaining_sessions else "finished"
+            self._register_agent(status=status, session_id=closed_session)
+            retention = self._prune_completed_agents()
+            retention["work_records_removed"] = self.coordination.prune()
         return {
             "agent_id": self.agent_id,
-            "status": "finished",
+            "status": status,
             "closed_session_id": closed_session,
             "context": context["context"],
+            "retention": retention,
         }
 
-    def _publish(self, text: str, *, kind: str, target: str, task_id: str | None = None) -> dict[str, Any]:
+    def _publish(
+        self, text: str, *, kind: str, target: str, task_id: str | None = None, session_id: str | None = None
+    ) -> dict[str, Any]:
         """Append one durable entry to the public dashboard Context section."""
 
         content = text.strip()
@@ -719,7 +806,7 @@ class AgentWorkspace:
             raise ValueError("Dashboard context message must not be empty")
         kind = kind.strip().casefold() or "public_note"
         target = target.strip() or "public"
-        session_id = self._active_session_id()
+        session_id = session_id or self._active_session_id()
         graph = self._ensure_public_dashboard()
         try:
             with graph.store.transaction():
@@ -754,60 +841,16 @@ class AgentWorkspace:
         self._touch_agent()
         return {"created": created, "context": self._dashboard_context_payload(stored)}
 
-    def _complete_task_in_graph(self, graph: MemoryGraph, node_id: str, message: str) -> dict[str, Any]:
-        node = graph.get_node(node_id)
-        if node is None or node.id == WORKSPACE_NODE_ID:
-            raise ValueError(f"Agent node not found: {node_id}")
-        if node.type != "task":
-            raise ValueError(f"Agent node is not a task: {node_id}")
-        props = dict(node.properties)
-        props["completed_at"] = utcnow_iso()
-        props["completion_message"] = message
-        updated = graph.store.update_node_fields(node.id, status="done", properties=props)
-        if updated is None:
-            raise ValueError(f"Agent node not found: {node_id}")
-        return {"task": self._node_payload(updated)}
-
-    def _sync_active_task(self, task: dict[str, Any]) -> None:
-        """Mirror coordination-safe task status on the public dashboard."""
-        graph = self._ensure_public_dashboard()
+    def _agent_status(self) -> str:
+        """Read roster status directly without projecting work or scratch."""
+        if not self.paths.dashboard_storage.exists():
+            return "unknown"
+        graph = self._open_public_dashboard(read_only=True)
         try:
-            with graph.store.transaction():
-                now = utcnow_iso()
-                self._public_dashboard_node(graph, now)
-                task_id = str(task["id"])
-                node_id = stable_id("agent-dashboard-task", self.agent_id, task_id)
-                active = task.get("status") != "done"
-                node = MemoryNode(
-                    id=node_id,
-                    type="active_task",
-                    label=str(task.get("title") or task.get("content") or task_id),
-                    text=str(task.get("content") or task.get("title") or task_id),
-                    canonical_key=node_id,
-                    properties={
-                        "source": "dashboard",
-                        "agent_id": self.agent_id,
-                        "task_id": task_id,
-                        "content": str(task.get("content") or task.get("title") or task_id),
-                        "title": str(task.get("title") or task.get("content") or task_id),
-                    },
-                    status="active" if active else "completed",
-                    created_at=str(task.get("created_at") or now),
-                    updated_at=now,
-                    salience=0.6,
-                    confidence=1.0,
-                )
-                graph.add_node(node)
+            node = graph.get_node(stable_id("agent-identity", self.agent_id))
+            return str(node.status) if node else "unknown"
         finally:
             graph.close()
-        self._touch_agent()
-
-    def _agent_status(self) -> str:
-        dashboard = self.public_dashboard(limit=500)
-        for identity in dashboard["agents"]:
-            if identity["agent_id"] == self.agent_id:
-                return str(identity["status"])
-        return "unknown"
 
     def _create_agent_node(
         self,
@@ -890,22 +933,127 @@ class AgentWorkspace:
         return self._remove_agent_store_path(self.paths.agent_storage)
 
     def _remove_agent_store_path(self, base: Path) -> dict[str, int]:
+        """Remove private data under its writer lock, preserving live readers."""
+        if base.resolve() in {self.paths.standard_storage, self.paths.dashboard_storage}:
+            raise ValueError(f"Cannot remove a project or public dashboard store as agent memory: {base}")
         files_removed = 0
         bytes_reclaimed = 0
-        for path in self._agent_store_files(base):
-            try:
-                size = path.stat().st_size
-            except FileNotFoundError:
-                continue
-            path.unlink()
-            files_removed += 1
-            bytes_reclaimed += size
-        readers = base.with_name(f"{base.name}.readers")
-        try:
-            readers.rmdir()
-        except (FileNotFoundError, OSError):
-            pass
+        with exclusive_store_lock(base, timeout_seconds=0.0):
+            for path in self._agent_store_files(base):
+                try:
+                    size = path.stat().st_size
+                except FileNotFoundError:
+                    continue
+                path.unlink()
+                files_removed += 1
+                bytes_reclaimed += size
         return {"files_removed": files_removed, "bytes_reclaimed": bytes_reclaimed}
+
+    @contextmanager
+    def _lifecycle_lease(self) -> Iterator[None]:
+        """Serialize initialization, completion, and retention across agents."""
+        path = self.paths.dashboard_storage.with_name(f"{self.paths.dashboard_storage.name}.lifecycle")
+        try:
+            with StoreLease(path, timeout_seconds=AGENT_READ_LOCK_TIMEOUT_SECONDS):
+                yield
+        except StorageError as exc:
+            raise ValueError(f"Cannot update agent lifecycle: {exc}") from exc
+
+    def _prune_completed_agents(self) -> dict[str, Any]:
+        """Release completed private stores and bound public completion history."""
+        result: dict[str, Any] = {
+            "files_removed": 0,
+            "records_removed": 0,
+            "bytes_reclaimed": 0,
+            "busy_agents": [],
+            "skipped_agents": [],
+        }
+        graph = self._ensure_public_dashboard()
+        try:
+            nodes = graph.store.all_nodes()
+            identities = {str(node.properties.get("agent_id") or node.label): node for node in nodes if node.type == "agent"}
+            protected = {agent_id for agent_id, node in identities.items() if node.status == "active"}
+            active_paths = {
+                Path(str(identities[agent_id].properties.get("agent_storage") or self.agent_storage_for(self.paths.standard_storage, agent_id))).resolve()
+                for agent_id in protected
+            }
+            deferred: set[str] = set()
+            for agent_id, identity in identities.items():
+                if identity.status not in {"finished", "terminated"}:
+                    continue
+                base = self.agent_storage_for(self.paths.standard_storage, agent_id)
+                registered_path = Path(str(identity.properties.get("agent_storage") or base)).resolve()
+                if agent_id == self.agent_id:
+                    base = self.paths.agent_storage
+                if (
+                    registered_path != base
+                    or base.resolve() != base
+                    or base in active_paths
+                    or (agent_id != self.agent_id and not base.is_relative_to(self.paths.standard_storage.parent))
+                ):
+                    result["skipped_agents"].append(agent_id)
+                    deferred.add(agent_id)
+                    protected.add(agent_id)
+                    continue
+                if not any(path.exists() for path in self._agent_store_files(base)):
+                    continue
+                try:
+                    legacy = MemoryGraph.open(base, read_only=True)
+                    try:
+                        CoordinationStore.migrate(graph.store, legacy.store.all_nodes(), agent_id)
+                    finally:
+                        legacy.close()
+                    removed = self._remove_agent_store_path(base)
+                except StorageError as exc:
+                    if "locked" not in str(exc).casefold():
+                        raise
+                    result["busy_agents"].append(agent_id)
+                    deferred.add(agent_id)
+                    protected.add(agent_id)
+                    continue
+                except OSError as exc:
+                    raise ValueError(f"Cannot remove completed agent store {base}: {exc}") from exc
+                for key, value in removed.items():
+                    result[key] += value
+
+            completions = [node for node in nodes if node.type == "context" and node.properties.get("message_type") in {"finish", "termination"}]
+            owners_with_messages = {str(node.properties.get("agent_id") or "") for node in completions}
+            completions.extend(node for agent_id, node in identities.items() if node.status in {"finished", "terminated"} and agent_id not in owners_with_messages)
+            completions.sort(key=lambda node: (node.updated_at, node.id), reverse=True)
+
+            def completion_key(node: MemoryNode) -> tuple[str, str]:
+                """Group a completed session's public records by owner and session."""
+                return (str(node.properties.get("agent_id") or ""), str(node.properties.get("session_id") or node.id))
+
+            ordered_keys = list(dict.fromkeys(completion_key(node) for node in completions))
+            retained = set(ordered_keys[:self.config.retention.agent_sessions])
+            completed = set(ordered_keys)
+            expired = completed - retained
+            retained_owners = {agent_id for agent_id, _ in retained}
+            removed_ids = set()
+            for node in nodes:
+                owner = str(node.properties.get("agent_id") or "")
+                identity = identities.get(owner)
+                inactive = identity is not None and identity.status in {"finished", "terminated"}
+                if node.type == "active_task" and (inactive or node.status != "active" or completion_key(node) in completed):
+                    removed_ids.add(node.id)
+                elif node.type in {"agent", "context"}:
+                    if owner in deferred:
+                        continue
+                    if node.type == "agent" and owner in protected:
+                        continue
+                    if completion_key(node) in expired or (inactive and owner not in retained_owners and owner not in protected):
+                        removed_ids.add(node.id)
+            if removed_ids:
+                with graph.store.transaction():
+                    for node_id in sorted(removed_ids):
+                        result["records_removed"] += int(graph.store.remove_node(node_id))
+                compact = getattr(graph.store, "compact_storage", None)
+                if compact is not None:
+                    result["bytes_reclaimed"] += int(compact().get("bytes_reclaimed", 0))
+        finally:
+            graph.close()
+        return result
 
     @classmethod
     def _normalize_agent_id(cls, agent_id: str) -> str:
@@ -964,10 +1112,19 @@ class AgentWorkspace:
         return safe.strip("._") or "agent"
 
     def _register_agent(self, *, status: str, session_id: str | None = None) -> None:
+        active_session_ids = []
+        if self.exists():
+            private = self._require_agent(read_only=True)
+            try:
+                root = private.get_node(WORKSPACE_NODE_ID)
+                if root:
+                    active_session_ids = list((root.properties.get("current_session_ids") or {}).values())
+            finally:
+                private.close()
         graph = self._ensure_public_dashboard()
         try:
             with graph.store.transaction():
-                self._register_agent_in_graph(graph, status=status, session_id=session_id)
+                self._register_agent_in_graph(graph, status=status, session_id=session_id, active_session_ids=active_session_ids)
         finally:
             graph.close()
 
@@ -982,6 +1139,7 @@ class AgentWorkspace:
         graph: MemoryGraph,
         *,
         status: str,
+        active_session_ids: list[str],
         session_id: str | None = None,
         updated_at: str | None = None,
     ) -> MemoryNode:
@@ -1006,12 +1164,15 @@ class AgentWorkspace:
                 "title": self.agent_id,
                 "content": self.agent_id,
                 "last_activity_at": now,
+                "active_session_ids": active_session_ids,
                 "activity_id": self.activity_id,
                 "selection_source": self.selection_source,
             }
         )
-        if existing is None:
+        if existing is None or (status == "active" and existing.status != "active"):
             props["session_started_at"] = now
+            props.pop("completed_at", None)
+            props.pop("terminated_at", None)
         if status == "finished":
             props["completed_at"] = now
         elif status == "terminated":
@@ -1047,10 +1208,10 @@ class AgentWorkspace:
             graph.close()
 
     def _agent_store_files(self, base: Path) -> Iterable[Path]:
+        """Enumerate data sidecars; the owning lease releases its own lock."""
         yield base
         yield base.with_name(f"{base.name}.wal")
-        yield base.with_name(f"{base.name}.lock")
-        yield base.with_suffix(base.suffix + ".lock")
+        yield base.with_name(f"{base.name}.usage.jsonl")
 
     def _require_agent(self, *, read_only: bool = False) -> MemoryGraph:
         if not self.exists():
@@ -1193,57 +1354,6 @@ class AgentWorkspace:
             payload["session_title"] = node.properties["session_title"]
         return payload
 
-    def _session_context_payload(
-        self,
-        agent_nodes: list[MemoryNode],
-        workspace: MemoryNode | None,
-        *,
-        include_metadata: bool,
-        selected_session_id: str | None,
-    ) -> dict[str, Any]:
-        sessions = [node for node in agent_nodes if node.type == "session"]
-        if selected_session_id:
-            sessions = [node for node in sessions if node.id == selected_session_id]
-        current_session_id = self._current_session_id(workspace)
-
-        def summary(session: MemoryNode) -> dict[str, Any]:
-            items = [
-                node
-                for node in agent_nodes
-                if node.id != session.id and node.properties.get("session_id") == session.id
-            ]
-            highlights = [
-                node
-                for node in items
-                if node.type in {*LEARNED_NODE_TYPES, "task"}
-                and (node.type != "task" or node.status == "done")
-            ]
-            payload: dict[str, Any] = {
-                "id": session.id,
-                "title": session.properties.get("title") or session.label,
-                "status": session.status,
-                "started_at": session.properties.get("started_at") or session.created_at,
-                "ended_at": session.properties.get("ended_at"),
-                "open_task_count": sum(1 for node in items if node.type == "task" and node.status != "done"),
-                "completed_task_count": sum(1 for node in items if node.type == "task" and node.status == "done"),
-                "highlights": [
-                    self._node_payload(node, include_metadata=include_metadata)
-                    for node in sorted(highlights, key=lambda item: item.updated_at, reverse=True)[:6]
-                ],
-            }
-            return payload
-
-        current = next((node for node in sessions if node.id == current_session_id), None)
-        previous = [node for node in sessions if node.id != current_session_id]
-        previous.sort(
-            key=lambda item: str(item.properties.get("started_at") or item.created_at or ""),
-            reverse=True,
-        )
-        return {
-            "current": summary(current) if current is not None else None,
-            "previous": [summary(node) for node in previous[:5]],
-        }
-
     def _dashboard_agent_payload(self, node: MemoryNode) -> dict[str, Any]:
         properties = node.properties
         return {
@@ -1275,44 +1385,6 @@ class AgentWorkspace:
             {"label": "search dashboard history", "command": 'reql agent search "<terms>"'},
         ]
 
-    def _public_dashboard_node_payload(self, node: MemoryNode, *, include_payload: bool = True) -> dict[str, Any]:
-        metadata = {
-            key: value
-            for key, value in node.properties.items()
-            if key
-            not in {
-                "source",
-                "content",
-                "title",
-                "agent_id",
-                "target_agent_id",
-                "agent_storage",
-                "standard_storage",
-                "payload",
-            }
-        }
-        payload: dict[str, Any] = {
-            "id": node.id,
-            "type": node.type,
-            "title": node.properties.get("title") or node.label,
-            "content": node.properties.get("content") or node.text or node.label,
-            "status": node.status,
-            "created_at": node.created_at,
-            "updated_at": node.updated_at,
-            "agent_id": node.properties.get("agent_id"),
-            "target_agent_id": node.properties.get("target_agent_id"),
-            "agent_storage": node.properties.get("agent_storage"),
-            "source": node.properties.get("source"),
-            "metadata": metadata,
-        }
-        if "payload" in node.properties and include_payload:
-            payload["payload"] = node.properties["payload"]
-        return payload
-
-    def _node_is_since(self, node: MemoryNode, since_dt: Any) -> bool:
-        value = parse_dt(node.updated_at) or parse_dt(node.created_at)
-        return value is not None and value >= since_dt
-
     def _current_session_properties(self, graph: MemoryGraph) -> dict[str, Any]:
         workspace = graph.get_node(WORKSPACE_NODE_ID)
         if workspace is None:
@@ -1339,21 +1411,6 @@ class AgentWorkspace:
 
     def _session_scope_key(self) -> str:
         return self.activity_id or DEFAULT_ACTIVITY_SCOPE
-
-    def _resolve_session_selector(self, graph: MemoryGraph, selector: str) -> str:
-        value = selector.strip()
-        if not value:
-            raise ValueError("Agent session selector must not be empty")
-        if value.casefold() == "current":
-            workspace = graph.get_node(WORKSPACE_NODE_ID)
-            session_id = self._current_session_id(workspace)
-            if not session_id:
-                raise ValueError("No current agent session. Run `reql agent init --name \"...\"` first.")
-            return session_id
-        session = graph.get_node(value)
-        if session is None or session.type != "session":
-            raise ValueError(f"Agent session not found: {selector}")
-        return session.id
 
     def _title_from_content(self, content: str) -> str:
         return " ".join(content.split())[:80]

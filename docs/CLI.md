@@ -164,104 +164,59 @@ dedicated execution paths without duplicating graph access classification.
 
 ## Agent Workspace
 
-`reql agent` is the operational-memory layer used by REQL-aware coding-agent
-integrations. Each CLI agent gets its own private memory store under
-`.reql/agents/` and all agents share a small internal public dashboard in
-`.reql/agent-dashboard.reql`. Explicit agent selection has highest precedence;
-otherwise a stable activity/thread id deterministically selects the private
-workspace. An implicit default workspace is used only when selection is
-unambiguous.
-The canonical graph in `.reql/memory.reql` is the sole source of repository,
-file, symbol, and relationship facts. Agent memory never copies, derives, links,
-or synchronizes canonical graph records.
-
-`reql agent` gives each agent a private dashboard under `.reql/agents/` and
-provides one public dashboard at `.reql/agent-dashboard.reql`. It never owns or
-copies canonical project graph facts.
+Shared engineering records persist goals, execution and rationale across agents
+and sessions; private stores retain scratch and active session state. See
+[Engineering coordination](COORDINATION.md) for the schema, migration, examples,
+retention and retrieval semantics.
 
 ```bash
-reql agent init --name "Focused implementation pass"
-reql agent task add "Patch serializer error handling"
-reql agent note "Check the serializer error path"
-reql agent reject "Cache every query" "Results stayed stale after source edits"
-reql agent note --public "The serializer owner is PaymentService"
-reql agent note --agent agent:reviewer "Please review the exception path"
-reql agent task done TASK_ID "Serializer error handling updated and tested"
-reql agent dashboard
-reql agent finish "Focused tests passed; serializer fix is ready"
+reql project overview                         # compact direction and execution
+reql project overview --details --limit 10    # full architecture and legacy history
+reql project context --file src/module.py --query "contract"
+reql project context --task WORK_ID --history --json
+reql agent init --name "Contract update"
+reql agent record task "Validate consumers" --workstream api --file src/module.py
+reql agent record decision "Keep version stable" --why "Consumer compatibility" --parent TASK_ID
+reql agent show TASK_ID --json
+reql agent record task "Validate consumers" --id TASK_ID --revision 1 --status in_progress
+reql agent task done TASK_ID "Consumer regression passed"
+reql agent reject "Cache every query" "Stale after source edits"
+reql agent finish "Consumer update tested; remaining work retained"
 ```
 
-`init` creates or resumes the session and registers the agent as active.
-`finish MESSAGE` closes the session, marks the agent finished, and publishes
-MESSAGE to public dashboard context without deleting private history. Explicit
-`REQL_AGENT_ID` or `--agent` takes precedence over activity-derived identity.
-`task list` returns the current agent's private tasks; add `--all` for completed
-tasks. A task-completion message is published publicly, but the task stays
-private to its owner.
+`agent record KIND CONTENT` creates shared work. `--key` names its identity;
+`--id ID --revision N` reconciles existing work. Optional fields are `--status`,
+`--why`, repeated `--file`, `--workstream`, `--parent`, repeated `--depends-on`,
+`--contradicts`, `--supersedes`, `--summarizes`, `--next` and `--importance 1..3`. Unknown targets,
+cycles, stale updates and completing tasks with unresolved dependencies fail.
 
-The public dashboard contains Agents, Active Tasks, Context, and Drill. Its
-Context records include a timestamp, agent id, message type, and content.
-Public notes, finish messages, and task-completion messages all appear there.
-The private dashboard contains Agent, Rejected, Done, Open, Private Notes, and
-External Notes. It ends with `reql project overview`. Run that command from the
-project directory to combine its explanation with complete operational history
-from every registered agent, including each rejection's reason and originating
-session and each completed task's result. History remains available after `finish`.
-Use `reql agent --agent "agent:AGENT_ID" dashboard` to open a selected private
-dashboard when permitted.
+`project context` accepts `--query`, repeated `--file`, `--workstream`, `--task`,
+`--history`, `--limit 1..40` and `--json`. It opens shared work only and requires
+no agent selection. `query_context` automatically adds bounded relevant work
+through the same Python/CLI/MCP service. `agent show ID --json` includes full
+content, provenance and eight previous revisions, without private selection for
+shared records. `project overview --limit 1..20` bounds each section; counts
+expose additional work, and workstreams summarize derived execution states.
 
-Use `agent dashboard` to inspect public coordination state and the selected
-private dashboard. Open a selected private dashboard, when permitted, with
-`reql agent --agent "agent:AGENT_ID" dashboard`.
+Explicit `--agent`/`REQL_AGENT_ID` takes precedence over activity-derived identity
+(`--activity`, `REQL_AGENT_ACTIVITY_ID`, `CODEX_THREAD_ID`). Ambiguous private
+selection fails with guidance. `agent dashboard` shows shared coordination and
+owned work plus private notes; `agent task list --all` includes completed owned
+outcomes from earlier sessions. Another session can continue a shared work id
+with its observed revision. `agent list --all` includes retained completed agents.
 
-```bash
-reql agent dashboard
-reql agent --agent "agent:AGENT_ID" dashboard
-reql agent list
-reql agent list --all
-reql agent search "serializer exception path"
-reql agent terminate agent:stale-worker
-```
+`agent note` is private scratch, `note --agent ID` is directed scratch, and
+`note --public` publishes a legacy message. `agent search` searches shared work
+and public/private messages with attribution. Durable decisions belong in records.
+Finish creates a checkpoint, preserves unfinished tasks and shared knowledge,
+then removes private storage once all activities close. `agent terminate ID`
+closes a stale agent's activities and preserves work before cleanup. Init, finish
+and terminate reconcile completed stores; busy stores are deferred and unmanaged
+paths are preserved. `agent reset` resets scratch, not shared engineering records.
 
-`agent list` returns active agents by default; `--all` includes finished and
-terminated agents. `agent search QUERY` searches the public dashboard, private
-dashboards, notes, tasks, and historical finish and completion messages. Each
-result includes timestamp, agent id, and surrounding context. Search matches an
-exact phrase or all normalized query terms in any order, so punctuation and
-word order do not prevent recovery of otherwise matching history. Private
-dashboard task rows include their ids, statuses, and completion messages.
-
-Use `agent note TEXT` for a private self-note, `agent note --agent AGENT_ID
-TEXT` for a directed external note, and `agent note --public TEXT` for shared
-context. Notes are the dashboard communication mechanism.
-
-Every coding agent should finish its work pass:
-
-```bash
-reql agent finish "Focused tests passed; serializer fix is ready"
-```
-
-`agent finish` closes the active session, marks the agent finished, and makes
-its supplied final message public. Its private store and all historical tasks
-and notes are retained. Use `agent terminate AGENT_ID` when an agent is stale,
-stuck, or cannot finish itself.
-
-The public dashboard's Context section retains public notes, task-completion
-messages, and finish messages. The selected private dashboard shows its full
-tasks, self-notes, and external notes. These dashboards are the only agent
-coordination surfaces.
-Agent commands emit lifecycle progress on stderr while JSON stays on stdout.
-Use `reql agent --no-progress COMMAND ...` when a caller requires silent
-stderr.
-
-Reset discards the selected agent's dashboard history without reading or
-changing the canonical graph:
-
-```bash
-reql agent reset
-```
-
-The dashboard supports `--json`; search accepts `--limit` to bound its results.
+Agent commands emit progress on stderr; JSON remains on stdout. Use
+`agent --no-progress COMMAND` to suppress progress. `agent export --metadata`
+includes owned shared work alongside private session/scratch records.
 
 ## Retrieval Commands
 
@@ -477,7 +432,8 @@ then directs the coding agent to verify the current source, callers, contracts,
 and tests. For multi-step or resumed work it also covers Agent Workspace
 commands such as `reql agent init`, cross-agent recovery through `reql project
 overview`, coordination through `agent dashboard` and `agent task add`,
-recording discarded approaches with `agent reject`, and cleanup through
+structured reconciliation with `agent record`, discarded approaches with
+`agent reject`, and checkpoints through
 `agent finish`, `agent export --json`, and `agent reset`. Small self-contained
 tasks skip Agent Workspace.
 Pass `--project-dir` to target another project root. Pass

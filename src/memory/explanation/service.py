@@ -508,6 +508,7 @@ class RepositoryExplanationService:
         if max_workflows == 0:
             return []
         focus_tokens = _tokens(focus or "")
+        documentation_tokens: dict[str, set[str]] = {}
         candidates: list[_WorkflowCandidate] = []
         for node, degree, weighted_degree in top_nodes:
             trigger_reason = _workflow_trigger_reason(node)
@@ -523,6 +524,7 @@ class RepositoryExplanationService:
             documentation = _workflow_documentation_evidence(
                 documentation_nodes,
                 concept_tokens,
+                tokens_by_id=documentation_tokens,
             )
             documentation.extend(
                 _workflow_docstring_evidence(
@@ -1125,21 +1127,27 @@ def _workflow_concept_tokens(node: MemoryNode) -> set[str]:
 def _workflow_documentation_evidence(
     documentation_nodes: Sequence[MemoryNode],
     concept_tokens: set[str],
+    *,
+    tokens_by_id: dict[str, set[str]],
 ) -> list[CodeEvidence]:
+    """Reuse document tokens across workflow candidates within one explanation."""
     if not concept_tokens:
         return []
     required_overlap = 1 if len(concept_tokens) == 1 else 2
     ranked = []
     for node in documentation_nodes:
-        searchable = " ".join(
-            (
-                _node_label(node),
-                str(node.text or ""),
-                str(node.properties.get("section_path") or ""),
-                _node_path(node),
+        tokens = tokens_by_id.get(node.id)
+        if tokens is None:
+            searchable = " ".join(
+                (
+                    _node_label(node),
+                    str(node.text or ""),
+                    str(node.properties.get("section_path") or ""),
+                    _node_path(node),
+                )
             )
-        )
-        overlap = len(concept_tokens & _tokens(searchable))
+            tokens = tokens_by_id[node.id] = _tokens(searchable)
+        overlap = len(concept_tokens & tokens)
         if overlap < required_overlap:
             continue
         score = overlap / max(1, len(concept_tokens))

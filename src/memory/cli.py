@@ -513,6 +513,21 @@ def _print_storage_clear(payload: dict[str, Any]) -> None:
     print(f"Bytes reclaimed: {payload['bytes_reclaimed']}")
 
 
+def _print_agent_retention(payload: dict[str, Any]) -> None:
+    """Report reclaimed storage and any private cleanup deferred for retry."""
+    if payload.get("files_removed") or payload.get("records_removed"):
+        print(
+            "Retention: "
+            f"files={payload.get('files_removed', 0)}, "
+            f"records={payload.get('records_removed', 0)}, "
+            f"bytes_reclaimed={payload.get('bytes_reclaimed', 0)}"
+        )
+    for agent_id in payload.get("busy_agents", []):
+        print(f"Cleanup deferred for busy agent {agent_id}; retry agent init or finish after its readers/writer close.")
+    for agent_id in payload.get("skipped_agents", []):
+        print(f"Cleanup skipped for agent {agent_id}: its store path is unmanaged or shared with an active agent.")
+
+
 def _print_agent_status(payload: dict[str, Any]) -> None:
     print(f"Agent memory: {'initialized' if payload['exists'] else 'not initialized'}")
     print(f"Agent id: {payload.get('agent_id') or ''}")
@@ -579,6 +594,8 @@ def _print_agent_dashboard(payload: dict[str, Any]) -> None:
 def _configure_project_overview_parser(parser: argparse.ArgumentParser) -> None:
     """Configure the working-directory project overview command."""
     parser.add_argument("--json", action="store_true", help="Print structured JSON result")
+    parser.add_argument("--limit", type=int, default=5, help="Maximum items per overview section (1-20)")
+    parser.add_argument("--details", action="store_true", help="Include full architecture and legacy private history")
 
 
 def _handle_project_overview(context: CommandContext) -> int:
@@ -587,21 +604,57 @@ def _handle_project_overview(context: CommandContext) -> int:
 
     args = context.args
     explanation = context.graph.explain_project(args.path)
-    operational = AgentWorkspace.project_operational_overview(args.storage, config=context.config)
+    operational = AgentWorkspace.project_operational_overview(args.storage, config=context.config, limit=args.limit, include_private=args.details)
     if args.json:
         _print_json({"format": "reql-project-overview-v1", "project": explanation.to_dict(), "operational": operational})
         return 0
-    print(explanation.to_markdown())
-    print("\n## Operational history")
-    if not operational["agents"]:
-        print("No Agent Workspace history for this project.")
-        return 0
-    for section, label in (("rejected_approaches", "Rejected approaches"), ("done_tasks", "Done"), ("open_tasks", "Open")):
-        print(f"\n### {label}")
-        for agent in operational["agents"]:
-            for item in agent[section]:
-                detail = item.get("reason") if section == "rejected_approaches" else item.get("completion_message")
-                print(f"- {item['content']}" + (f" — {detail}" if detail else "") + f" ({agent['agent']['agent_id']}, {item.get('session_title') or '-'}, {item['updated_at']})")
+    from memory.services.coordination import CoordinationStore, render_work_context
+    work = operational["work"]
+    if args.details:
+        print(explanation.to_markdown())
+    else:
+        architecture = explanation.to_markdown().split("## Business capabilities")[0]
+        print(architecture)
+        print("Architecture evidence: reql project explain; focused history: reql project context --query TERMS")
+    print("Workstreams: " + json.dumps(work["workstreams"], ensure_ascii=False))
+    for label, items in work["sections"].items():
+        print(f"\n### {label.title()} ({work['counts'][label]})")
+        print(render_work_context({"records": items}, max_chars=1200))
+    if args.details:
+        for section, label in (("rejected_approaches", "Rejected approaches"), ("done_tasks", "Done"), ("open_tasks", "Open")):
+            print(f"\n### {label}")
+            for agent in operational["agents"]:
+                for item in agent[section]:
+                    detail = item.get("reason") if section == "rejected_approaches" else item.get("completion_message")
+                    print(f"- {item['content']}" + (f" — {detail}" if detail else "") + f" ({agent['agent']['agent_id']}, {item.get('session_title') or '-'})")
+    if operational["context"]:
+        print("\n### Public summaries")
+        for item in operational["context"][:args.limit]:
+            print(f"- {item['content'][:600]} ({item['agent_id']}, {item['timestamp']})")
+    return 0
+
+
+def _configure_project_context_parser(parser: argparse.ArgumentParser) -> None:
+    """Configure focused work retrieval without selecting an agent identity."""
+    parser.add_argument("--query", default="")
+    parser.add_argument("--file", dest="files", action="append", default=[])
+    parser.add_argument("--workstream", default=None)
+    parser.add_argument("--task", dest="record_id", default=None)
+    parser.add_argument("--history", action="store_true", help="Include obsolete approaches and their replacements")
+    parser.add_argument("--limit", type=int, default=8)
+    parser.add_argument("--json", action="store_true")
+
+
+def _handle_project_context(args: argparse.Namespace) -> int:
+    """Read causal engineering context independently of private sessions."""
+    from memory.services.coordination import CoordinationStore, render_work_context
+    payload = CoordinationStore(Path(args.storage).with_name("agent-dashboard.reql")).context(
+        args.query, files=args.files, workstream=args.workstream, record_id=args.record_id,
+        include_history=args.history, limit=args.limit)
+    if args.json:
+        _print_json(payload)
+    else:
+        print(render_work_context(payload))
     return 0
 
 
@@ -1351,14 +1404,6 @@ def _add_reql_statement_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true", help="Print structured JSON result")
 
 
-def _add_agent_filters(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--type", dest="node_type", default=None, help="Filter by agent node type")
-    parser.add_argument("--status", default=None, help="Filter by node status")
-    parser.add_argument("--since", default=None, help="Filter by ISO updated_at timestamp")
-    parser.add_argument("--limit", type=int, default=50, help="Maximum items to print")
-    parser.add_argument("--json", action="store_true", help="Print structured JSON result")
-
-
 _TEXT_QUERY_CLAUSES = {
     "RETRIEVE": {"TYPE", "TYPES", "TOP", "LIMIT", "DEPTH", "INCLUDE", "NO", "RETURN", "MAX"},
     "SEARCH": {"TYPE", "TYPES", "TOP", "LIMIT", "DEPTH", "CONTEXT", "INCLUDE", "RETURN"},
@@ -1598,6 +1643,23 @@ def build_parser() -> argparse.ArgumentParser:
     agent_init = agent_sub.add_parser("init", help="Create or resume this agent's active session")
     agent_init.add_argument("--name", default=None, help="Name for a newly created session")
     agent_init.add_argument("--json", action="store_true", help="Print structured JSON result")
+    agent_record = agent_sub.add_parser("record", help="Create or reconcile durable shared engineering work")
+    from memory.services.coordination import KINDS, STATUSES
+    agent_record.add_argument("kind", choices=sorted(KINDS))
+    agent_record.add_argument("content")
+    agent_record.add_argument("--key", default=None, help="Stable name for deduplication within kind/workstream")
+    agent_record.add_argument("--id", dest="record_id", default=None, help="Existing shared record to update")
+    agent_record.add_argument("--revision", dest="expected_revision", type=int, default=None)
+    agent_record.add_argument("--status", choices=sorted(STATUSES), default=None)
+    agent_record.add_argument("--why", dest="rationale", default=None)
+    agent_record.add_argument("--file", dest="files", action="append", default=None)
+    agent_record.add_argument("--workstream", default=None)
+    agent_record.add_argument("--parent", default=None)
+    for relation in ("depends_on", "contradicts", "supersedes", "summarizes"):
+        agent_record.add_argument("--" + relation.replace("_", "-"), action="append", default=None)
+    agent_record.add_argument("--next", dest="next_action", default=None)
+    agent_record.add_argument("--importance", type=int, choices=(1, 2, 3), default=None)
+    agent_record.add_argument("--json", action="store_true")
     agent_status = agent_sub.add_parser("status", help="Show private agent-memory status")
     agent_status.add_argument("--json", action="store_true", help="Print structured JSON result")
     agent_reset = agent_sub.add_parser("reset", help="Discard and recreate this agent's operational memory")
@@ -1642,7 +1704,7 @@ def build_parser() -> argparse.ArgumentParser:
     agent_finish = agent_sub.add_parser("finish", help="Publish final context, close the session, and mark this agent completed")
     agent_finish.add_argument("summary", help="Final message published to shared dashboard context")
     agent_finish.add_argument("--json", action="store_true", help="Print structured JSON result")
-    agent_terminate = agent_sub.add_parser("terminate", help="Force-terminate a stale agent while preserving history")
+    agent_terminate = agent_sub.add_parser("terminate", help="Force-terminate a stale agent and release its private store")
     agent_terminate.add_argument("agent_id")
     agent_terminate.add_argument("--json", action="store_true", help="Print structured JSON result")
     agent_export = agent_sub.add_parser("export", help="Export private agent operational memory")
@@ -1661,6 +1723,8 @@ def build_parser() -> argparse.ArgumentParser:
     project = sub.add_parser("project", help="Compile, inspect, explain, and report on the current working directory")
     project.set_defaults(path=".")
     project_sub = project.add_subparsers(dest="project_command", required=True)
+    project_context = project_sub.add_parser("context", help="Retrieve focused engineering work without opening the code graph")
+    _configure_project_context_parser(project_context)
 
     project_watch_status = project_sub.add_parser("watch-status", help="Check watcher liveness without opening the graph")
     project_watch_status.add_argument("--json", action="store_true", help="Print structured JSON result")
@@ -1868,6 +1932,9 @@ def _main(argv: list[str] | None = None) -> int:
             _print_project_watch_status(payload)
         return 0
 
+    if args.command == "project" and args.project_command == "context":
+        return _handle_project_context(args)
+
     if args.command == "agent":
         from memory.agent import AgentIdentitySelectionError, AgentWorkspace
 
@@ -1889,7 +1956,18 @@ def _main(argv: list[str] | None = None) -> int:
                 _print_json(result)
             else:
                 print(f"Agent terminated: {result['agent_id']}")
+                _print_agent_retention(result.get("retention") or {})
             return 0
+        if args.agent_command == "show":
+            from memory.services.coordination import CoordinationStore
+            shared = CoordinationStore(Path(args.storage).with_name("agent-dashboard.reql"))
+            matches = [item for item in shared.records() if item["id"] == args.id]
+            if matches:
+                if args.json:
+                    _print_json({"kind": "node", "node": matches[0]})
+                else:
+                    _print_json(matches[0])
+                return 0
         if args.agent_command == "search":
             result = AgentWorkspace.search_dashboards(args.storage, args.query, limit=args.limit, config=config)
             if args.json:
@@ -1921,6 +1999,16 @@ def _main(argv: list[str] | None = None) -> int:
                     print(f"Public dashboard: {result['dashboard_storage']}")
                     if session := result.get("session"):
                         print(f"Started session: {session['title']}")
+                    _print_agent_retention(result.get("retention") or {})
+                return 0
+            if args.agent_command == "record":
+                names = ("key", "record_id", "expected_revision", "status", "rationale", "files", "workstream", "parent", "depends_on", "contradicts", "supersedes", "summarizes", "next_action", "importance")
+                result = workspace.record(args.kind, args.content, **{name: getattr(args, name) for name in names})
+                if args.json:
+                    _print_json(result)
+                else:
+                    _print_agent_node(result)
+                    print(f"Revision: {result['node']['revision']}")
                 return 0
             if args.agent_command == "status":
                 result = workspace.status()
@@ -2007,14 +2095,7 @@ def _main(argv: list[str] | None = None) -> int:
                         f"Agent finished: {result['agent_id']}"
                         f"\tclosed_session={result.get('closed_session_id') or 'none'}"
                     )
-                    retention = result.get("retention") or {}
-                    if retention.get("files_removed") or retention.get("records_removed"):
-                        print(
-                            "Retention: "
-                            f"files={retention.get('files_removed', 0)}, "
-                            f"records={retention.get('records_removed', 0)}, "
-                            f"bytes_reclaimed={retention.get('bytes_reclaimed', 0)}"
-                        )
+                    _print_agent_retention(result.get("retention") or {})
                 return 0
             if args.agent_command == "export":
                 result = workspace.export(include_metadata=args.metadata)

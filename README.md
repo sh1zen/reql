@@ -9,7 +9,7 @@ In the intended coding-agent integration, the user does not treat REQL as a
 separate manual workflow. After the assistant instructions or skill are
 installed for Codex, Claude, Gemini, Cursor, or another agent environment, the
 agent uses REQL while it works: it compiles or refreshes the repository graph,
-retrieves compact source-backed context, records task-local notes and
+retrieves compact source-backed context, records durable goals, outcomes and
 decisions, and reconstructs operational history and plans after context loss.
 Repository facts remain exclusively in the canonical project graph.
 
@@ -37,8 +37,8 @@ before and during edits:
   semantics at every provider boundary;
 - every result can point back to paths, line ranges, relationships, evidence,
   and graph provenance instead of relying on broad source dumps;
-- `reql agent` maintains per-agent working memory for plans, findings,
-  decisions, tasks, risks, and finish messages without changing the
+- `reql agent` maintains shared structured goals, tasks, decisions, constraints,
+  failures and checkpoints with causal links and revision-checked updates without changing the
   canonical project graph;
 - compact context and saved working maps reduce repeated source reading, which
   helps preserve token budget and keeps large, multi-step tasks coherent;
@@ -74,91 +74,57 @@ reql install codex
 Replace `codex` with another supported agent platform, or let interactive
 install auto-detect one. The installed instructions make REQL part of the
 agent's normal repository workflow. The generated `SKILL.md` is a concise
-coding workflow: REQL bounds discovery, while the checked-out source and tests
+coding workflow: REQL retrieves source evidence and project direction, while the checked-out source and tests
 remain authoritative. Bootstrap, query,
 update, reporting, document, and Agent Workspace details stay in routed
 `references/` files loaded only when their situation occurs.
-For resumed work, the generated skill directs agents to check `project overview`
-for cross-agent rejected, done, and open work before choosing an approach. It
-keeps discovery bounded to relevant graph results and source spans so agents do
-not repeatedly scan the whole project.
-The commands below are the operations the agent integration uses to bootstrap
-context, retrieve focused evidence, and keep working memory:
+Installation also adds the explicit-only `reql-context-compact` skill. Invoke
+`/reql-context-compact` in agents that expose skills as slash commands (or
+select that skill explicitly in Codex). It runs a local, model-free transcript
+filter only when the host can export and accept a JSON message list. The filter
+keeps every message and replaces only large, exact duplicate tool results with
+pointers to an earlier retained copy. It never reads or changes hidden host
+context on its own; Codex and other hosts without transcript replacement support
+cannot compact the live window through this skill. For external harnesses, pipe
+a transcript through `python -m agents.context_compact < transcript.json > compacted.json`,
+then provide the output as the next message list. The source file is not modified.
+
+For resumed or substantial work, start with `project overview` for compact goals,
+architecture, workstreams, completed/active outcomes, blockers and next ready work.
+Retrieve source context and relevant engineering evidence, then reconcile shared
+records at meaningful work boundaries:
 
 ```bash
-reql project compile
-reql project explain --focus "payment workflow"
-reql project pipeline
-reql project pipeline --code
-reql query_context --query "payment service"
-reql query_memories --query "payment service" --limit 8 --json
-reql query_explore --query "payment service serialization" --view owners --view code
-reql query_explore --query "profile template" --structural-duplicates-only
-```
-
-For coding-agent tasks, the normal `query_context --code` output shows at most
-eight paths: five to eight source files when available, reduced as needed to
-reserve room for up to three associated tests. Each source row includes its
-  owner symbols and best bounded line range. Detailed graph metadata and planning
-  fields remain available from `query_context --json` for programmatic consumers;
-  structured results include contract `schema_version`, a deterministic
-  `graph_revision`, and typed confidence metadata.
-When the highest ranked score is below `0.25`, `query_context` short-circuits
-with `Confidence: insufficient` and explicitly allows one targeted `rg`
-fallback using the user's exact symbol, path, or error terms.
-
-Agent Workspace commands store the agent's session-scoped working state while
-it implements, reviews, or documents a repository:
-
-```bash
-reql agent init --name "Focused implementation pass"
-reql agent dashboard
+reql project status
 reql project overview
-reql agent note "Read src/memory/cli.py and found the argparse command surface"
-reql agent reject "Cache every query" "Results stayed stale after source edits"
-reql agent note --public "Parser API now returns a document result"
-reql agent note --agent agent:reviewer "Check the updated parser return type"
-reql agent task add "Implement the reset behavior"
-reql agent task list
-reql agent task done TASK_ID "Reset behavior implemented and tests pass"
-reql agent finish "Implementation notes ready for master review"
-reql agent list
-reql agent terminate agent:stale-worker
-reql agent search "parser return type"
+reql query_context --query "serializer" --code
+reql project context --file src/codec.py
+reql agent init --name "Serializer contract"
+reql agent record goal "Preserve serializer round trips" --key serializer
+reql agent record task "Verify consumers" --parent GOAL_ID --file src/codec.py
+reql agent record decision "Keep schema version" --parent TASK_ID --why "Consumer compatibility"
+reql agent show TASK_ID --json
+reql agent record task "Verify consumers" --id TASK_ID --revision 1 --status in_progress
+reql agent task done TASK_ID "Consumer regression passed"
+reql agent finish "Serializer updated; unresolved work retained"
 ```
 
-`reql agent init` creates or resumes the selected private dashboard and marks
-the agent active. Explicit `reql agent --agent AGENT_ID ...` or
-`REQL_AGENT_ID=AGENT_ID` takes precedence over a stable activity or thread id.
-Use `reql agent dashboard` for the public dashboard and the selected private
-dashboard; use `reql agent --agent "agent:AGENT_ID" dashboard` to view another
-agent's private dashboard when permitted.
+Use the ids and revisions returned by your commands. Shared work survives session
+completion; finish creates a checkpoint and releases private scratch. Dependencies
+and conflicts derive readiness/blockers, and replacement flags obsolete assumptions.
+`query_context` joins up to eight relevant work records to its source evidence;
+`project context` supports task, file, workstream and history scopes. Identical
+writes deduplicate; stale updates require reconciliation. See
+[Engineering coordination](docs/COORDINATION.md) for lifecycle, retrieval,
+retention, migration and Python ownership details. `project explain` drills into
+architecture; `project overview --details` includes full architecture and legacy
+history; `agent show ID --json` exposes record evidence and bounded revisions.
 
-The private dashboard lists recent rejected, done, and open work, then gives an
-exact `project overview` command for the complete project explanation and history
-across registered agents. Rejections retain their reasons and originating sessions across work
-sessions. The public dashboard contains the agent roster, coordination-safe
-active-task summaries, shared context, and drill information. Public
-notes, task-completion messages, and finish messages are all timestamped shared
-context. Private history remains intact after `finish` or `terminate`.
-
-`reql agent finish "<outcome>"` closes the current session, marks the agent
-finished, and publishes its supplied message as shared context. `reql agent
-terminate AGENT_ID` performs the same lifecycle cleanup for a stale agent,
-while preserving all task, note, and dashboard history.
-
-`reql agent list` returns active agents by default; add `--all` for finished
-and terminated agents. `reql agent search QUERY` searches public context and
-permitted private dashboard history, returning timestamp, agent id, and enough
-context to explain each match.
-
-Use `agent note TEXT` for a private self-note, `agent note --agent AGENT_ID
-TEXT` to send a private note to another agent, and `agent note --public TEXT`
-to publish shared context. Tasks remain private to their owner; only a task's
-completion message becomes public.
-
-`reql agent reset` discards the selected agent's dashboard history. It never
-reads or modifies the canonical project graph.
+Code-scoped `query_context` retains its eight-path source budget, owner symbols,
+bounded line ranges and associated tests. JSON remains schema-v2, adding
+`payload.engineering_context` with its own revision alongside source-only graph
+revision/confidence. Low code confidence still allows one targeted exact-name
+search; engineering claims must be checked against current source and tests.
 
 Context results use schema version 2. Alongside the query-specific
 `graph_revision`, they report the committed `source_revision` and freshness
@@ -211,8 +177,11 @@ project manifest and creates a `ProjectRevision`; clean compile invocations do
 not advance retention. When the limit is exceeded, REQL removes history,
 archived records, and project-owned usage entries older than the oldest retained
 commit while preserving the active graph. Agent coordination records retain
-the latest `retention.agent_sessions` completed sessions (default `20`), and
-finish preserves the completed agent's private dashboard history.
+public summaries for the latest `retention.agent_sessions` completed sessions
+across the project (default `20`). Set it to `0` to discard completed public
+history immediately. Completed agents' private scratch stores are removed regardless
+of that limit. Shared engineering records have independent bounded retention and
+are preserved even when `retention.agent_sessions` is zero.
 
 ## Features
 
@@ -220,9 +189,9 @@ finish preserves the completed agent's private dashboard history.
 - Retrieval with lexical seed nodes, bounded graph expansion, and chain-aware ranking.
 - Compact `query_context`, `query_explore`, `query_graph`, and `query_memories`
   outputs for coding-agent workflows, including owner symbols, bounded source
-  ranges, and associated test targets.
-- Separate `reql agent` dashboard state for sessions, private tasks, private
-  and external notes, public notes, completion messages, and finish messages.
+  ranges, associated test targets and scoped engineering evidence.
+- Shared structured engineering work with revisions, causal relations, derived
+  execution and checkpoints; separate private scratch and session lifecycle.
   It contains no copied project, file, symbol, or canonical graph records.
 - Local block-file persistence with fixed-size pages, compressed records,
   reader/writer lock diagnostics, safe stale-lock recovery, transactions,
@@ -322,6 +291,8 @@ documentation lives under `docs/`:
 - [Repository explanation](docs/REPOSITORY_EXPLANATION.md): deterministic
   business capabilities, architecture, workflows, and change guidance derived
   from the code graph.
+- [Engineering coordination](docs/COORDINATION.md): shared work, plans, checkpoints,
+  context ranking, migration and lifecycle.
 - [CLI](docs/CLI.md): command reference for compilation, retrieval, graph
   queries, exports, configuration, install helpers, and MCP startup.
 - [Configuration](docs/CONFIGURATION.md): `reql.conf`, defaults, overrides, scan rules,
@@ -347,122 +318,12 @@ documentation lives under `docs/`:
 - [Extending](docs/EXTENDING.md): storage adapters, extractors, engines, and
   adding node or edge types.
 
-## Main Pipeline
+## Architecture
 
-REQL has a project compile pipeline. `compile` builds a technical graph for
-programming agents from scanning, AST/static analysis, document parsing, and
-deterministic document-to-code linking. It does not extract memories from chat
-or non-code prose.
-
-Retrieval:
-
-```text
-query
-  -> tokenization
-  -> lexical seed-node search
-  -> bounded graph expansion
-  -> graph-aware ranking
-  -> subgraph or context block
-```
-
-Maintenance:
-
-```text
-activation and usage signals
-  -> salience update
-  -> sidecar retrieval usage updates
-  -> provenance preservation
-```
-
-Compile-time project scan:
-
-```text
-project directory
-  -> recursive scanner
-  -> default ignore rules and config include/exclude filtering
-  -> file classification and SHA-256 fingerprints
-  -> Project + Directory + File + SourceArtifact nodes
-  -> CONTAINS edges
-```
-
-Project compile uses the same fingerprinting path and built-in default ignores.
-Put additional compile exclusions in the configured `scan.exclude` list.
-
-Incremental compilation:
-
-```text
-SourceArtifact fingerprints
-  -> ArtifactCacheEntry comparison
-  -> dirty and deleted artifact set
-  -> deterministic compile graph updates
-  -> CompilationRun
-  -> GraphDelta
-```
-
-Artifact document parsing:
-
-```text
-SourceArtifact bytes
-  -> document parser
-  -> DocumentFragment records
-  -> SourceFragment nodes
-  -> provenance and document relations
-```
-
-Code analysis:
-
-```text
-code artifact
-  -> AST/static parser when supported
-  -> Module / Package / Class / Interface / Function / Method / useful Variable nodes
-  -> Import / Dependency / Endpoint / Schema / Config / Test nodes
-  -> CONTAINS / DEFINES / METHOD / IMPORTS / CALLS / REFERENCES / INHERITS edges
-  -> DEPENDS_ON / IMPORTS_FROM / RE_EXPORTS / READS / WRITES / RETURNS edges
-  -> RAISES / DECORATED_BY / HANDLES_ROUTE / HAS_FINDING edges
-  -> StaticAnalysisFinding cleanup candidates for unused code
-```
-
-Graph analysis:
-
-```text
-graph nodes and edges
-  -> deterministic community detection
-  -> specificity-aware hub scoring
-  -> cross-community bridge edges
-  -> Community nodes, BRIDGES_COMMUNITY edges, and hub properties
-```
-
-## Project Structure
-
-```text
-src/api/
-|-- memory_graph.py         # Public facade
-|-- __init__.py             # Public Python API exports
-src/agents/
-|-- install.py              # Agent skill/instruction installers
-|-- __init__.py             # Agent installer exports
-src/mcp/
-|-- tools.py                # Dependency-free MCP tool handlers
-`-- server.py               # stdio and HTTP JSON-RPC MCP transports
-src/memory/
-|-- domain/                 # Pure models, constants, ids, time, exceptions
-|-- storage/                # Storage/extractor protocols and public exports
-|   `-- adapters/           # Concrete adapters, including BlockGraphStore
-|-- extraction/             # Deterministic query/source extraction and optional adapters
-|-- artifacts/              # Project scanning, file classification, fingerprints
-|-- engines/                # Activation and salience scoring
-|   |-- activation.py       # Spreading activation
-|   `-- salience.py         # Salience scoring
-|-- services/               # Application orchestration
-|   |-- retrieval/          # Search, expansion, context projections, renderers
-|   |-- incremental_compilation.py
-|   `-- project_watch.py
-|-- query/                  # REQL lexer, parser, AST, and evaluator
-|-- analysis/               # Communities, centrality, specificity, hubs, bridges
-|-- reporting/              # Markdown reports
-|-- config/                 # internal defaults, project models, and loader
-`-- cli.py                  # Command-line interface
-```
+For component ownership, source layout, compilation, retrieval, and maintenance,
+see [Architecture](docs/ARCHITECTURE.md). The detailed processing contracts and
+recovery behavior are documented in [Incremental compilation](docs/INCREMENTAL_COMPILATION.md),
+[Artifact ingestion](docs/ARTIFACT_INGESTION.md), and [Engineering coordination](docs/COORDINATION.md).
 
 ## Public API
 
@@ -520,49 +381,6 @@ result = graph.query_context_result(request)
 payload = result.to_dict()
 ```
 
-## Extending the Project
-
-### New Storage Backend
-
-Implement `memory.storage.graph_store.GraphStore` and pass it to the facade:
-
-```python
-from reql import MemoryGraph
-
-store = MyGraphStore(...)
-graph = MemoryGraph(store)
-```
-
-The bundled block backend is portable local persistence, not an architectural
-constraint.
-
-### New Extractor
-
-Implement `SemanticExtractor`:
-
-```python
-class MyExtractor:
-    def extract(self, text: str):
-        ...
-
-graph = MemoryGraph.open(".reql/memory.reql", extractor=MyExtractor())
-```
-
-The extractor is used for query seed discovery. Project document ingest is
-handled by the local deterministic compiler path. The default
-`MemoryGraph.open()` extractor is dependency-free and deterministic.
-
-Compile mode structurally parses text document fragments and links explicit
-documentation mentions back to compiled code symbols where possible.
-
-### New Node or Edge Types
-
-Types are strings. To keep them coherent:
-
-1. add constants in `domain/constants.py`;
-2. update compiler, retrieval, reporting, or analysis code if dedicated logic is needed;
-3. add integration tests when the new type changes retrieval, salience, or graph analysis.
-
 ## License
 
 MIT. See `LICENSE`.
@@ -571,5 +389,9 @@ MIT. See `LICENSE`.
 
 See `CONTRIBUTING.md` for development setup, contribution guidelines, and pull
 request expectations.
+
+For repeatable agent-session performance measurements and profiling, see
+[Benchmark instructions](CONTRIBUTING.md#benchmarks). Fixtures and profiles remain local
+under an ignored directory; benchmarks do not use provider APIs or model downloads.
 
 

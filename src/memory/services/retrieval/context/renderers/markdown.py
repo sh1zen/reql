@@ -373,17 +373,6 @@ class MarkdownContextRendererMixin:
             lines.append(f"Trace: {payload['trace_id']}")
         return lines
 
-    def _render_agent_node_payload_lines(self, item: dict[str, Any]) -> list[str]:
-        label = self._compact_text(str(item.get("label") or item.get("text") or item.get("id") or ""), max_chars=140)
-        line = f"- ({float(item.get('score', 0.0)):.2f}) `{item.get('id')}` [{item.get('type')}] {label}"
-        if item.get("location"):
-            line += f" @ {item['location']}"
-        lines = [line]
-        text = self._compact_text(str(item.get("text") or ""), max_chars=220)
-        if text and text != label:
-            lines.append(f"  text: {text}")
-        return lines
-
     def _render_general_result_lines(self, item: dict[str, Any]) -> list[str]:
         label = self._compact_text(str(item.get("label") or item.get("text") or item.get("id") or ""), max_chars=140)
         prefix = "- source" if item.get("kind") == "source" else f"- ({float(item.get('score', 0.0)):.2f})"
@@ -402,10 +391,6 @@ class MarkdownContextRendererMixin:
         if text and text != label:
             lines.append(f"  text: {text}")
         return lines
-
-    @staticmethod
-    def _render_followups(followups: list[dict[str, str]]) -> list[str]:
-        return [f"- {item['label']}: `{item['command']}` ({item.get('purpose', '')})" for item in followups]
 
     @staticmethod
     def _render_counts(payload: dict[str, Any]) -> list[str]:

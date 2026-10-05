@@ -74,7 +74,8 @@ retention:
 ## Behavior
 
 - `retention.agent_sessions` is the maximum number of completed agent sessions
-  retained in each private dashboard.
+  retained on the shared dashboard across the project. Completed private stores
+  are removed regardless of this limit.
 - `scan.max_file_size_mb`, `scan.include`, and `scan.exclude` are used by
   project compile, watch mode, and cache status. `scan.include` retains
   glob matching. `scan.exclude` uses one strict, scope-aware grammar: a literal
@@ -137,9 +138,11 @@ retention:
   history, archived graph records, and project-owned usage events become
   eligible for removal.
 - `retention.agent_sessions` is the non-negative number of completed agent
-  sessions retained on the shared public dashboard. The default is `20`. Identity, finish message,
-  and message records owned by older completed sessions are removed together;
-  active sessions are never removed.
+  sessions retained on the shared public dashboard across the project. The default
+  is `20`; `0` discards completed public history immediately. Identity, finish
+  message, and message records owned by older completed sessions are removed
+  together; active sessions are never removed. Init, finish, and terminate enforce
+  this limit and remove completed private stores independently of it.
 
 REQL never downloads parser dependencies at runtime. Project compile and
 document processing are deterministic local operations.
@@ -209,3 +212,8 @@ external YAML dependency is required.
 
 Invalid sections, unknown options, or wrong value types raise a clear
 `ConfigError`.
+
+Shared engineering work has independent lifecycle and retention;
+`retention.agent_sessions` applies only to legacy public messages and roster.
+See [Engineering coordination](COORDINATION.md) for work-record fields,
+status transitions, relation validation and bounded revisions.

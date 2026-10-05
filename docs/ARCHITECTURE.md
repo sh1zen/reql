@@ -39,6 +39,12 @@ transactions, and batch writes. The bundled block adapter implements that
 contract as a local fixed-size page store; the architecture does not depend on
 Neo4j or any external graph service.
 
+`memory.storage.adapters.block_store.BlockGraphStore` owns persistence,
+transaction journals, lazy record loading, and lexical-index lifecycle. Bounded
+term selection lives in the stateless `lexical_index` module. All supported
+block-store import paths resolve to that same class. Older lexical postings still
+migrate when first loaded.
+
 Routine operations should prefer bounded or indexed port methods:
 
 - `find_nodes_by_property` and `find_edges_by_property` for project/artifact
@@ -178,6 +184,10 @@ a node id and source location. Workflow participants are exposed through
 the business view explainable while allowing the underlying code graph to
 remain the single source of truth.
 
+Workflow candidates reuse documentation tokens within a single explanation.
+Normalization and token-signal helpers use bounded caches keyed by immutable
+input text; changes to source text therefore need no cache invalidation.
+
 ## Project Pipeline Projection
 
 `memory.pipeline.ProjectPipelineService` is a second read-only view over the
@@ -198,45 +208,40 @@ feedback cycles. `MemoryGraph.project_pipeline` returns the versioned typed
 payload without persisting nodes or metrics. The CLI renders that payload as
 Mermaid or as an embedded-data `vis-network` HTML file.
 
-## Agent Operational Memory
+## Engineering Work and Agent Sessions
 
-`reql agent` is a separate dashboard-centric coordination boundary for agent
-sessions, private tasks, private notes, directed notes, and public context. It
-does not derive from, copy, query, or synchronize canonical project nodes.
+`memory.services.coordination.CoordinationStore` owns durable work records in
+`.reql/agent-dashboard.reql`: goals, tasks, decisions, constraints, failures,
+questions, changes, observations and checkpoints. Stable ids and typed relation
+fields connect work over time. Transactional revision checks prevent lost updates;
+replacement retires old assumptions atomically. Bounded snapshots retain causes
+and provenance. Execution/readiness and project direction are read projections.
 
-The canonical project graph remains the sole owner of repository identity,
-files, symbols, source spans, dependencies, and code relationships. Coding
-agents obtain those facts through the normal project query APIs, never through
-their operational memory.
+Coordination reads use structural indexes and defer the existing lexical index
+until search or checkpoint finalization needs it. Single-record reads use identity
+lookup; ordinary writes load only the causal closure needed for cycle validation.
+Completion still checks the full current snapshot. Context and overview build a
+request-local conflict lookup, retaining the same directional and terminal-state
+rules without scanning all records for each projected item.
 
-The public dashboard is persisted at `.reql/agent-dashboard.reql` and owns the
-registered-agent roster, coordination-safe active-task summaries, and shared
-context. Shared context records carry a timestamp, agent id, message type, and
-content; finish messages, public notes, and task-completion messages are all
-records in this section. Each agent's private dashboard remains under
-`.reql/agents/` and owns its complete tasks, private notes, external notes,
-rejected approaches with reasons, and session history.
+`memory.agent.AgentWorkspace` supplies agent/session identity and private scratch
+under `.reql/agents/`. Existing task/rejection APIs route to the shared work owner;
+legacy private work migrates on resume or cleanup. Finish saves a durable
+checkpoint before closing the private session and releasing scratch storage.
+Session/roster retention does not remove engineering knowledge. Lifecycle leases
+and existing block-store reader/writer locks protect cleanup and shared updates.
 
-`reql agent init` creates or resumes the selected private dashboard, creates a
-session if necessary, and registers the agent as active. `reql agent finish
-MESSAGE` closes that session, marks the agent finished, and appends MESSAGE to
-public context without deleting private history. `reql agent terminate AGENT_ID`
-does the same lifecycle cleanup for stale agents while preserving their tasks
-and notes. The dashboard is the persistent coordination layer.
+The canonical project graph owns files, symbols, source spans and dependencies.
+Work records carry relative evidence paths and intent, without copying graph facts.
+`QueryContextService` joins bounded engineering context to the source projection
+for Python, CLI and MCP. Code confidence/revision remain source-only; work context
+has its own revision. `project context` works without opening the canonical graph;
+`project overview` combines compact source architecture and derived work state.
 
-The canonical CLI writes dashboard notes through `agent note TEXT`,
-`agent note --agent AGENT_ID TEXT`, and `agent note --public TEXT`.
-`agent reject APPROACH REASON` stores a private operational record tied to the
-current session. The dashboard presents bounded rejected, done, and open lists,
-with a command to open `project overview` for the complete history. That read-only
-CLI view combines the canonical explanation for the working-directory project
-with operational records from every registered agent, attributed by agent id;
-neither store copies facts from the other.
-The dashboard owns cross-agent inspection and public coordination context.
-Its private task view renders task ids, lifecycle status, and completion
-messages so a later session can resume or audit work without opening raw graph
-records. Dashboard search accepts an exact phrase or all normalized query terms
-in any order, including across punctuation such as hyphenated identifiers.
+See [Engineering coordination](COORDINATION.md) for schema, lifecycle, ranking,
+retention, commands and migration limits. The generator in `src/agents/gen-skill.py`
+is the source for installed skills, platform rules and routed references;
+`src/agents/install.py` owns their installation and guidance hooks.
 
 ## Maintenance
 

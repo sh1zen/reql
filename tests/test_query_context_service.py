@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from api import MemoryGraph
-from mcp.tools import query_context as mcp_query_context
+from mcp.tools import call_tool, list_tools, query_context as mcp_query_context
 from memory.domain.models import MemoryNode
 from memory.domain.query_context import (
     ContextResult,
@@ -19,6 +19,8 @@ from tests.config_helpers import open_graph_with_documents
 
 
 class QueryContextContractTests(unittest.TestCase):
+    """Validate provider values and the advertised MCP request schema."""
+
     def test_request_factory_normalizes_provider_values(self) -> None:
         request = QueryContextRequest.from_raw(
             text="  shared context  ",
@@ -51,6 +53,19 @@ class QueryContextContractTests(unittest.TestCase):
         for values in invalid_cases:
             with self.subTest(values=values), self.assertRaises((TypeError, ValueError)):
                 QueryContextRequest.from_raw(**values)
+
+    def test_mcp_query_context_schema_uses_the_shared_contract(self) -> None:
+        schema = next(item for item in list_tools() if item["name"] == "query_context")
+        properties = schema["inputSchema"]["properties"]
+
+        self.assertEqual(properties["top_k"]["default"], 20)
+        self.assertEqual(properties["max_depth"]["default"], 3)
+        self.assertEqual(properties["max_items"]["default"], 20)
+        self.assertEqual(properties["mode"]["enum"], ["informative", "cleanup"])
+        self.assertEqual(properties["scopes"]["items"]["enum"], ["code", "docs", "test"])
+        for name in ("code", "docs", "test", "include_archived"):
+            self.assertIn(name, properties)
+        self.assertNotIn("include_risky", properties)
 
 
 class QueryContextServiceTests(unittest.TestCase):
@@ -98,6 +113,10 @@ class QueryContextServiceTests(unittest.TestCase):
         self.assertIn("trace_id", result.payload)
         self.assertIn("ranked_nodes", result.payload)
         self.assertIn("seed_node_ids", result.payload)
+        self.assertNotIn("context", result.payload)
+        self.assertEqual(result.payload["kind"], "code")
+        for field in ("followups", "working_set", "contracts", "read_plan", "change_chain", "targeted_reads"):
+            self.assertIn(field, result.payload)
         envelope = result.to_dict()
         self.assertIn("payload", envelope)
         self.assertEqual(envelope["schema_version"], 2)
@@ -176,14 +195,23 @@ class QueryContextServiceTests(unittest.TestCase):
         finally:
             api_graph.close()
 
-        mcp_payload = mcp_query_context(
-            storage_path=str(self.db),
-            query="typed query context common service",
-            scopes=["code"],
-            top_k=8,
-            max_depth=3,
-            max_items=8,
-        )
+        arguments = {
+            "storage_path": str(self.db),
+            "query": "typed query context common service",
+            "scopes": ["code"],
+            "top_k": 8,
+            "max_depth": 3,
+            "max_items": 8,
+        }
+        mcp_payload = mcp_query_context(**arguments)
+        dispatched = call_tool("query_context", arguments)
+        for field in ("schema_version", "graph_revision", "confidence", "freshness", "source_revision"):
+            self.assertEqual(dispatched[field], mcp_payload[field])
+        self.assertNotIn("context", dispatched["payload"])
+        self.assertEqual(dispatched["payload"]["kind"], "code")
+        for field in ("trace_id", "ranked_nodes", "seed_node_ids", "followups", "working_set",
+                      "contracts", "read_plan", "change_chain", "targeted_reads"):
+            self.assertIn(field, dispatched["payload"])
         api_payload["payload"].pop("trace_id", None)
         mcp_payload["payload"].pop("trace_id", None)
         self.assertEqual(api_payload, mcp_payload)

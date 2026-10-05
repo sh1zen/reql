@@ -4,6 +4,9 @@ from __future__ import annotations
 import hashlib
 import json
 from typing import Any
+from pathlib import Path
+
+from .coordination import CoordinationStore, render_work_context
 
 from ..domain.models import MemoryEdge, MemoryNode, MemoryQuery, MemorySubgraph, RankedNode
 from ..domain.query_context import (
@@ -53,6 +56,12 @@ class QueryContextService:
             }
         )
         source_revision, freshness = _source_revision_and_freshness(subgraph, self.retrieval.store)
+        storage_path = getattr(self.retrieval.store, "path", None)
+        if storage_path is not None:
+            work = CoordinationStore(Path(storage_path).with_name("agent-dashboard.reql"))
+            files = list(dict.fromkeys(str(item.node.properties["relative_path"]) for item in subgraph.ranked_nodes
+                                       if item.node.properties.get("relative_path")))[:8]
+            payload["engineering_context"] = work.context(request.text, files=files, limit=min(8, request.budget.max_items))
         return ContextResult(
             schema_version=CONTEXT_RESULT_SCHEMA_VERSION,
             graph_revision=_context_graph_revision(subgraph),
@@ -66,6 +75,9 @@ class QueryContextService:
         payload = dict(result.payload)
         payload["confidence"] = result.confidence.to_dict()
         rendered = self.retrieval.render_context_payload(payload)
+        work = payload.get("engineering_context")
+        if work and work["records"]:
+            rendered += "\n\n" + render_work_context(work)
         source = result.source_revision.id if result.source_revision else "unknown"
         return f"Graph freshness: {result.freshness.status}; source_revision={source}\n\n{rendered}"
 

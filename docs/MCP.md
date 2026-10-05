@@ -75,6 +75,12 @@ The health endpoint is available at `/health`.
 Read-only tools are intended to be callable without server-side approvals. They
 return bounded JSON payloads and never return the full graph.
 
+- `reql_work_context`: retrieves focused shared engineering records by query,
+  files, workstream or record id; `include_history` admits obsolete records and
+  includes bounded revision history for an explicit record id. It does not open
+  the canonical graph or select a private agent.
+- `reql_work_overview`: projects goals, direction, workstreams, completed/active
+  outcomes, blockers and next ready steps across sessions.
 - `query_graph`: retrieves a structured agent context with seed nodes,
   expanded graph nodes, edges, textual sources, filtered generic nodes, and a
   compact rendered context block.
@@ -82,7 +88,8 @@ return bounded JSON payloads and never return the full graph.
   targets, targeted reads, bounded `read_plan` entries, snippets,
   graph-derived `change_chain` steps, impact, tests, and structured next-step
   commands for JSON clients. It returns the canonical `ContextResult` envelope;
-  projected context is nested under `payload`.
+  projected context is nested under `payload`, with a bounded
+  `engineering_context` and independent work revision.
 - `query_explore`: retrieves dependency-oriented slices for coding agents:
   owners, callers, public surface, serialization paths, docs mentions, explicit
   structural template duplicates, and code working-set records.
@@ -117,6 +124,16 @@ nested sections or dotted keys. The server process also honors `REQL_CONFIG`
 and `REQL_CONFIG_OVERRIDES`. Tools that receive a project `path` search for
 `reql.conf` from that path upward when no explicit config is supplied, then
 join it with the protected internal configuration.
+
+`reql_work_record` is a write tool hidden/rejected in read-only mode. It accepts
+`storage_path`, `kind`, `content`, `agent_id`, `session_id` and optional `fields`
+(key, record_id, expected_revision, status, rationale, files, workstream, parent,
+depends_on, contradicts, supersedes, summarizes, next_action, importance). Supply stable caller
+provenance. Reconcile existing ids with their observed revisions; record a
+checkpoint at a session boundary. Direct MCP writes do not create private scratch
+or manage a roster session; Agent Workspace/CLI finish supplies automatic session
+checkpoints. Both adapters use the same shared transactional owner. See
+[Engineering coordination](COORDINATION.md) for record and lifecycle semantics.
 
 ## Codex `config.toml`
 

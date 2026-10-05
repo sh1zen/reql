@@ -15,12 +15,16 @@ A backend must support:
 - export.
 
 The service layer should not assume any database-engine-specific behaviour.
+Pass the backend to `MemoryGraph(store)`; the bundled block adapter implements
+the same port.
 
 ## Extractors
 
 Implement `SemanticExtractor` from `memory.storage.extractor`.
 
-The extractor should return `ExtractionResult` objects. Core compile paths use
+The extractor should return `ExtractionResult` objects and is injected through
+`MemoryGraph(store, extractor=extractor)` or `MemoryGraph.open(path, extractor=extractor)`.
+It supplies query seed discovery. Core compile paths use
 deterministic local processing. Document processing lives in
 `memory.extraction.document_processor` and emits ranked terms, raw events,
 co-occurrence relations, and links to code symbols.
@@ -55,5 +59,6 @@ Add constants in `memory/domain/constants.py`, then update compiler, retrieval,
 reporting, services, engines, or analysis code only where the new type needs
 dedicated behavior. The storage layer accepts arbitrary `type` strings, so
 schema evolution is mainly a domain and service concern.
+Add integration tests when a type changes retrieval, salience, or analysis.
 
 

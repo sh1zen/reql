@@ -601,18 +601,6 @@ class GeneralContextProjectionMixin:
         payload["location"] = self._location_summary(item.node)
         return payload
 
-    def _agent_node_lines(self, item: RankedNode, *, max_text_chars: int) -> list[str]:
-        node = item.node
-        label = self._compact_text(self._node_label(node), max_chars=140)
-        parts = [f"- ({item.score:.2f}) `{node.id}` [{node.type}] {label}"]
-        location = self._location_summary(node)
-        if location:
-            parts[0] += f" @ {location}"
-        text = self._compact_text(node.text or "", max_chars=max_text_chars)
-        if text and text != label:
-            parts.append(f"  text: {text}")
-        return parts
-
     def _agent_source_payloads(self, subgraph: MemorySubgraph, *, max_items: int, query_text: str | None = None) -> list[dict[str, Any]]:
         candidates: OrderedDict[str, MemoryNode] = OrderedDict()
         query_tokens = set(_expanded_tokens(query_text or ""))
@@ -785,9 +773,6 @@ class GeneralContextProjectionMixin:
             if len(lines) >= limit:
                 break
         return lines
-
-    def _agent_follow_up_lines(self, subgraph: MemorySubgraph, *, max_items: int) -> list[str]:
-        return self._render_followups(self._agent_follow_up_payload(subgraph, max_items=max_items))
 
     def _agent_follow_up_payload(
         self,

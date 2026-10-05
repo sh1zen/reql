@@ -61,8 +61,9 @@ the separate lexical-postings record and loads only the structural indexes used
 by compilation. Deferred lexical changes are retained as an in-memory overlay,
 applied before any lexical query, persisted through the WAL, and folded into a
 checkpoint when the WAL threshold is reached.
-For the lowest repeated latency during active editing, keep one watch process
-running so the structural storage also remains open between changes.
+During active editing, one watch process reuses the verified compile pipeline.
+Monitor mode opens storage for each compile batch and releases it while idle;
+see [Reader/writer locking](STORAGE.md#readerwriter-locking).
 
 With the current format, updating one or a few files is bounded by the structural delta
 instead of the total number of lexical postings in the project graph.

@@ -3448,10 +3448,6 @@ def _name_is_used(name: str, usage_names: set[str]) -> bool:
     return name in usage_names or any(candidate.startswith(f"{name}.") for candidate in usage_names)
 
 
-def _valid_external_symbol_name(name: str | None) -> bool:
-    return _clean_external_symbol_name(name) is not None
-
-
 def _clean_external_symbol_name(name: str | None, *, imported_names: set[str] | None = None) -> str | None:
     value = _clean_call_target(name)
     if value is None:
@@ -3500,16 +3496,6 @@ def _code_nodes_for_artifact(store: GraphStore, artifact: SourceArtifact | Memor
         for node in _find_nodes_by_property(store, "artifact_id", artifact.id, limit=100000)
         if node.type in CODE_GRAPH_NODE_TYPES and node.properties.get("artifact_id") == artifact.id
     ]
-
-
-def _code_related_edges(store: GraphStore, node: MemoryNode) -> list[MemoryEdge]:
-    edges: dict[str, MemoryEdge] = {}
-    for edge_type in CODE_GRAPH_EDGE_TYPES:
-        for edge in _get_edges(store, from_id=node.id, type_=edge_type, limit=100):
-            edges[edge.id] = edge
-        for edge in _get_edges(store, to_id=node.id, type_=edge_type, limit=100):
-            edges[edge.id] = edge
-    return list(edges.values())
 
 
 def _code_related_edges_for_nodes(store: GraphStore, nodes: list[MemoryNode]) -> list[MemoryEdge]:

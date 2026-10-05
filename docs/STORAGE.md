@@ -89,6 +89,13 @@ This keeps retrieval, activation, cache inspection, project compilation, and
 common REQL query paths bounded without relying on SQL or a graph database
 service.
 
+The block adapter owns one lexical-index implementation, using stateless term
+selection helpers in `memory.storage.adapters.lexical_index`. The former
+`memory.storage.adapters.lexical_block_store` path remains an import alias.
+Checkpoints record lexical schema version 2; older head-only postings are rebuilt
+from all nodes on first lexical use, including in read-only or deferred sessions.
+Read-only migration does not rewrite the checkpoint.
+
 Lexical postings include bounded identifier components (camelCase, snake_case,
 hyphenated names, and paths) plus conservative singular variants. Bounded
 searches rank posting scores before materializing records and only load a small
@@ -155,11 +162,19 @@ only operational records. They contain no project, file, symbol,
 source-fragment, or canonical relationship records, and initialization does
 not open the canonical store.
 
-Completed agents do not retain private stores. `agent finish` publishes a
+Durable `work_record` nodes live in the shared dashboard and survive agent/session
+retention. Relative evidence paths and relation ids are operational context, not
+canonical graph replicas. See [Engineering coordination](COORDINATION.md) for
+revision checks, migration and bounded work retention.
+
+Completed agents do not retain private scratch stores. `agent finish` saves a
+shared checkpoint and publishes a
 compact public dashboard finish message, closes the store, and removes its block file and sidecars.
-Agent init/finish reconcile known completed stores and retain public dashboard identities,
+Agent init/finish/terminate reconcile known completed stores and retain public dashboard identities,
 messages, and finish messages for the latest `retention.agent_sessions` completed
-sessions; active sessions and unregistered files are not removed.
+sessions across the project; active sessions and unregistered files are not removed.
+The last activity to finish releases a shared private store. Cleanup holds the
+private store writer lock and defers busy stores until the next lifecycle command.
 
 ## Reader/Writer Locking
 
@@ -212,11 +227,12 @@ raise `StorageError` according to their configured lock timeout.
 
 The adapter exposes `store.transaction()` through the `GraphStore` contract.
 
-- outer transactions snapshot the current in-memory graph and append WAL once
-  on commit;
-- nested transactions use nested snapshots;
-- writes inside failed transactions are rolled back by restoring the relevant
-  snapshot;
+- each transaction journals touched nodes, edges, pending WAL state, and small
+  mutable side structures;
+- inner rollback restores its journal while preserving outer work;
+- rollback restores touched records and rebuilds indexes, including deferred
+  lexical postings;
+- the outer commit appends pending WAL records once;
 - `storage compact` is the explicit full-checkpoint path.
 
 Project compilation uses this transaction boundary so a compilation run, graph

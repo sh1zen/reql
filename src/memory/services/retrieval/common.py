@@ -5,9 +5,7 @@ from typing import Sequence
 
 from ...extraction.normalization import (
     expanded_tokens as _expanded_tokens,
-    identifier_expanded_text as _identifier_expanded_text,
     singular_source_variants as _singular_source_variants,
-    token_variants as _token_variants,
 )
 
 TECHNICAL_NODE_TYPES = {"RetrievalTrace", "System", "Session", "Debug", "Log", "Comment", "Docstring", "Import"}

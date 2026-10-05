@@ -24,7 +24,9 @@ def normalize_text(value: str) -> str:
     return re.sub(r"\s+", " ", value)
 
 
+@lru_cache(maxsize=8192)
 def canonicalize(value: str) -> str:
+    """Reuse normalization of immutable text across ranking and indexing passes."""
     value = normalize_text(value).lower()
     value = strip_accents(value)
     value = re.sub(r"[^a-z0-9_\-\s]", " ", value)
@@ -36,7 +38,9 @@ def token_signal_score(token: str) -> float:
     return _token_signal_score_stripped(token.strip("_-"))
 
 
+@lru_cache(maxsize=8192)
 def _token_signal_score_stripped(token: str) -> float:
+    """Reuse immutable token scores throughout lexical indexing and ranking."""
     if len(token) < 2:
         return 0.0
     has_alpha = False
@@ -68,6 +72,7 @@ def tokenize(value: str, *, keep_stopwords: bool = False) -> list[str]:
     return tokens
 
 
+@lru_cache(maxsize=8192)
 def identifier_expanded_text(value: str) -> str:
     """Expose path and identifier components as ordinary lexical words."""
 

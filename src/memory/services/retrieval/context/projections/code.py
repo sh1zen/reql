@@ -16,7 +16,6 @@ from ...common import (
     QUERY_CONTEXT_MAX_RENDERED_FILES,
     QUERY_CONTEXT_MODES,
     QUERY_CONTEXT_SCOPES,
-    SOURCE_EDGE_TYPES,
     SOURCE_NODE_TYPES,
     SERIALIZATION_EDGE_TYPES,
     TECHNICAL_NODE_TYPES,
@@ -1211,62 +1210,3 @@ class CodeContextProjectionMixin:
                 }
             )
         return followups
-
-    def _code_edit_plan_lines(
-        self,
-        path_rows: list[dict[str, Any]],
-        ranked: list[RankedNode],
-        subgraph: MemorySubgraph,
-        *,
-        max_items: int,
-    ) -> list[str]:
-        if not path_rows:
-            return []
-        lines: list[str] = [
-            "- Existing graph-node context is available for implementation planning.",
-        ]
-        candidates = [row for row in path_rows if row["edit_candidate"]] or path_rows[: min(3, len(path_rows))]
-        for row in candidates[: min(max_items, 4)]:
-            symbols = ", ".join(row["symbols"][:3]) if row["symbols"] else "inspect file-level owner"
-            reasons = ", ".join(row.get("reasons") or ["graph match"])
-            lines.append(f"- Primary candidate: `{row['path']}` ({symbols}; {reasons}; score={float(row['score']):.2f})")
-        owner_ids = [
-            item.node.id
-            for item in ranked
-            if item.node.type in {"Module", "Function", "Class", "Interface", "Method", "Endpoint", "Schema", "StaticAnalysisFinding"}
-        ][:3]
-        if owner_ids:
-            joined = ", ".join(owner_ids)
-            lines.append(f"- Owner/provenance nodes: {joined}")
-        source_edges = [
-            edge
-            for edge in subgraph.edges
-            if edge.type in SOURCE_EDGE_TYPES and (edge.from_id in owner_ids or edge.to_id in owner_ids)
-        ]
-        if source_edges:
-            lines.append("- Linked `SourceFragment` evidence exists for relevant line ranges.")
-        lines.append("- Candidate alignment depends on the query terms and retrieved graph evidence.")
-        return lines
-
-    def _code_edge_lines(self, subgraph: MemorySubgraph, *, max_items: int) -> list[str]:
-        nodes: dict[str, MemoryNode] = {item.node.id: item.node for item in subgraph.ranked_nodes}
-        nodes.update({node.id: node for node in subgraph.nodes if self._is_code_context_node(node)})
-        lines: list[str] = []
-        seen: set[str] = set()
-        for edge in subgraph.edges:
-            if edge.id in seen or edge.type not in CODE_CONTEXT_EDGE_TYPES:
-                continue
-            left = nodes.get(edge.from_id)
-            right = nodes.get(edge.to_id)
-            if left is None or right is None:
-                continue
-            seen.add(edge.id)
-            left_label = self._compact_text(self._node_label(left), max_chars=80)
-            right_label = self._compact_text(self._node_label(right), max_chars=80)
-            lines.append(f"- `{edge.id}` {left_label} --{edge.type}--> {right_label}")
-            if len(lines) >= min(max_items, 8):
-                break
-        return lines
-
-    def _code_follow_up_lines(self, subgraph: MemorySubgraph, path_rows: list[dict[str, Any]], *, max_items: int) -> list[str]:
-        return self._render_followups(self._code_follow_up_payload(subgraph, path_rows, max_items=max_items))

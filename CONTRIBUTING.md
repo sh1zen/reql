@@ -45,6 +45,42 @@ On Windows, if tests cannot create temporary lock files under the default temp
 directory, point `TEMP` and `TMP` at a writable local directory before running
 the suite.
 
+## Benchmarks
+
+`tests/benchmark_performance.py` measures production graph, coordination, MCP,
+and CLI workloads locally. Timing stays separate from semantic regression tests;
+the suite has no wall-clock assertions or live provider dependencies.
+
+Before changing the implementation, snapshot `src/` and root `cli.py`, including
+working-tree changes, under `.tmp/benchmark-baseline/`. Use the same Python
+installation and run versions sequentially against one prepared fixture. For
+example, in PowerShell:
+
+```powershell
+$env:PYTHONPATH = 'src'
+$env:PYTHONHASHSEED = '0'
+New-Item -ItemType Directory -Force .tmp | Out-Null
+$env:TEMP = (Resolve-Path .tmp).Path
+$env:TMP = $env:TEMP
+python tests/benchmark_performance.py --root .tmp/benchmark --prepare --modules 96 --history 320
+$env:PYTHONPATH = '.tmp/benchmark-baseline/src'
+python tests/benchmark_performance.py --root .tmp/benchmark --repeats 7 --profile --cli .tmp/benchmark-baseline/cli.py --output .tmp/before.json
+$env:PYTHONPATH = 'src'
+python tests/benchmark_performance.py --root .tmp/benchmark --repeats 7 --profile --output .tmp/after.json --compare .tmp/before.json
+```
+
+Preparation preserves source timestamps, artifact cache, and checkpointed stores.
+Each run restores those inputs; cold compilation disables the cache. Use
+`--modules 24 --history 80` for a smaller fixture. `--compare` checks meaningful
+outputs, including scores, ordering, ids, statuses, relations, revisions,
+confidence, and scopes, while excluding timestamps and trace ids. The fixed hash
+seed controls existing set-order ties. Profiles are separate from timed samples.
+
+To measure a real repository, copy its store and sidecars to an ignored directory
+and use `--root DIR --existing-project PROJECT --repeats 5 --profile`. This reads
+the copied graph without recompilation. Keep fixtures, profiles, and results out
+of source control.
+
 ## Pull Requests
 
 1. Fork the repository and create a branch from `main`.

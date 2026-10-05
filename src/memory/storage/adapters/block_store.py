@@ -19,11 +19,9 @@ from pathlib import Path
 import json
 import math
 import shlex
-import signal
 import socket
 import struct
 import sys
-import threading
 import time
 import uuid
 import zlib
@@ -36,10 +34,18 @@ from ...domain.timeutils import parse_dt, utcnow_iso
 from ...extraction.normalization import (
     expanded_tokens,
     identifier_expanded_text,
-    keyword_scores,
     token_signal_score,
     tokenize,
     token_variants,
+)
+
+from .lexical_index import (
+    LEXICAL_INDEX_SCHEMA_VERSION,
+    LEXICAL_MAX_TERMS_PER_NODE,
+    LEXICAL_PROPERTY_VALUE_LIMIT,
+    _cap_terms,
+    _metadata_term_weights,
+    _text_term_weights,
 )
 
 SCHEMA_VERSION = 2
@@ -49,7 +55,6 @@ DEFAULT_DENSE_NODE_THRESHOLD = 1024
 DEFAULT_LOCK_TIMEOUT_SECONDS = 30.0
 DEFAULT_INCOMPLETE_LOCK_STALE_SECONDS = 30.0
 DEFAULT_AUTO_CHECKPOINT_WAL_BYTES = 8 * 1024 * 1024
-DEFAULT_LEXICAL_TEXT_BUDGET = 4096
 
 _FORMAT_NAME = "reql-block-graph"
 _SUPERBLOCK_MAGIC = b"RQLSPB01"
@@ -1064,26 +1069,6 @@ class BlockGraphStore:
             self._lock = None
 
     @contextmanager
-    def _defer_keyboard_interrupt(self) -> Iterator[None]:
-        if threading.current_thread() is not threading.main_thread():
-            yield
-            return
-        previous_handler = signal.getsignal(signal.SIGINT)
-        interrupted = False
-
-        def _handler(signum: int, frame: Any) -> None:
-            nonlocal interrupted
-            interrupted = True
-
-        signal.signal(signal.SIGINT, _handler)
-        try:
-            yield
-        finally:
-            signal.signal(signal.SIGINT, previous_handler)
-            if interrupted:
-                raise KeyboardInterrupt
-
-    @contextmanager
     def transaction(self) -> Iterator["BlockGraphStore"]:
         self._ensure_writable()
         journal = _TransactionJournal(self)
@@ -1237,87 +1222,6 @@ class BlockGraphStore:
     def _ensure_writable(self) -> None:
         if self.read_only:
             raise StorageError(f"REQL block store is opened read-only: {self.path}")
-
-    def _snapshot(self) -> dict[str, Any]:
-        return {
-            "nodes": dict(self._nodes),
-            "edges": dict(self._edges),
-            "node_locations": dict(self._node_locations),
-            "edge_locations": dict(self._edge_locations),
-            "loaded_all_records": self._loaded_all_records,
-            "node_key_index": dict(self._node_key_index),
-            "edge_pattern_index": dict(self._edge_pattern_index),
-            "out_edges": {key: set(values) for key, values in self._out_edges.items()},
-            "in_edges": {key: set(values) for key, values in self._in_edges.items()},
-            "node_terms": {term: dict(postings) for term, postings in self._node_terms.items()},
-            "node_term_index": {node_id: set(terms) for node_id, terms in self._node_term_index.items()},
-            "node_lexical_fingerprints": dict(self._node_lexical_fingerprints),
-            "lexical_index_loaded": self._lexical_index_loaded,
-            "lexical_index_location": dict(self._lexical_index_location) if self._lexical_index_location else None,
-            "deferred_lexical_changes": {
-                node_id: (
-                    self._clone_node(old) if old is not None else None,
-                    self._clone_node(new) if new is not None else None,
-                )
-                for node_id, (old, new) in self._deferred_lexical_changes.items()
-            },
-            "node_type_index": {key: set(values) for key, values in self._node_type_index.items()},
-            "node_status_index": {key: set(values) for key, values in self._node_status_index.items()},
-            "edge_type_index": {key: set(values) for key, values in self._edge_type_index.items()},
-            "node_property_index": {key: set(values) for key, values in self._node_property_index.items()},
-            "edge_property_index": {key: set(values) for key, values in self._edge_property_index.items()},
-            "operation_log": list(self._operation_log),
-            "usage_by_node": {key: dict(value) for key, value in self._usage_by_node.items()},
-            "meta": dict(self._meta),
-            "dirty": self._dirty,
-            "generation_id": self._generation_id,
-            "data_offset": self._data_offset,
-            "root_index_offset": self._root_index_offset,
-            "manifest": dict(self._manifest),
-            "root_index": dict(self._root_index),
-            "space_map": dict(self._space_map),
-            "pending_wal_records": list(self._pending_wal_records),
-        }
-
-    def _restore(self, snapshot: dict[str, Any]) -> None:
-        self._nodes = snapshot["nodes"]
-        self._edges = snapshot["edges"]
-        self._node_locations = snapshot["node_locations"]
-        self._edge_locations = snapshot["edge_locations"]
-        self._loaded_all_records = bool(snapshot["loaded_all_records"])
-        self._node_key_index = snapshot["node_key_index"]
-        self._edge_pattern_index = snapshot["edge_pattern_index"]
-        self._out_edges = defaultdict(set, snapshot["out_edges"])
-        self._in_edges = defaultdict(set, snapshot["in_edges"])
-        self._node_terms = defaultdict(dict, {term: dict(postings) for term, postings in snapshot["node_terms"].items()})
-        self._node_term_index = {node_id: set(terms) for node_id, terms in snapshot["node_term_index"].items()}
-        self._node_lexical_fingerprints = dict(snapshot.get("node_lexical_fingerprints", {}))
-        self._lexical_index_loaded = bool(snapshot.get("lexical_index_loaded", True))
-        lexical_location = snapshot.get("lexical_index_location")
-        self._lexical_index_location = dict(lexical_location) if isinstance(lexical_location, dict) else None
-        self._deferred_lexical_changes = {
-            node_id: (
-                self._clone_node(old) if old is not None else None,
-                self._clone_node(new) if new is not None else None,
-            )
-            for node_id, (old, new) in snapshot.get("deferred_lexical_changes", {}).items()
-        }
-        self._node_type_index = defaultdict(set, snapshot["node_type_index"])
-        self._node_status_index = defaultdict(set, snapshot["node_status_index"])
-        self._edge_type_index = defaultdict(set, snapshot["edge_type_index"])
-        self._node_property_index = defaultdict(set, snapshot["node_property_index"])
-        self._edge_property_index = defaultdict(set, snapshot["edge_property_index"])
-        self._operation_log = snapshot["operation_log"]
-        self._usage_by_node = defaultdict(dict, {key: dict(value) for key, value in snapshot.get("usage_by_node", {}).items()})
-        self._meta = snapshot["meta"]
-        self._dirty = bool(snapshot.get("dirty", self._dirty))
-        self._generation_id = int(snapshot.get("generation_id", self._generation_id))
-        self._data_offset = int(snapshot.get("data_offset", self._data_offset))
-        self._root_index_offset = int(snapshot.get("root_index_offset", self._root_index_offset))
-        self._manifest = dict(snapshot.get("manifest", self._manifest))
-        self._root_index = dict(snapshot.get("root_index", self._root_index))
-        self._space_map = dict(snapshot.get("space_map", self._space_map))
-        self._pending_wal_records = [dict(record) for record in snapshot.get("pending_wal_records", self._pending_wal_records)]
 
     def _restore_journal(self, journal: _TransactionJournal) -> None:
         self._materialize_all_records()
@@ -1550,37 +1454,6 @@ class BlockGraphStore:
                 digest.update(chunk)
         if digest.hexdigest() != expected:
             raise StorageError(f"Invalid REQL data checksum for {self.path}")
-
-    def _load_blocks(self, data_offset: int, block_count: int) -> None:
-        pending_parts: list[dict[str, Any]] = []
-        for block_id in range(block_count):
-            page = self._read_block(block_id, data_offset=data_offset)
-            magic, version, block_size, current_id, used, _reserved = _HEADER_STRUCT.unpack(page[:_HEADER_SIZE])
-            if magic != _BLOCK_MAGIC or version != SCHEMA_VERSION or block_size != self.block_size or current_id != block_id:
-                raise StorageError(f"Invalid REQL block header at block {block_id}")
-            offset = _HEADER_SIZE
-            end = min(self.block_size, _HEADER_SIZE + used)
-            while offset + _FRAME_HEADER.size <= end:
-                (length,) = _FRAME_HEADER.unpack(page[offset : offset + _FRAME_HEADER.size])
-                offset += _FRAME_HEADER.size
-                if length == 0:
-                    break
-                payload = page[offset : offset + length]
-                offset += length
-                record, _uncompressed_length, _compressed = _decode_record_payload(payload)
-                if record.get("kind") == "record_part":
-                    pending_parts.append(record)
-                    expected_parts = int(dict(record.get("value", {})).get("total_parts", 0))
-                    if expected_parts and len(pending_parts) == expected_parts:
-                        record, _uncompressed_length, _compressed = _decode_record_parts(pending_parts)
-                        pending_parts = []
-                    else:
-                        continue
-                elif pending_parts:
-                    raise StorageError("Incomplete REQL large record before next record")
-                self._apply_record(record)
-        if pending_parts:
-            raise StorageError("Incomplete REQL large record at end of block file")
 
     def _replay_wal(self) -> int:
         if not self._wal_path.exists() or self._wal_path.stat().st_size == 0:
@@ -2266,6 +2139,7 @@ class BlockGraphStore:
             "version": CURRENT_ROOT_INDEX_VERSION,
             "generation_id": generation_id,
             "codec": "binary-v2",
+            "lexical_schema_version": LEXICAL_INDEX_SCHEMA_VERSION,
             "nodes": len(node_locations),
             "edges": len(edge_locations),
             "node_keys": node_keys,
@@ -2291,6 +2165,10 @@ class BlockGraphStore:
         }
 
     def _apply_root_index(self, value: dict[str, Any]) -> None:
+        try:
+            self._loaded_lexical_schema_version = int(value.get("lexical_schema_version", 1) or 1)
+        except (TypeError, ValueError):
+            self._loaded_lexical_schema_version = 1
         version = int(value.get("version", 0) or 0)
         if version != CURRENT_ROOT_INDEX_VERSION:
             raise StorageError(
@@ -2356,6 +2234,14 @@ class BlockGraphStore:
             if new is not None:
                 self._reindex_node_terms(new)
         self._deferred_lexical_changes = {}
+        loaded_version = getattr(self, "_loaded_lexical_schema_version", LEXICAL_INDEX_SCHEMA_VERSION)
+        if loaded_version < LEXICAL_INDEX_SCHEMA_VERSION:
+            # Rebuild old head-only postings from all records, including cold nodes.
+            self._materialize_all_records()
+            self._rebuild_lexical_index()
+            self._loaded_lexical_schema_version = LEXICAL_INDEX_SCHEMA_VERSION
+            if not self.read_only:
+                self._dirty = True
 
     def _rebuild_lexical_index(self) -> None:
         self._node_terms = defaultdict(dict)
@@ -2505,41 +2391,70 @@ class BlockGraphStore:
             if not postings:
                 self._node_terms.pop(term, None)
 
-    def _node_lexical_texts(self, node: MemoryNode) -> list[str]:
-        index_texts = [node.type, node.label or "", node.canonical_key or ""]
-        remaining = DEFAULT_LEXICAL_TEXT_BUDGET
-        text = node.text or ""
-        if text:
-            index_texts.append(text[:remaining])
-            remaining = max(0, remaining - len(text))
-        for key in sorted(INDEXED_NODE_PROPERTIES):
-            value = node.properties.get(key)
-            if isinstance(value, (str, int, float, bool)):
-                item = str(value)
-                index_texts.append(item[:remaining] if remaining else item[:128])
-                remaining = max(0, remaining - len(item))
-            elif isinstance(value, list):
-                for item in value[:20]:
-                    if isinstance(item, (str, int, float, bool)):
-                        text_item = str(item)
-                        index_texts.append(text_item[:remaining] if remaining else text_item[:128])
-                        remaining = max(0, remaining - len(text_item))
-        return index_texts
-
     def _node_lexical_fingerprint(self, node: MemoryNode) -> tuple[str, ...]:
-        return tuple(self._node_lexical_texts(node))
+        """Detect changes across the full text and bounded searchable metadata."""
+        digest = hashlib.blake2b(digest_size=20)
+        for value in self._fingerprint_values(node):
+            encoded = value.encode("utf-8", errors="replace")
+            digest.update(len(encoded).to_bytes(8, "little", signed=False))
+            digest.update(encoded)
+        return (str(LEXICAL_INDEX_SCHEMA_VERSION), digest.hexdigest())
 
     def _reindex_node_terms(self, node: MemoryNode) -> None:
-        index_texts = self._node_lexical_texts(node)
+        """Index bounded terms from the head, middle, tail, and metadata."""
+        text_terms = _text_term_weights(node.text or "")
+        metadata_terms = _metadata_term_weights(node, self._property_values(node))
+
+        combined: dict[str, float] = dict(text_terms)
+        for term, weight in metadata_terms.items():
+            combined[term] = max(combined.get(term, 0.0), weight)
+        combined = _cap_terms(combined, LEXICAL_MAX_TERMS_PER_NODE)
+
         node_terms: set[str] = set()
-        for term, score in keyword_scores(" ".join(index_texts), max_terms=80):
+        for term, score in combined.items():
             self._node_terms[term][node.id] = float(score)
             node_terms.add(term)
-        self._node_lexical_fingerprints[node.id] = tuple(index_texts)
+
+        self._node_lexical_fingerprints[node.id] = self._node_lexical_fingerprint(node)
         if node_terms:
             self._node_term_index[node.id] = node_terms
         else:
             self._node_term_index.pop(node.id, None)
+
+    @staticmethod
+    def _property_values(node: MemoryNode) -> list[str]:
+        """Collect searchable property values in deterministic, bounded order."""
+        values: list[str] = []
+        remaining = LEXICAL_PROPERTY_VALUE_LIMIT
+        for key in sorted(INDEXED_NODE_PROPERTIES):
+            if remaining <= 0:
+                break
+            value = node.properties.get(key)
+            if isinstance(value, (str, int, float, bool)):
+                values.append(str(value)[:512])
+                remaining -= 1
+                continue
+            if isinstance(value, (list, tuple, set, frozenset)):
+                items: Iterable[Any]
+                if isinstance(value, (set, frozenset)):
+                    items = sorted(value, key=str)
+                else:
+                    items = value
+                for item in items:
+                    if remaining <= 0:
+                        break
+                    if isinstance(item, (str, int, float, bool)):
+                        values.append(str(item)[:256])
+                        remaining -= 1
+        return values
+
+    def _fingerprint_values(self, node: MemoryNode) -> Iterable[str]:
+        """Yield the values that determine a node's lexical postings."""
+        yield node.type
+        yield node.label or ""
+        yield node.canonical_key or ""
+        yield node.text or ""
+        yield from self._property_values(node)
 
     def upsert_node(self, node: MemoryNode, *, return_clone: bool = True) -> tuple[MemoryNode, bool]:
         self._ensure_writable()

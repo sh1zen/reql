@@ -5,13 +5,12 @@ from typing import MutableMapping, Sequence
 
 from ...domain.constants import INACTIVE_STATUSES
 from ...domain.models import MemoryNode, MemoryQuery
-from ...extraction.normalization import canonicalize, token_signal_score, tokenize
+from ...extraction.normalization import canonicalize, identifier_expanded_text, token_signal_score
 from .common import (
     STRUCTURED_SEARCH_FIELDS,
     TECHNICAL_NODE_TYPES,
     _canonical_token_overlap,
     _expanded_tokens,
-    _identifier_expanded_text,
     _raw_query_token_overlap,
 )
 from .context.models import NodeMatchMetrics, QueryProfile
@@ -177,7 +176,7 @@ class RetrievalSearchMixin:
         overlap = _canonical_token_overlap(node_key, query_profile.informative_tokens)
         strong_identifier_overlap = self._has_strong_identifier_overlap(overlap)
         identifier_keys = [
-            canonicalize(_identifier_expanded_text(part))
+            canonicalize(identifier_expanded_text(part))
             for part in self._node_identifier_parts(node)
             if part
         ]
@@ -217,7 +216,7 @@ class RetrievalSearchMixin:
             phrase_bonus = 0.18 * phrase_coverage
             return result(min(0.38, (0.16 * coverage) + phrase_bonus), coverage)
         source = str(node.properties.get("relative_path") or node.properties.get("path") or "")
-        source_key = canonicalize(" ".join((source, _identifier_expanded_text(source))))
+        source_key = canonicalize(" ".join((source, identifier_expanded_text(source))))
         source_overlap = _canonical_token_overlap(source_key, query_profile.informative_tokens)
         source_coverage = self._coverage(source_overlap, query_profile)
         if source_coverage >= 0.50:
@@ -331,11 +330,7 @@ class RetrievalSearchMixin:
     @classmethod
     def _node_search_text(cls, node: MemoryNode) -> str:
         parts = cls._node_search_parts(node)
-        return " ".join(parts + [_identifier_expanded_text(part) for part in parts])
-
-    @classmethod
-    def _node_query_token_overlap(cls, node: MemoryNode, query_tokens: set[str]) -> int:
-        return len(cls._node_query_token_overlap_tokens(node, query_tokens))
+        return " ".join(parts + [identifier_expanded_text(part) for part in parts])
 
     @classmethod
     def _node_query_token_overlap_tokens(cls, node: MemoryNode, query_tokens: set[str]) -> set[str]:
@@ -351,20 +346,3 @@ class RetrievalSearchMixin:
             token_signal_score(token) >= 0.85 and (any(separator in token for separator in ("_", "-")) or any(char.isdigit() for char in token))
             for token in tokens
         )
-
-    @staticmethod
-    def _contains_query(
-        node_key: str,
-        query_key: str,
-        *,
-        node_tokens: set[str] | None = None,
-        query_tokens: set[str] | None = None,
-    ) -> bool:
-        if not query_key:
-            return False
-        if node_key == query_key or f" {query_key} " in f" {node_key} ":
-            return True
-        node_tokens = node_tokens if node_tokens is not None else set(tokenize(node_key))
-        query_tokens = query_tokens if query_tokens is not None else set(tokenize(query_key))
-        return bool(query_tokens) and query_tokens.issubset(node_tokens)
-

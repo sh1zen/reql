@@ -1,4 +1,3 @@
-from .lexical_block_store import BlockGraphStore
-from .block_store import StoreLease
+from .block_store import BlockGraphStore, StoreLease
 
 __all__ = ["BlockGraphStore", "StoreLease"]

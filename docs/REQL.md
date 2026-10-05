@@ -118,44 +118,9 @@ not read source files on demand.
 
 ## Retrieval Query Examples
 
-Use `query_context` when an agent needs compact next-action context. It is
-informative by default for structure/documentation/existence questions and
-renders one compact block with file/line references plus raw-query references
-for extended research. Add `--code`, `--docs`, or `--test` to restrict the
-same query to code, documentation/imported documents, or tests. Pass
-`--cleanup` for dead-code and unused-symbol cleanup; cleanup output shows only
-safe-remove `StaticAnalysisFinding` candidates before removals. Review
-validation-required findings through explicit `FINDINGS` statements instead
-of the removal-oriented context builder. Generic memory candidates, generated package docs,
-and secondary test/docs paths are suppressed when a production owner is
-available. Use `reql query_context --code --json` or `reql query_context
---cleanup --json` when another tool should consume the canonical result envelope.
-The envelope contains `schema_version`, `graph_revision`, and `confidence`;
-its nested `payload` contains `query_mode`, `scopes`, `cleanup_filter`,
-`owner_candidates`, `cleanup_candidates`, `working_set`, and `targeted_reads`.
-For `--docs`, document concepts are ranked against their strongest bounded
-evidence excerpt. Raw ingestion events remain hidden, repeated broad excerpts
-are deduplicated, weak results from unrelated documents are dropped relative to
-the strongest match, and confidence is calculated from the results actually
-returned to the caller.
-For small code working sets, informative code context can also embed exact
-`SourceFragment` snippets when a source fragment strongly matches the query
-phrase; this keeps phrase-level hits, such as UI labels inside PHP templates,
-available without opening whole files. Rendered code results stay compact for
-one- or two-file tasks while the JSON payload keeps the full targeted-read data.
-In cleanup mode, `targeted_reads` includes per-finding read kinds such as
-`import_block`, `symbol_body`, `finding_context`, `caller_ref`, `importer_ref`,
-`doc_ref`, and `test_ref`, plus a sufficiency reason explaining whether the
-listed reads are enough before opening broader source files.
-
-Use `query_explore` when an agent needs the dependency chain for a concrete code
-target before editing. It returns focused owners, callers, public surface,
-serialization paths, docs mentions, structural template duplicates, and code
-working-set sections with usage guidance, snippets, and targeted reads; pass repeated
-`--view` flags such as `--view owners --view code`, or shortcuts such as `--owners-only` and
-`--serialization-paths-only` to keep output small. Use
-`--structural-duplicates-only` for markup-signature comparisons across templates;
-this view is opt-in so normal dependency exploration does not pay its scan cost.
+For the `query_context`, `query_explore`, and `query_memories` CLI commands,
+including scopes, budgets, cleanup mode, and structured envelopes, see
+[Retrieval commands](CLI.md#retrieval-commands).
 
 Use raw `reql query "..."` statements when you need deterministic rows instead
 of a synthesized context block. `RETRIEVE` is the raw query form for ranked
@@ -166,7 +131,7 @@ Ask for only the columns needed for the next decision, include `LIMIT`, and add
 `direction` when provenance matters.
 
 ```text
-RETRIEVE "office plant" LIMIT 8
+RETRIEVE "payment validation" LIMIT 8
 RETRIEVE "compile document fragments" TOP 20 DEPTH 2 LIMIT 10
 RETRIEVE "payment workflow" TYPE Function,Method NO SOURCES RETURN id,type,label,text,score
 RETRIEVE "source provenance" RETURN id,type,text,score,source_for,relation,direction,relative_path,line_start,line_end
@@ -198,22 +163,7 @@ Explain why a node was or was not scored as a hub:
 EXPLAIN HUB "node_id"
 ```
 
-## Path And Match Examples
-
-List artifact-defined functions:
-
-```text
-MATCH (a:SourceArtifact)-[:DEFINES]->(f:Function)
-RETURN a.path,f.name,f.start_line
-ORDER BY a.path ASC
-```
-
-List resolved calls:
-
-```text
-MATCH (f:Function)-[:CALLS]->(g)
-RETURN f.name,g.name
-```
+## Path Example
 
 Find a bounded path between text-selected concepts:
 

@@ -1,3 +1,3 @@
-from .adapters.lexical_block_store import BlockGraphStore
+from .adapters.block_store import BlockGraphStore
 
 __all__ = ["BlockGraphStore"]

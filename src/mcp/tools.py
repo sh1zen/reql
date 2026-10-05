@@ -62,6 +62,7 @@ from memory.services.project_watch import (
     _WatchdogChangeHandler,
 )
 from memory.storage import StoreLease
+from memory.services.coordination import CoordinationStore, KINDS
 
 MAX_TOP_K = 50
 MAX_DEPTH = 5
@@ -88,13 +89,54 @@ READ_ONLY_TOOLS = {
     "query_memories",
     "reql_query",
     "reql_project_status",
+    "reql_work_context",
+    "reql_work_overview",
 }
 
 WRITE_TOOLS = {
     "reql_compile_project",
     "reql_hubs",
     "reql_watch_project",
+    "reql_work_record",
 }
+
+
+def _work_store(storage_path: str) -> CoordinationStore:
+    """Validate both the project boundary and its derived engineering store."""
+    path = validate_mcp_path(_required_path_text(storage_path, "storage_path"), name="storage_path")
+    dashboard = validate_mcp_path(Path(path).with_name("agent-dashboard.reql"), name="dashboard_storage")
+    return CoordinationStore(dashboard)
+
+
+def reql_work_context(*, storage_path: str, query: str = "", files: list[str] | None = None,
+                      workstream: str | None = None, record_id: str | None = None,
+                      limit: int = 8, include_history: bool = False) -> dict[str, Any]:
+    """Read focused causal work without opening the canonical graph or a session."""
+    try:
+        return _work_store(storage_path).context(query, files=files, workstream=workstream,
+                                                record_id=record_id, limit=limit, include_history=include_history)
+    except ValueError as exc:
+        raise MCPToolError(str(exc)) from exc
+
+
+def reql_work_overview(*, storage_path: str, limit: int = 5) -> dict[str, Any]:
+    """Read compact goals, trajectory, blockers and ready work across sessions."""
+    try:
+        return _work_store(storage_path).overview(limit=limit)
+    except ValueError as exc:
+        raise MCPToolError(str(exc)) from exc
+
+
+def reql_work_record(*, storage_path: str, kind: str, content: str, agent_id: str,
+                     session_id: str, fields: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Reconcile one shared record with explicit caller provenance and revision."""
+    if fields is not None and not isinstance(fields, dict):
+        raise MCPToolError("fields must be an object")
+    try:
+        return _work_store(storage_path).put(kind, content, agent_id=_required_text(agent_id, "agent_id"),
+                                             session_id=_required_text(session_id, "session_id"), **(fields or {}))
+    except (TypeError, ValueError) as exc:
+        raise MCPToolError(str(exc)) from exc
 
 
 def query_graph(
@@ -522,6 +564,9 @@ def _watch_event_payload(event: Any) -> dict[str, Any]:
 
 
 TOOL_HANDLERS: dict[str, ToolHandler] = {
+    "reql_work_context": reql_work_context,
+    "reql_work_overview": reql_work_overview,
+    "reql_work_record": reql_work_record,
     "inspect_node": inspect_node,
     "query_graph": query_graph,
     "query_context": query_context,
@@ -536,6 +581,35 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
 
 
 TOOL_SCHEMAS: list[dict[str, Any]] = [
+    {
+        "name": "reql_work_context",
+        "description": "Read-only: focused engineering work, decisions, constraints, failures and dependencies across sessions.",
+        "inputSchema": {"type": "object", "required": ["storage_path"], "properties": {
+            "storage_path": {"type": "string"}, "query": {"type": "string", "default": ""},
+            "files": {"type": "array", "items": {"type": "string"}},
+            "workstream": {"type": "string"}, "record_id": {"type": "string"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 40, "default": 8},
+            "include_history": {"type": "boolean", "default": False}}},
+    },
+    {
+        "name": "reql_work_overview",
+        "description": "Read-only: compact project goals, workstreams, direction, completion, blockers and next ready outcomes.",
+        "inputSchema": {"type": "object", "required": ["storage_path"], "properties": {
+            "storage_path": {"type": "string"},
+            "limit": {"type": "integer", "minimum": 1, "maximum": 20, "default": 5}}},
+    },
+    {
+        "name": "reql_work_record",
+        "description": "Write: upsert durable work. Reuse ids; updates require fields.record_id and fields.expected_revision. Decisions/failures require fields.rationale. Provide stable agent/session provenance; record checkpoints at session boundaries.",
+        "inputSchema": {"type": "object", "required": ["storage_path", "kind", "content", "agent_id", "session_id"], "properties": {
+            "storage_path": {"type": "string"}, "kind": {"type": "string", "enum": sorted(KINDS)},
+            "content": {"type": "string"}, "agent_id": {"type": "string"}, "session_id": {"type": "string"},
+            "fields": {"type": "object", "additionalProperties": False, "properties": {
+                "key": {"type": "string"}, "record_id": {"type": "string"}, "expected_revision": {"type": "integer"},
+                "status": {"type": "string"}, "rationale": {"type": "string"}, "workstream": {"type": "string"},
+                "parent": {"type": "string"}, "next_action": {"type": "string"}, "importance": {"type": "integer"},
+                **{name: {"type": "array", "items": {"type": "string"}} for name in ("files", "depends_on", "contradicts", "supersedes", "summarizes")}}}}},
+    },
     {
         "name": "inspect_node",
         "description": "Read-only: resolve a REQL node id to its node payload, adjacent edges, neighbors, and source/location hints.",

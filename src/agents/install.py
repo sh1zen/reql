@@ -204,7 +204,7 @@ def _directory_has_agent_profile_signal(path: Path) -> bool:
 
 
 def _is_reql_owned_path(path: Path) -> bool:
-    if path.name == "reql-agent":
+    if path.name in {"reql-agent", "reql-context-compact"}:
         return True
     if path.is_file():
         return _is_reql_owned_file(path)
@@ -375,14 +375,20 @@ def _planned_files(
 
     if platform_name == "cursor":
         base = project_dir / ".cursor" / "rules" if project else home / ".cursor" / "rules"
-        return [("rule", base / "reql.mdc", _cursor_rule(command_name=command_name, command_path=command_path, fallback_command=fallback_command))]
+        skill_base = project_dir / ".cursor" if project else home / ".cursor"
+        return [
+            ("rule", base / "reql.mdc", _cursor_rule(command_name=command_name, command_path=command_path, fallback_command=fallback_command)),
+            _compact_skill_file(skill_base, platform_name),
+        ]
 
     if platform_name == "copilot":
         target = project_dir / ".github" / "copilot-instructions.md" if project else home / ".github" / "copilot-instructions.md"
         vscode_target = project_dir / ".github" / "instructions" / "reql.instructions.md" if project else home / ".github" / "instructions" / "reql.instructions.md"
+        skill_base = project_dir / ".github" if project else home / ".copilot"
         return [
             ("instructions", target, instructions),
             ("rule", vscode_target, _vscode_copilot_rule(command_name=command_name, command_path=command_path, fallback_command=fallback_command)),
+            _compact_skill_file(skill_base, platform_name),
         ]
 
     if platform_name == "opencode":
@@ -829,7 +835,9 @@ def _python_hook_command(platform_name: str) -> str:
         "`reql query_explore --query \"<terms from user request>\"` for repository context; do not duplicate that context with broad "
         "`rg`, recursive directory listings, or custom scanners. If status reports "
         "`Project not found`, immediately run `reql project compile` before broad raw file exploration. "
-        "For automatic memory updates during active work, run one `reql project compile --watch` monitor from the workspace after approval. "
+        "For resumed or substantial work, read `reql project overview`; query_context includes relevant shared engineering work. "
+        "Record durable outcomes/decisions with `reql agent record`, reconcile by id/revision, and finish the session for a checkpoint. "
+        "Start watch mode only when continuous monitoring was requested. "
         "If no watch process is running, run `reql project compile` once after modifying project files before finishing."
     )
     if platform_name == "gemini":
@@ -909,6 +917,15 @@ def _skill_files(
             )
         )
     return files
+
+
+def _compact_skill_file(base: Path, platform_name: str) -> tuple[str, Path, str]:
+    """Install the manual compact skill on platforms without the REQL agent skill."""
+    return (
+        "skill",
+        base / "skills" / "reql-context-compact" / "SKILL.md",
+        _skill_generator().context_compact_skill(platform_name),
+    )
 
 
 def _skill_generator() -> ModuleType:
