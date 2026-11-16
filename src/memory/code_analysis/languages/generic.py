@@ -149,10 +149,6 @@ COMMON_CONTROL_CALLS = frozenset(
 DEFAULT_PROFILE = AstProfile(name="default", languages=frozenset())
 
 
-def profile_for(language: str | None) -> AstProfile:
-    return DEFAULT_PROFILE
-
-
 class GenericProfileTreeSitterExtractor(TreeSitterExtractorBase):
     profile: AstProfile = DEFAULT_PROFILE
 
@@ -364,9 +360,10 @@ class GenericProfileTreeSitterExtractor(TreeSitterExtractorBase):
             return
         caller = _call_owner(scope)
         self.references.append(_reference(self.artifact, caller or _parent(self.module, scope), target, _line(target_node), _column(target_node), "read"))
-        for argument in _call_argument_nodes(node, self.profile):
+        arguments = _call_argument_nodes(node)
+        for argument in arguments:
             self._generic_expression_references(argument, scope, access="read")
-        argument_values = _quoted_texts_in_nodes(self.source, _call_argument_nodes(node, self.profile))
+        argument_values = _quoted_texts_in_nodes(self.source, arguments)
         self.calls.append(
             CodeCall(
                 id=stable_id("call", self.artifact.id, caller or "", target, _line(node), _column(node)),
@@ -551,7 +548,8 @@ def _call_target_node(node: Any, profile: AstProfile) -> Any | None:
     return None
 
 
-def _call_argument_nodes(node: Any, profile: AstProfile) -> list[Any]:
+def _call_argument_nodes(node: Any) -> list[Any]:
+    """Collect call arguments once for references and quoted argument metadata."""
     values: list[Any] = []
     for field_name in ("arguments", "argument", "argument_list"):
         field = _field(node, field_name)

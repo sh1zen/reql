@@ -8,19 +8,21 @@ Artifact ingestion turns registered `SourceArtifact` files into parsed
 - Markdown: headings, paragraphs, lists, fenced code blocks, inline links, and
   simple pipe tables.
 - Plain text and text-like artifacts: paragraph chunks with preserved line
-  ranges and character offsets. This includes `.txt`, `.rst`, `.rts`, `.sql`,
-  `.html`, and unknown UTF-8 text files.
+  ranges and character offsets, including unknown UTF-8 text files. Recognized
+  code formats use the code parser instead.
 - PDF: optional `pypdf` extraction when available. If it is not installed,
   metadata is recorded and the artifact is marked as needing a parser.
-- Code: source files are recognized across Python, TS/JS, Go, Rust, Java,
-  C/C++, Ruby, C#, Kotlin, Scala, PHP, Swift, Lua, Zig, PowerShell, Elixir,
-  Julia, Verilog, Solidity, Fortran, Bash, SQL, Terraform, Apex, Pascal, Razor, and
-  related extensions. Mandatory Tree-sitter AST parsing creates module,
-  declaration, import/include, comment, and source-fragment graph nodes for
-  recognized languages, with richer symbol/call/docstring extraction for
-  Python, JavaScript, and TypeScript.
+- Code: registered Tree-sitter parsers create technical graph facts and source
+  fragments. [Code analysis](CODE_ANALYSIS.md#language-support) owns the language
+  list, grammar requirements and extraction details.
 - Image and video files are skipped during project compilation and are not parsed,
   registered, or compiled.
+
+Document classification includes `readme.txt`, changelog and FAQ files,
+WordPress readme headings (`=== Plugin ===`, `== Description ==`), and
+extensionless files with Markdown structure. These sections participate in
+`query_context --docs`. Configured formats and document policy are described in
+[Configuration](CONFIGURATION.md#behavior).
 
 ## Parser Interface
 
@@ -96,9 +98,6 @@ records metadata-only fragments and marks artifact properties such as
 `needs_parser` or `partially_readable` where appropriate. Image and video files
 are skipped before parsing.
 
-Tree-sitter is mandatory for supported code parsing. The compiler does not use
-Python AST, regex parsing, or another fallback parser for code artifacts.
+Tree-sitter is required for supported code parsing.
 Unrecognized code-like artifacts compile conservatively as project
 structure/source artifacts only and are not reported as parser failures.
-
-

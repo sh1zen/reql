@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping, TypeAlias
+from typing import Mapping
 
 from ..config.models import CompileConfig, REQLConfig, ScanConfig
 from .models import SourceArtifact
@@ -32,15 +32,6 @@ class DocumentPolicy:
             self,
             "filenames",
             tuple(_normalized_values(self.filenames, casefold=True)),
-        )
-
-    @classmethod
-    def from_mapping(cls, value: Mapping[str, object]) -> "DocumentPolicy":
-        return cls(
-            format=str(value.get("format") or ""),
-            extensions=_string_tuple(value.get("extensions")),
-            filenames=_string_tuple(value.get("filenames")),
-            ingest=bool(value.get("ingest", True)),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -92,20 +83,6 @@ class CompilationOptions:
             ignore_defaults=scan_config.ignore_defaults,
         )
 
-    @classmethod
-    def from_mapping(cls, value: Mapping[str, object] | None) -> "CompilationOptions":
-        raw = value or {}
-        raw_compile = raw.get("compile")
-        compile_settings = raw_compile if isinstance(raw_compile, Mapping) else {}
-        raw_scan = raw.get("scan")
-        scan_settings = raw_scan if isinstance(raw_scan, Mapping) else {}
-        return cls(
-            ingest_documents=bool(compile_settings.get("ingest_documents", True)),
-            document_policies=_policies_from_compile_mapping(compile_settings),
-            use_gitignore=bool(scan_settings.get("use_gitignore", False)),
-            ignore_defaults=bool(scan_settings.get("ignore_defaults", False)),
-        )
-
     def document_ingest_enabled(self, artifact: SourceArtifact) -> bool:
         if not self.ingest_documents:
             return False
@@ -145,45 +122,13 @@ class CompilationOptions:
         }
 
 
-RawCompilationOptions: TypeAlias = CompilationOptions | Mapping[str, object] | None
-
-
-def normalize_compilation_options(value: RawCompilationOptions) -> CompilationOptions:
-    if isinstance(value, CompilationOptions):
-        return value
-    return CompilationOptions.from_mapping(value)
-
-
-def _policies_from_compile_mapping(settings: Mapping[str, object]) -> tuple[DocumentPolicy, ...]:
-    documents = settings.get("documents")
-    if isinstance(documents, list):
-        return tuple(
-            DocumentPolicy.from_mapping(item)
-            for item in documents
-            if isinstance(item, Mapping) and str(item.get("format") or "").strip()
-        )
-    document_formats = settings.get("document_formats")
-    if not isinstance(documents, Mapping) or not isinstance(document_formats, Mapping):
-        return ()
-    policies = []
-    for format_name, raw_definition in document_formats.items():
-        if not isinstance(raw_definition, Mapping):
-            continue
-        policies.append(
-            DocumentPolicy(
-                format=str(format_name),
-                extensions=_string_tuple(raw_definition.get("extensions")),
-                filenames=_string_tuple(raw_definition.get("filenames")),
-                ingest=bool(documents.get(format_name, False)),
-            )
-        )
-    return tuple(policies)
-
-
-def _string_tuple(value: object) -> tuple[str, ...]:
-    if not isinstance(value, (list, tuple, set, frozenset)):
-        return ()
-    return tuple(str(item) for item in value)
+def normalize_compilation_options(value: CompilationOptions | None) -> CompilationOptions:
+    """Resolve defaults and reject inputs outside the typed compilation contract."""
+    if value is None:
+        return CompilationOptions()
+    if not isinstance(value, CompilationOptions):
+        raise TypeError("compilation options must be CompilationOptions or None")
+    return value
 
 
 def _normalized_values(values: tuple[str, ...], *, casefold: bool) -> list[str]:

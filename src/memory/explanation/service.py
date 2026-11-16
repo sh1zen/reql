@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict, deque
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import PurePosixPath
 import re
 from typing import Any, Iterable, Sequence
@@ -235,6 +236,7 @@ class RepositoryExplanationService:
             statuses=ACTIVE_STATUSES,
             project_id=project_id,
             include_global_project=False,
+            clone=False,
         )
         degree_by_id = {node.id: degree for node, degree, _ in top_nodes}
         for node, degree, weighted_degree in top_nodes:
@@ -915,7 +917,9 @@ def _dominant_source_root(paths: Sequence[str]) -> str | None:
     return root if count >= required else None
 
 
+@lru_cache(maxsize=4096)
 def _capability_key(path: str, dominant_root: str | None) -> str | None:
+    """Reuse immutable path classification for symbols sharing a source file."""
     parts = _path_parts(path)
     if not parts:
         return None
@@ -927,7 +931,9 @@ def _capability_key(path: str, dominant_root: str | None) -> str | None:
     return folded[0]
 
 
+@lru_cache(maxsize=4096)
 def _is_test_path(path: str) -> bool:
+    """Classify path text without caching filesystem or project state."""
     parts = [part.casefold() for part in PurePosixPath(path.replace("\\", "/")).parts]
     filename = parts[-1] if parts else ""
     return bool(

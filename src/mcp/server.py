@@ -243,7 +243,9 @@ def _handle_request(
             payload = call_tool(str(name), arguments)
         except MCPToolError as exc:
             return _error_response(request_id, -32602, str(exc))
-        text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+        # This JSON string becomes model-visible tool text in either transport.
+        # Preserve every value and source newline without paying for indentation.
+        text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
         return _result_response(request_id, {"content": [{"type": "text", "text": text}], "isError": False})
     if method == "ping":
         return _result_response(request_id, {})

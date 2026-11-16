@@ -6,6 +6,7 @@ from typing import Any
 from ..ast import Statement
 from ..errors import REQLSyntaxError
 from ..lexer import Token, tokenize_reql
+from .clauses import SYMBOL_NODE_TYPES
 from .commands import CommandParserMixin
 
 
@@ -43,7 +44,7 @@ class REQLParser(CommandParserMixin):
         elif self.match_keyword("FRAGMENTS"):
             stmt = self._parse_typed_node_list("FRAGMENTS", ("SourceFragment",), allow_type=False)
         elif self.match_keyword("SYMBOLS"):
-            stmt = self._parse_typed_node_list("SYMBOLS", _SYMBOL_NODE_TYPES, allow_type=True)
+            stmt = self._parse_typed_node_list("SYMBOLS", SYMBOL_NODE_TYPES, allow_type=True)
         elif self.match_keyword("FINDINGS"):
             stmt = self._parse_typed_node_list("FINDINGS", ("StaticAnalysisFinding",), allow_type=False)
         elif self.match_keyword("COMMUNITIES"):
@@ -134,6 +135,3 @@ class REQLParser(CommandParserMixin):
 
 def parse_reql(source: str) -> Statement:
     return REQLParser(source).parse()
-
-
-_SYMBOL_NODE_TYPES = ("Module", "CodeSymbol", "Function", "Class", "Method", "Import", "Comment", "Docstring")

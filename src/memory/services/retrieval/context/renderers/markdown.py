@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from pathlib import PurePosixPath
 from typing import Any, Sequence
 
 from .....domain.models import MemoryEdge, MemoryNode
@@ -146,6 +147,7 @@ class MarkdownContextRendererMixin:
         working_set = list(payload.get("working_set") or [])
         owner_candidates = list(payload.get("owner_candidates") or [])
         targeted_reads = list(payload.get("targeted_reads") or [])
+        read_plan = list(payload.get("read_plan") or [])
         tests: list[dict[str, Any]] = []
         seen_test_paths: set[str] = set()
         for item in list(payload.get("test_targets") or []):
@@ -195,11 +197,30 @@ class MarkdownContextRendererMixin:
                 symbol = item.get("name") or item.get("label")
                 if item.get("path") == path and symbol and symbol not in symbols:
                     symbols.append(str(symbol))
-            owner_note = f"; owners={', '.join(symbols[:4])}" if symbols else "; owners=none identified"
-            file_lines.append(f"- `{location}`{owner_note}")
+            owner_note = f"; owners={', '.join(self._source_symbol_name(symbol, path) for symbol in symbols[:4])}" if symbols else "; owners=none identified"
+            planned_read = next((item for item in read_plan if item.get("path") == path), None)
+            inspection = ""
+            if planned_read and planned_read.get("command") and (
+                payload.get("source_mode") != "verified" or not planned_read.get("snippet_embedded")
+            ):
+                # Human-facing reads use text. Structured read plans retain JSON.
+                inspection = f"; inspect=`{planned_read['command'].removesuffix(' --json')}`"
+            file_lines.append(f"- `{location}`{owner_note}{inspection}")
         if not file_lines:
             file_lines.append("- No source files matched this query.")
         self._append_section(lines, "Files", file_lines)
+
+        # Reuse the projection's bounded evidence instead of requiring another
+        # retrieval just to discover the base implementation or affected callers.
+        impact = payload.get("impact") or {}
+        boundary_items = list(impact.get("implementation_links") or []) + list(impact.get("callers") or [])
+        boundary_items.extend(item for item in impact.get("public_surface", []) if item.get("edge_id"))
+        boundary_lines = [f"- {self._render_change_chain_item(item)}" for item in boundary_items[:6]]
+        if len(boundary_items) > 6:
+            boundary_lines.append(f"- {len(boundary_items) - 6} more relation(s) in structured impact.")
+        boundary_lines.extend(f"- {note}" for note in list(impact.get("notes") or [])[:1])
+        if boundary_lines:
+            self._append_section(lines, "Change boundaries", boundary_lines)
 
         test_lines: list[str] = []
         for item in tests:
@@ -208,11 +229,15 @@ class MarkdownContextRendererMixin:
                 continue
             location = self._format_path_bracket_span(path, item.get("line_start"), item.get("line_end"))
             symbols = [str(symbol) for symbol in list(item.get("symbols") or []) if symbol]
-            owner_note = f"; owners={', '.join(symbols[:3])}" if symbols else ""
+            owner_note = f"; owners={', '.join(self._source_symbol_name(symbol, path) for symbol in symbols[:3])}" if symbols else ""
             test_lines.append(f"- `{location}`{owner_note}")
         if not test_lines:
-            test_lines.append("- No associated tests found in the graph.")
+            test_lines.append("- Tests included in Files above." if tests else "- No associated tests found in the graph.")
         self._append_section(lines, "Associated tests", test_lines)
+        if payload.get("source_mode") == "verified":
+            self._append_section(lines, "Current source", self._render_snippet_lines(payload.get("snippets") or [], limit=6))
+        else:
+            self._append_section(lines, "Source previews", self._render_snippet_lines(payload.get("snippets") or [], limit=3))
         return "\n".join(lines).strip()
 
     def _render_general_context_payload(self, payload: dict[str, Any]) -> str:
@@ -264,7 +289,7 @@ class MarkdownContextRendererMixin:
             read_lines.append(f"- {kind} `{location}` from `{item.get('node_id')}` [{item.get('type')}] {item.get('reason')}{status_text}")
         self._append_section(lines, "Targeted reads", read_lines)
         self._append_section(lines, "Change chain", self._render_change_chain_lines(payload.get("change_chain") or []))
-        self._append_section(lines, "Snippets", self._render_snippet_lines(payload.get("snippets") or [], limit=3))
+        self._append_section(lines, "Snippets", self._render_snippet_lines(payload.get("snippets") or [], limit=6 if payload.get("source_mode") else 3))
         self._append_section(lines, "Research queries", self._render_research_refs(payload))
         self._append_section(lines, "Summary", self._render_compact_counts(payload))
         return "\n".join(lines).strip()
@@ -280,17 +305,23 @@ class MarkdownContextRendererMixin:
         return lines
 
     def _render_change_chain_item(self, item: dict[str, Any]) -> str:
+        """Render existing source and relationship evidence without opaque duplicate ids."""
         if item.get("source_span"):
             return f"`{item.get('source_span')}` via `{item.get('node_id')}`; {item.get('reason') or 'graph match'}"
         if item.get("command"):
             return f"`{item.get('command')}`; {item.get('reason') or item.get('kind') or 'verify'}"
+        if item.get("source") and item.get("target"):
+            source, target = item["source"], item["target"]
+            return (f"{item.get('edge_type')}: `{self._source_symbol_name(source.get('label') or source.get('id'), source.get('path'))}` @ {source.get('location') or source.get('path') or 'unknown'}"
+                    f" -> `{self._source_symbol_name(target.get('label') or target.get('id'), target.get('path'))}` @ {target.get('location') or target.get('path') or 'unknown'}")
         if item.get("surface"):
             surface = item.get("surface") or {}
-            return f"{item.get('impact_kind', 'impact')} `{surface.get('id')}` {surface.get('label')} @ {surface.get('location') or surface.get('path') or 'unknown'}"
+            return f"{item.get('edge_type') or item.get('impact_kind', 'impact')}: `{self._source_symbol_name(surface.get('label') or surface.get('id'), surface.get('path'))}` @ {surface.get('location') or surface.get('path') or 'unknown'}"
         if item.get("caller"):
             caller = item.get("caller") or {}
             target = item.get("target") or {}
-            return f"{item.get('impact_kind', 'impact')} `{caller.get('id')}` -> `{target.get('id')}`; {item.get('reason') or item.get('edge_type') or 'caller'}"
+            return (f"{item.get('edge_type') or 'caller'}: `{self._source_symbol_name(caller.get('label') or caller.get('id'), caller.get('path'))}` @ {caller.get('location') or caller.get('path') or 'unknown'}"
+                    f" -> `{target.get('label') or target.get('id')}`")
         if item.get("impact_kind") == "docs":
             return f"docs `{item.get('location') or item.get('path')}`; {item.get('reason') or 'documentation mention'}"
         if item.get("impact_kind") == "note":
@@ -303,14 +334,46 @@ class MarkdownContextRendererMixin:
             return f"`{item.get('id') or item.get('node_id')}` {name} @ {location}{related_text}"
         return self._compact_text(str(item), max_chars=220)
 
+    @staticmethod
+    def _source_symbol_name(name: object, path: str | None) -> str:
+        """Omit only the exact file module prefix when its source path is displayed."""
+        name = str(name)
+        if not path:
+            return name
+        relative = PurePosixPath(path.replace("\\", "/"))
+        if not relative.name:
+            return name
+        module = relative.with_suffix("").as_posix().replace("/", ".")
+        if name == module:
+            return "(module)"
+        return name.removeprefix(module + ".")
+
     def _render_snippet_lines(self, snippets: Sequence[dict[str, Any]], *, limit: int) -> list[str]:
         snippet_lines: list[str] = []
         for item in list(snippets)[:limit]:
             location = self._format_path_bracket_span(item.get("path"), item.get("line_start"), item.get("line_end"))
-            snippet_lines.append(f"- `{location}` ({item.get('type')}; {item.get('source')})")
+            if "source_status" in item:
+                status = item["source_status"]
+                snippet_lines.append(f"- `{location}` ({status})")
+                if status == "verified":
+                    # Source capture already enforces a shared line and character budget.
+                    snippet_lines.append("")
+                    snippet_lines.extend(f"      {line}" for line in str(item.get("text") or "").splitlines())
+                    snippet_lines.append("")
+                    if item.get("truncated"):
+                        snippet_lines.append(f"  Truncated; read from line {item['next_line']} for the remaining span.")
+                else:
+                    snippet_lines.append(f"  {item.get('reason')}")
+                continue
+            origin = "unverified disk preview" if item.get("source") == "disk" else "indexed graph preview"
+            snippet_lines.append(f"- `{location}` ({item.get('type')}; {origin})")
             text = str(item.get("text") or "")
             if text:
-                snippet_lines.extend(f"  {line}" for line in text.splitlines()[:12])
+                # Preview production already bounds complete lines and characters.
+                snippet_lines.extend(f"  {line}" for line in text.splitlines())
+            if item.get("truncated"):
+                next_line = f"; next line {item['next_line']}" if item.get("next_line") else ""
+                snippet_lines.append(f"  Preview truncated{next_line}. Inspect `{item.get('node_id')}` for current source.")
         return snippet_lines
 
     @staticmethod

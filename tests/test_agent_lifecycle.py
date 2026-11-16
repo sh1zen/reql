@@ -95,25 +95,25 @@ class AgentLifecycleTests(unittest.TestCase):
         self.assertTrue(active.exists())
         self.assertFalse(completed.exists())
 
-    def test_init_reconciles_legacy_completed_stores_and_defers_busy_readers(self) -> None:
-        legacy = self.workspace("agent:legacy")
-        legacy.init("Legacy")
-        legacy.publish_note("Legacy shared context")
-        # Reproduce the old finish behavior: mark completed but leave the store.
-        legacy._register_agent(status="finished")
-        reader = MemoryGraph.open(legacy.paths.agent_storage, read_only=True)
+    def test_init_retries_completed_cleanup_and_defers_busy_readers(self) -> None:
+        completed = self.workspace("agent:completed")
+        completed.init("Completed")
+        completed.publish_note("Completed shared context")
+        # Reproduce cleanup interrupted after publishing completion.
+        completed._register_agent(status="finished")
+        reader = MemoryGraph.open(completed.paths.agent_storage, read_only=True)
         current = self.workspace("agent:current")
         try:
             result = current.init("Current")
-            self.assertEqual(result["retention"]["busy_agents"], [legacy.agent_id])
-            self.assertTrue(legacy.exists())
+            self.assertEqual(result["retention"]["busy_agents"], [completed.agent_id])
+            self.assertTrue(completed.exists())
         finally:
             reader.close()
         result = current.init("Current")
         self.assertEqual(result["retention"]["busy_agents"], [])
-        self.assertFalse(legacy.exists())
+        self.assertFalse(completed.exists())
         self.assertTrue(current.exists())
-        self.assertTrue(AgentWorkspace.search_dashboards(self.storage, "Legacy shared context")["results"])
+        self.assertTrue(AgentWorkspace.search_dashboards(self.storage, "Completed shared context")["results"])
 
     def test_finish_preserves_other_activity_using_same_private_store(self) -> None:
         self.config = merge_config(self.config, {"retention": {"agent_sessions": 0}})
@@ -145,11 +145,11 @@ class AgentLifecycleTests(unittest.TestCase):
         self.assertTrue(AgentWorkspace.search_dashboards(self.storage, "Agent terminated")["results"])
 
     def test_cleanup_does_not_follow_untrusted_registered_store_paths(self) -> None:
-        legacy = self.workspace("agent:legacy")
-        legacy.init("Legacy")
-        legacy._register_agent(status="finished")
+        completed = self.workspace("agent:completed")
+        completed.init("Completed")
+        completed._register_agent(status="finished")
         self.storage.write_bytes(b"canonical")
-        graph = MemoryGraph.open(legacy.paths.dashboard_storage)
+        graph = MemoryGraph.open(completed.paths.dashboard_storage)
         try:
             identity = next(node for node in graph.store.all_nodes() if node.type == "agent")
             properties = dict(identity.properties)
@@ -158,20 +158,20 @@ class AgentLifecycleTests(unittest.TestCase):
         finally:
             graph.close()
         result = self.workspace("agent:current").init("Current")
-        self.assertEqual(result["retention"]["skipped_agents"], [legacy.agent_id])
-        self.assertTrue(legacy.exists())
+        self.assertEqual(result["retention"]["skipped_agents"], [completed.agent_id])
+        self.assertTrue(completed.exists())
         self.assertEqual(self.storage.read_bytes(), b"canonical")
         with self.assertRaisesRegex(ValueError, "distinct paths"):
             AgentWorkspace(self.storage, agent_id="agent:unsafe", agent_storage=self.storage)
 
     def test_cleanup_preserves_store_aliased_by_an_active_identity(self) -> None:
-        legacy = self.workspace("agent:alias/worker")
-        legacy.init("Legacy")
-        legacy._register_agent(status="finished")
+        completed = self.workspace("agent:alias/worker")
+        completed.init("Completed")
+        completed._register_agent(status="finished")
         active = self.workspace("agent:alias_worker")
         result = active.init("Active alias")
-        self.assertEqual(legacy.paths.agent_storage, active.paths.agent_storage)
-        self.assertEqual(result["retention"]["skipped_agents"], [legacy.agent_id])
+        self.assertEqual(completed.paths.agent_storage, active.paths.agent_storage)
+        self.assertEqual(result["retention"]["skipped_agents"], [completed.agent_id])
         self.assertTrue(active.exists())
 
     def test_concurrent_lifecycles_leave_only_bounded_public_summaries(self) -> None:
@@ -235,6 +235,8 @@ class AgentLifecycleTests(unittest.TestCase):
         with redirect_stdout(output):
             self.assertEqual(_handle_project_overview(CommandContext(args, self.config, graph)), 0)
         self.assertEqual(graph.path, ".")
+        self.assertEqual(output.getvalue().count("Add isolation tests"), 1)
+        self.assertIn("see Active above", output.getvalue())
         for text in ("# Sample project", "Cache every query", "Stale results", "Mixed tenants",
                      "Parsing works", "Global cache", "Try direct parsing", "Add isolation tests",
                      "agent:cli", "agent:other"):

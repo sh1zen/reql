@@ -11,6 +11,7 @@ from collections import OrderedDict, defaultdict
 from contextlib import contextmanager, suppress
 from dataclasses import replace
 from datetime import datetime, timezone
+import errno
 import hashlib
 import heapq
 import mmap
@@ -53,6 +54,7 @@ DEFAULT_BLOCK_SIZE = 64 * 1024
 DEFAULT_PAGE_CACHE_BLOCKS = 128
 DEFAULT_DENSE_NODE_THRESHOLD = 1024
 DEFAULT_LOCK_TIMEOUT_SECONDS = 30.0
+DEFAULT_LOCK_RELEASE_TIMEOUT_SECONDS = 1.0
 DEFAULT_INCOMPLETE_LOCK_STALE_SECONDS = 30.0
 DEFAULT_AUTO_CHECKPOINT_WAL_BYTES = 8 * 1024 * 1024
 
@@ -296,9 +298,14 @@ def _lock_age_seconds(payload: dict[str, Any], lock_path: Path) -> float:
         return 0.0
 
 
-def _read_lock_payload(lock_path: Path) -> dict[str, Any]:
+def _read_lock_payload(lock_path: Path, *, missing_ok: bool = True) -> dict[str, Any]:
+    """Read lock metadata, preserving strict missing-file errors for lock owners."""
     try:
         raw = lock_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        if not missing_ok:
+            raise
+        return {}
     except OSError:
         return {}
     try:
@@ -306,6 +313,29 @@ def _read_lock_payload(lock_path: Path) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return payload if isinstance(payload, dict) else {}
+
+
+def _is_windows_lock_creation_contention(error: OSError, lock_path: Path) -> bool:
+    """Recognize the CRT's access-denied result for a delete-pending sidecar."""
+    return os.name == "nt" and error.errno == errno.EACCES and error.filename == str(lock_path)
+
+
+def _release_owned_lock(lock_path: Path, token: str) -> None:
+    """Release an owned sidecar despite brief Windows metadata-reader handles."""
+    deadline = time.monotonic() + DEFAULT_LOCK_RELEASE_TIMEOUT_SECONDS
+    while True:
+        try:
+            if _read_lock_payload(lock_path, missing_ok=False).get("token") != token:
+                return
+            lock_path.unlink()
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError as error:
+            if getattr(error, "winerror", None) != 32 or time.monotonic() >= deadline:
+                raise
+            # Recheck ownership after waiting; a replaced sidecar is not ours.
+            time.sleep(0.01)
 
 
 def _lock_process_alive(payload: dict[str, Any]) -> bool | None:
@@ -436,6 +466,9 @@ class _StoreLock:
                 time.sleep(0.05)
                 continue
             except OSError as exc:
+                if _is_windows_lock_creation_contention(exc, self.lock_path) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                    continue
                 raise StorageError(f"Cannot acquire REQL write lock for {self.target_path}: {exc}") from exc
             try:
                 os.write(fd, json.dumps(self._payload(), sort_keys=True).encode("utf-8"))
@@ -448,11 +481,7 @@ class _StoreLock:
         if not self.acquired:
             return
         try:
-            payload = self._read_payload()
-            if payload.get("token") == self.token:
-                self.lock_path.unlink()
-        except FileNotFoundError:
-            pass
+            _release_owned_lock(self.lock_path, self.token)
         finally:
             self.acquired = False
 
@@ -469,21 +498,12 @@ class _StoreLock:
             "watcher": "--watch" in command.split(),
         }
 
-    def _read_payload(self) -> dict[str, Any]:
-        try:
-            raw = self.lock_path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            raise
-        except OSError:
-            return {}
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
-            return {}
-        return payload if isinstance(payload, dict) else {}
-
     def _remove_stale_lock(self) -> bool:
-        payload = self._read_payload()
+        try:
+            payload = _read_lock_payload(self.lock_path, missing_ok=False)
+        except FileNotFoundError:
+            # The owner released after our existence check; retry acquisition.
+            return True
         if not _lock_is_stale(payload, self.lock_path):
             return False
         try:
@@ -495,7 +515,7 @@ class _StoreLock:
             return False
 
     def _locked_message(self) -> str:
-        diagnostic = _lock_diagnostic(self._read_payload(), self.lock_path, mode="write")
+        diagnostic = _lock_diagnostic(_read_lock_payload(self.lock_path), self.lock_path, mode="write")
         return _format_locked_message(self.target_path, diagnostic)
 
 
@@ -525,7 +545,7 @@ class _ReaderLock:
     def acquire(self, writer_lock: _StoreLock) -> None:
         deadline = time.monotonic() + self.timeout_seconds
         while True:
-            self._create_slot()
+            self._create_slot(deadline=deadline)
             if not writer_lock.lock_path.exists() or writer_lock._remove_stale_lock():
                 self.acquired = True
                 return
@@ -536,16 +556,13 @@ class _ReaderLock:
 
     def release(self) -> None:
         try:
-            payload = self._read_payload()
-            if payload.get("token") == self.token:
-                self.lock_path.unlink()
-        except FileNotFoundError:
-            pass
+            _release_owned_lock(self.lock_path, self.token)
         finally:
             self.acquired = False
             self._remove_empty_readers_dir()
 
-    def _create_slot(self) -> None:
+    def _create_slot(self, *, deadline: float) -> None:
+        """Publish a reader slot while peers may remove its empty directory."""
         while True:
             try:
                 self.readers_path.mkdir(parents=True, exist_ok=True)
@@ -555,6 +572,11 @@ class _ReaderLock:
                 self.token = uuid.uuid4().hex
                 self.lock_path = self.readers_path / f"{os.getpid()}-{self.token}.lock"
             except OSError as exc:
+                if (
+                    isinstance(exc, FileNotFoundError) or _is_windows_lock_creation_contention(exc, self.lock_path)
+                ) and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                    continue
                 raise StorageError(f"Cannot acquire REQL read lock for {self.target_path}: {exc}") from exc
         try:
             os.write(fd, json.dumps(self._payload(), sort_keys=True).encode("utf-8"))
@@ -573,19 +595,6 @@ class _ReaderLock:
             "command": command,
             "watcher": "--watch" in command.split(),
         }
-
-    def _read_payload(self) -> dict[str, Any]:
-        try:
-            raw = self.lock_path.read_text(encoding="utf-8")
-        except FileNotFoundError:
-            raise
-        except OSError:
-            return {}
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
-            return {}
-        return payload if isinstance(payload, dict) else {}
 
     def _remove_empty_readers_dir(self) -> None:
         with suppress(OSError):
@@ -637,9 +646,9 @@ class _StoreReadWriteLock:
             return []
         active: list[dict[str, Any]] = []
         for path in sorted(self.reader.readers_path.glob("*.lock")):
-            payload = self._read_payload(path)
+            payload = _read_lock_payload(path)
             payload["_lock_path"] = str(path)
-            if self._reader_is_stale(payload, path):
+            if _lock_is_stale(payload, path):
                 try:
                     path.unlink()
                 except FileNotFoundError:
@@ -651,20 +660,6 @@ class _StoreReadWriteLock:
         with suppress(OSError):
             self.reader.readers_path.rmdir()
         return active
-
-    def _read_payload(self, path: Path) -> dict[str, Any]:
-        try:
-            raw = path.read_text(encoding="utf-8")
-        except OSError:
-            return {}
-        try:
-            payload = json.loads(raw)
-        except json.JSONDecodeError:
-            return {}
-        return payload if isinstance(payload, dict) else {}
-
-    def _reader_is_stale(self, payload: dict[str, Any], path: Path) -> bool:
-        return _lock_is_stale(payload, path)
 
 
 def _process_is_alive(pid: int) -> bool:
@@ -1366,9 +1361,9 @@ class BlockGraphStore:
             raise StorageError(f"Invalid REQL manifest JSON for {self.path}") from exc
         self._validate_manifest(manifest, file_size)
         self._manifest = dict(manifest)
-        self._generation_id = int(manifest["generation_id"])
-        self._root_index_offset = int(manifest["root_index_offset"])
-        self._data_offset = int(manifest.get("data_offset", self.block_size))
+        self._generation_id = manifest["generation_id"]
+        self._root_index_offset = manifest["root_index_offset"]
+        self._data_offset = manifest["data_offset"]
         self._open_mmap()
         self._load_root_index()
 
@@ -1383,11 +1378,15 @@ class BlockGraphStore:
             "generation_id",
             "data_block_count",
             "checksum",
+            "checksum_algorithm",
             "record_codec",
         }
         missing = sorted(required.difference(manifest))
         if missing:
-            raise StorageError(f"REQL manifest missing fields for {self.path}: {', '.join(missing)}")
+            raise StorageError(
+                f"REQL manifest missing fields for {self.path}: {', '.join(missing)}. "
+                "Rebuild the storage with the current REQL version."
+            )
         if manifest["format"] != _FORMAT_NAME:
             raise StorageError(f"Invalid REQL format in manifest for {self.path}")
         manifest_version = self._manifest_int(manifest, "manifest_version")
@@ -1415,19 +1414,20 @@ class BlockGraphStore:
             raise StorageError(f"Invalid REQL block store size for {self.path}")
         if generation_id < 0:
             raise StorageError(f"Invalid REQL generation id for {self.path}")
-        if manifest.get("checksum_algorithm", "sha256") != "sha256":
+        if manifest["checksum_algorithm"] != "sha256":
             raise StorageError(f"Unsupported REQL checksum algorithm for {self.path}")
-        if manifest.get("record_codec") != "binary-v2":
+        if manifest["record_codec"] != "binary-v2":
             raise StorageError(f"Unsupported REQL record codec for {self.path}")
         checksum = str(manifest["checksum"])
         if len(checksum) != 64 or any(ch not in "0123456789abcdef" for ch in checksum):
             raise StorageError(f"Invalid REQL data checksum for {self.path}")
 
     def _manifest_int(self, manifest: dict[str, Any], field: str) -> int:
-        try:
-            return int(manifest[field])
-        except (TypeError, ValueError) as exc:
-            raise StorageError(f"Invalid REQL manifest field {field} for {self.path}") from exc
+        """Require the integer representation emitted by the current manifest writer."""
+        value = manifest[field]
+        if type(value) is not int:
+            raise StorageError(f"Invalid REQL manifest field {field} for {self.path}; expected an integer")
+        return value
 
     def _validate_data_checksum(self, data_offset: int, expected: str) -> None:
         digest = hashlib.sha256()
@@ -2165,10 +2165,12 @@ class BlockGraphStore:
         }
 
     def _apply_root_index(self, value: dict[str, Any]) -> None:
-        try:
-            self._loaded_lexical_schema_version = int(value.get("lexical_schema_version", 1) or 1)
-        except (TypeError, ValueError):
-            self._loaded_lexical_schema_version = 1
+        lexical_version = value.get("lexical_schema_version")
+        if type(lexical_version) is not int or lexical_version != LEXICAL_INDEX_SCHEMA_VERSION:
+            raise StorageError(
+                f"Unsupported REQL lexical index schema version {lexical_version!r} for {self.path}; "
+                f"expected {LEXICAL_INDEX_SCHEMA_VERSION}. Rebuild the storage with the current REQL version."
+            )
         version = int(value.get("version", 0) or 0)
         if version != CURRENT_ROOT_INDEX_VERSION:
             raise StorageError(
@@ -2221,12 +2223,21 @@ class BlockGraphStore:
                 raise StorageError(f"REQL lexical index record was not found for {self.path}")
             raw_terms = dict(record.get("value", {})).get("node_terms", {})
         node_terms: dict[str, dict[str, float]] = defaultdict(dict)
+        node_term_index: dict[str, set[str]] = defaultdict(set)
         if isinstance(raw_terms, dict):
             for term, postings in raw_terms.items():
                 if isinstance(postings, dict):
-                    node_terms[str(term)] = {str(node_id): float(weight) for node_id, weight in postings.items()}
-        self._node_terms = defaultdict(dict, node_terms)
-        self._node_term_index = self._build_node_term_index()
+                    term_key = str(term)
+                    weights: dict[str, float] = {}
+                    for node_id, weight in postings.items():
+                        node_key = str(node_id)
+                        weights[node_key] = float(weight)
+                        node_term_index[node_key].add(term_key)
+                    node_terms[term_key] = weights
+        # Publish both directions only after conversion succeeds, then reconcile
+        # the existing deferred overlay against that same consistent snapshot.
+        self._node_terms = node_terms
+        self._node_term_index = dict(node_term_index)
         self._lexical_index_loaded = True
         for old, new in self._deferred_lexical_changes.values():
             if old is not None:
@@ -2234,23 +2245,6 @@ class BlockGraphStore:
             if new is not None:
                 self._reindex_node_terms(new)
         self._deferred_lexical_changes = {}
-        loaded_version = getattr(self, "_loaded_lexical_schema_version", LEXICAL_INDEX_SCHEMA_VERSION)
-        if loaded_version < LEXICAL_INDEX_SCHEMA_VERSION:
-            # Rebuild old head-only postings from all records, including cold nodes.
-            self._materialize_all_records()
-            self._rebuild_lexical_index()
-            self._loaded_lexical_schema_version = LEXICAL_INDEX_SCHEMA_VERSION
-            if not self.read_only:
-                self._dirty = True
-
-    def _rebuild_lexical_index(self) -> None:
-        self._node_terms = defaultdict(dict)
-        self._node_term_index = {}
-        self._node_lexical_fingerprints = {}
-        self._deferred_lexical_changes = {}
-        self._lexical_index_loaded = True
-        for node in self._nodes.values():
-            self._reindex_node_terms(node)
 
     def _rebuild_indexes(self) -> None:
         self._node_key_index = {}
@@ -2269,13 +2263,6 @@ class BlockGraphStore:
             self._index_node(node)
         for edge in self._edges.values():
             self._index_edge(edge)
-
-    def _build_node_term_index(self) -> dict[str, set[str]]:
-        node_term_index: dict[str, set[str]] = defaultdict(set)
-        for term, postings in self._node_terms.items():
-            for node_id in postings:
-                node_term_index[node_id].add(term)
-        return dict(node_term_index)
 
     def _replace_node(self, node: MemoryNode) -> None:
         self._journal_node_before_change(node.id)
@@ -3141,6 +3128,10 @@ class BlockGraphStore:
             and self._project_matches(edge.properties, project_id, include_global_project)
         )
 
+    def edge_type_counts(self) -> dict[str, int]:
+        """Expose structural edge types without loading graph records or lexical postings."""
+        return {edge_type: len(ids) for (edge_type,), ids in sorted(self._edge_type_index.items()) if ids}
+
     def node_type_counts(
         self,
         *,
@@ -3177,7 +3168,9 @@ class BlockGraphStore:
         ignored_edge_types: set[str] | None = None,
         project_id: str | None = None,
         include_global_project: bool = True,
+        clone: bool = True,
     ) -> list[tuple[MemoryNode, int, float]]:
+        """Rank stored nodes and copy only the returned rows at the public boundary."""
         if limit is not None and limit <= 0:
             return []
         rows: list[tuple[MemoryNode, int, float]] = []
@@ -3205,9 +3198,10 @@ class BlockGraphStore:
                     continue
                 degree += 1
                 weighted += edge.weight * edge.confidence
-            rows.append((self._clone_node(node), degree, weighted))
+            rows.append((node, degree, weighted))
         rows.sort(key=lambda item: (item[1], item[2], item[0].salience, item[0].updated_at), reverse=True)
-        return rows if limit is None else rows[:limit]
+        selected = rows if limit is None else rows[:limit]
+        return [(self._clone_node(node) if clone else node, degree, weighted) for node, degree, weighted in selected]
 
     @staticmethod
     def _project_matches(properties: dict[str, Any], project_id: str | None, include_global_project: bool) -> bool:

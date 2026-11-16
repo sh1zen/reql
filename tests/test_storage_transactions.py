@@ -1,4 +1,4 @@
-"""Exercise the canonical block store's loading, migration, and journal paths."""
+"""Exercise the canonical block store's loading, format validation, and journals."""
 from __future__ import annotations
 
 import random
@@ -11,13 +11,14 @@ from unittest.mock import patch
 
 from memory.storage import BlockGraphStore
 from memory.storage.adapters.block_store import BlockGraphStore as AdapterStore
-from memory.storage.adapters.lexical_block_store import BlockGraphStore as LexicalStore
-from memory.storage.block_store import BlockGraphStore as ModuleStore
+from memory.storage.adapters import BlockGraphStore as AdapterExport
+from memory.storage.adapters.lexical_index import LEXICAL_INDEX_SCHEMA_VERSION
+from memory.domain.exceptions import StorageError
 from reql import BlockGraphStore as PublicStore, MemoryEdge, MemoryNode
 
 
 class StorageTransactionTests(unittest.TestCase):
-    """Protect persisted reads and rollback while obsolete storage paths are removed."""
+    """Protect persisted reads, rollback and checkpoint validation."""
 
     def setUp(self) -> None:
         self.directory = TemporaryDirectory()
@@ -33,8 +34,39 @@ class StorageTransactionTests(unittest.TestCase):
         return store
 
     def test_supported_imports_share_the_canonical_store(self) -> None:
-        for imported in (AdapterStore, LexicalStore, ModuleStore, PublicStore):
+        for imported in (AdapterStore, AdapterExport, PublicStore):
             self.assertIs(imported, BlockGraphStore)
+
+    def test_manifest_requires_explicit_algorithm_and_integer_metadata(self) -> None:
+        """Current checkpoints reject omitted fields and coercible scalar metadata."""
+        for field, convert in (("checksum_algorithm", None), ("data_offset", str),
+                               ("generation_id", bool), ("data_block_count", float)):
+            self.path = Path(self.directory.name) / f"invalid-{field}.reql"
+            store = self.open_store()
+            store.upsert_node(MemoryNode(id="owner", type="Function", text="persistedtoken"))
+            build_manifest = store._build_manifest
+
+            def invalid_manifest(**fields: Any) -> dict[str, Any]:
+                """Write malformed metadata through the real checkpoint encoder."""
+                manifest = build_manifest(**fields)
+                if convert is None:
+                    del manifest[field]
+                else:
+                    manifest[field] = convert(manifest[field])
+                return manifest
+
+            with patch.object(store, "_build_manifest", side_effect=invalid_manifest):
+                store.checkpoint_if_needed(wal_bytes_threshold=0)
+            store.close()
+            checkpoint = self.path.read_bytes()
+            for read_only in (False, True):
+                with self.subTest(field=field, read_only=read_only):
+                    with self.assertRaisesRegex(StorageError, f"manifest.*{field}"):
+                        reopened = self.open_store(read_only=read_only)
+                        reopened.close()
+                    self.assertEqual(self.path.read_bytes(), checkpoint)
+                    self.assertFalse(self.path.with_name(self.path.name + ".wal").exists())
+                    self.assertFalse(self.path.with_name(self.path.name + ".lock").exists())
 
     def test_nested_journal_rollback_restores_records_indexes_and_deferred_terms(self) -> None:
         store = self.open_store()
@@ -101,46 +133,33 @@ class StorageTransactionTests(unittest.TestCase):
         self.assertEqual([node.id for node, _ in reader.lexical_search("replayedtail")], ["tail"])
         self.assertEqual(reader.lexical_search("persistedtail"), [])
 
-    def test_old_postings_migrate_on_normal_open_without_read_only_writes(self) -> None:
-        store = self.open_store()
-        store.upsert_node(MemoryNode(id="long", type="SourceFragment",
-                                     text="headonly " * 1000 + "tailmigrationtoken"))
-        store.upsert_node(MemoryNode(id="other", type="Function", text="othermigrationtoken"))
-        # Build a version-one checkpoint fixture at the persistence boundary.
-        # Opening, deferred loading, and migration then use the unmodified store.
-        store._node_terms.clear()
-        store._node_terms["headonly"]["long"] = 1.0
-        store._node_term_index = {"long": {"headonly"}}
-        build_root = store._build_root_index
+    def test_unsupported_postings_are_rejected_without_rewriting_or_leaking_locks(self) -> None:
+        """Every open mode rejects malformed and future lexical metadata."""
+        for index, version in enumerate((LEXICAL_INDEX_SCHEMA_VERSION + 1, "2", True)):
+            self.path = Path(self.directory.name) / f"unsupported-{index}.reql"
+            store = self.open_store()
+            store.upsert_node(MemoryNode(id="owner", type="Function", text="persistedtoken"))
+            build_root = store._build_root_index
 
-        def old_root(*, locations: dict[str, dict[str, dict[str, int]]],
-                     space_map: dict[str, Any], generation_id: int) -> dict[str, Any]:
-            """Encode the root metadata used by old head-only checkpoints."""
-            root = build_root(locations=locations, space_map=space_map, generation_id=generation_id)
-            root.pop("lexical_schema_version")
-            return root
+            def unsupported_root(*, locations: dict[str, dict[str, dict[str, int]]],
+                                 space_map: dict[str, Any], generation_id: int) -> dict[str, Any]:
+                """Encode unsupported metadata at the checkpoint persistence boundary."""
+                root = build_root(locations=locations, space_map=space_map, generation_id=generation_id)
+                root["lexical_schema_version"] = version
+                return root
 
-        with patch.object(store, "_build_root_index", side_effect=old_root):
-            store.checkpoint_if_needed(wal_bytes_threshold=0)
-        store.close()
-        checkpoint = self.path.read_bytes()
-        wal_path = self.path.with_name(self.path.name + ".wal")
-        self.assertFalse(wal_path.exists())
-
-        for deferred in (False, True):
-            reader = self.open_store(read_only=True, defer_lexical_index=deferred)
-            self.assertEqual([node.id for node, _ in reader.lexical_search("tailmigrationtoken")], ["long"])
-            self.assertEqual([node.id for node, _ in reader.lexical_search("othermigrationtoken")], ["other"])
-            reader.close()
-            self.assertEqual(self.path.read_bytes(), checkpoint)
-            self.assertFalse(wal_path.exists())
-
-        writer = self.open_store(defer_lexical_index=True)
-        self.assertEqual([node.id for node, _ in writer.lexical_search("tailmigrationtoken")], ["long"])
-        writer.checkpoint_if_needed(wal_bytes_threshold=0)
-        writer.close()
-        reader = self.open_store(read_only=True)
-        self.assertEqual(reader._root_index["lexical_schema_version"], 2)
+            with patch.object(store, "_build_root_index", side_effect=unsupported_root):
+                store.checkpoint_if_needed(wal_bytes_threshold=0)
+            store.close()
+            checkpoint = self.path.read_bytes()
+            for read_only in (False, True):
+                for deferred in (False, True):
+                    with self.subTest(version=version, read_only=read_only, deferred=deferred):
+                        with self.assertRaisesRegex(StorageError, "Unsupported REQL lexical index.*Rebuild"):
+                            self.open_store(read_only=read_only, defer_lexical_index=deferred)
+                        self.assertEqual(self.path.read_bytes(), checkpoint)
+                        self.assertFalse(self.path.with_name(self.path.name + ".wal").exists())
+                        self.assertFalse(self.path.with_name(self.path.name + ".lock").exists())
 
 
 if __name__ == "__main__":

@@ -16,27 +16,27 @@ fixed-size block files directly instead of using a database engine.
 - node records are packed near ordinary incident relationships to preserve
   graph-neighborhood locality;
 - relationships for dense nodes are written as dedicated dense-edge records so
-  a high-degree node does not make its node page expensive to load;
-- schema version 2 persists operational indexes in the root index and lazily
-  loads node/edge records by location.
+  a high-degree node does not make its node page expensive to load.
 
 The superblock is the durable entry point for validation and recovery. It
 records the storage format, manifest version, schema version,
 block size, root index offset, data block count, generation id, and a SHA-256
 checksum for the data region. Opening a manifested file validates the manifest
 checksum first, then validates the data checksum before replaying block records.
+The manifest requires an explicit `checksum_algorithm: "sha256"`. Version,
+size, offset, block-count and generation fields must be JSON integers; strings,
+booleans and floating-point values are rejected. Incomplete manifests require
+a rebuild with the current REQL version. Storage opens require store schema
+2, root-index version 3, lexical schema 2 and the `binary-v2` record codec.
+Writable, read-only and deferred opens use the same format validation; errors
+leave the checkpoint untouched.
 
 For the current format, `data_offset` points to the first data block after the
 superblock and `root_index_offset` points to the persisted root-index record
 inside the data region.
 
-New checkpoints use the `binary-v2` record codec. Fixed node and edge fields are
-encoded as typed binary values; dynamic `properties` and administrative records
-remain deterministic JSON payloads inside the binary frame. Payloads are
-compressed only when they are large enough and compression reduces size, which
-avoids paying zlib CPU for small records. If an encoded logical record is still
-larger than one block after compression, the checkpoint writes it as consecutive
-record-part frames and reconstructs the original record when the store opens.
+Record encoding, compression and multi-block records are described under
+[Compression and dynamic records](#compression-and-dynamic-records).
 
 Writable sessions append canonical graph changes to a sidecar WAL,
 `<store>.wal`, after the initial checkpoint exists. Opening a store validates
@@ -60,7 +60,8 @@ Each checkpoint also stores a `root_index` record. It captures record locations,
 canonical node keys, edge patterns, incoming/outgoing adjacency, type/status
 buckets, selected property indexes, counters, and a block space map. Lexical
 postings live in a separate `lexical_index` record referenced by root-index
-version 3. Query sessions load both records; compilation sessions defer the
+version 3. Read-only CLI/MCP sessions load the lexical record on first search;
+metadata reads need only structural indexes. Compilation sessions defer the
 lexical record and append changed nodes to the WAL, so a small graph delta does
 not pay the full lexical-index startup cost. This also applies to a newly created
 store. Repeated updates to the same node are coalesced before the first query or
@@ -69,9 +70,15 @@ old/new lexical overlay: an in-process query applies it before searching, rollba
 restores it transactionally, and an automatic checkpoint loads and folds it into
 the persisted postings once the WAL threshold is reached. Deferral therefore
 does not create stale same-process queries or an indefinitely growing WAL.
-Storage opens require schema version 2 and root-index version 3. A version
-mismatch raises `StorageError`; rebuild the project graph with the current REQL
-version.
+
+Loading the split lexical record builds both term-to-node and node-to-term indexes
+together. Neither direction is published after a conversion failure; pending edits
+remain available for retry.
+
+`top_nodes_by_degree` preserves defensive copies by default and copies only the
+selected rows after ranking. Internal read-only projections may pass
+`clone=False`, matching other borrowed store reads; borrowed nodes must not be
+mutated or returned as public mutable state.
 
 The adapter keeps operational indexes available for deterministic graph access:
 
@@ -90,11 +97,14 @@ common REQL query paths bounded without relying on SQL or a graph database
 service.
 
 The block adapter owns one lexical-index implementation, using stateless term
-selection helpers in `memory.storage.adapters.lexical_index`. The former
-`memory.storage.adapters.lexical_block_store` path remains an import alias.
-Checkpoints record lexical schema version 2; older head-only postings are rebuilt
-from all nodes on first lexical use, including in read-only or deferred sessions.
-Read-only migration does not rewrite the checkpoint.
+selection helpers in `memory.storage.adapters.lexical_index`. Import the store
+from `memory.storage`, `memory.storage.adapters`, or the public `reql` package.
+See [clean rebuilds](#inspection-compaction-and-clean-rebuilds) for explicit
+project storage maintenance.
+
+Indexing and retrieval share immutable short-text analysis. Its process-local
+cache retains at most 1,024 strings of up to 2,048 characters; larger text uses
+the same uncached algorithm. Public token lists remain independent of cached values.
 
 Lexical postings include bounded identifier components (camelCase, snake_case,
 hyphenated names, and paths) plus conservative singular variants. Bounded
@@ -117,13 +127,13 @@ indexes.
 
 ## Compression And Dynamic Records
 
-Records are dynamic in size: a small node or edge occupies a small compressed
-frame, while larger property payloads take more space without forcing a fixed
-record width. Each frame is compressed before being packed into a block, which
-keeps more graph records in each page and improves page-cache density.
-
-The default block size intentionally matches common filesystem and cache use
-better than many tiny files while remaining simple to inspect and rewrite.
+Fixed node and edge fields are
+encoded as typed binary values; dynamic `properties` and administrative records
+remain deterministic JSON payloads inside the binary frame. Payloads are
+compressed only when they are large enough and compression reduces size, which
+avoids paying zlib CPU for small records. If an encoded logical record is still
+larger than one block after compression, the checkpoint writes it as consecutive
+record-part frames and reconstructs the original record when the store opens.
 
 ## Inspection, Compaction, And Clean Rebuilds
 
@@ -144,6 +154,9 @@ compaction. It does not itself delete archived graph records. Successful
 compilation operations that create a changed-manifest `ProjectRevision`
 enforce the graph-level `retention.commits` policy and invoke compaction only
 when they actually remove graph records.
+History selection applies limits after ordering by committed revision sequence
+or delta creation time. Retention boundaries use committed history timestamps;
+later activation, usage, or analysis updates cannot change the retained revisions.
 
 Use `reql storage clear` when archived records, compilation history, and
 other state that no longer belongs to the current project tree must be removed.
@@ -156,25 +169,14 @@ usage journal.
 
 ## Agent Memory Isolation
 
-Private agent files and the shared agent dashboard use the block adapter as a storage
-implementation, but they are not project graph replicas. Agent stores contain
-only operational records. They contain no project, file, symbol,
-source-fragment, or canonical relationship records, and initialization does
-not open the canonical store.
+Private stores under `.reql/agents/` and the shared `agent-dashboard.reql` use
+the block adapter but contain operational records rather than project graph
+replicas. Agent initialization and shared-work retrieval do not open the
+canonical graph. Lifecycle cleanup locks private stores and defers busy stores;
+the last active session releases shared private scratch.
 
-Durable `work_record` nodes live in the shared dashboard and survive agent/session
-retention. Relative evidence paths and relation ids are operational context, not
-canonical graph replicas. See [Engineering coordination](COORDINATION.md) for
-revision checks, migration and bounded work retention.
-
-Completed agents do not retain private scratch stores. `agent finish` saves a
-shared checkpoint and publishes a
-compact public dashboard finish message, closes the store, and removes its block file and sidecars.
-Agent init/finish/terminate reconcile known completed stores and retain public dashboard identities,
-messages, and finish messages for the latest `retention.agent_sessions` completed
-sessions across the project; active sessions and unregistered files are not removed.
-The last activity to finish releases a shared private store. Cleanup holds the
-private store writer lock and defers busy stores until the next lifecycle command.
+See [Engineering coordination](COORDINATION.md) for checkpoint creation,
+session/public-message retention and independent shared-work retention.
 
 ## Reader/Writer Locking
 
@@ -193,6 +195,17 @@ processes:
 - a reader waits for or rejects an active writer according to the configured
   lock timeout;
 - stale same-host lock files from dead processes are removed automatically.
+
+Writer and reader-slot release retry Windows sharing violations for up to one
+second, allowing brief metadata-reader handles to close. Each retry rechecks the
+ownership token before deleting the sidecar. Other deletion errors and persistent
+sharing violations still propagate to the caller. If an owner releases between
+an acquisition check and its metadata read, the contender retries acquisition;
+timeout diagnostics also tolerate vanished sidecars.
+Windows may report access denied while a deleted sidecar is pending removal;
+exclusive creation retries that lock-file error within the acquisition timeout.
+Reader-slot creation likewise tolerates concurrent removal of an empty slot
+directory. Persistent access failures still report the original cause.
 
 Lock sidecars record the owning command, PID, host, creation time, and whether
 the command is a `--watch` process. Inspect them without opening the graph:
@@ -235,10 +248,17 @@ The adapter exposes `store.transaction()` through the `GraphStore` contract.
 - the outer commit appends pending WAL records once;
 - `storage compact` is the explicit full-checkpoint path.
 
-Project compilation uses this transaction boundary so a compilation run, graph
-updates, cache writes, and graph delta persistence commit atomically.
+Project graph updates, cache-entry nodes and run/delta persistence share this
+transaction boundary. The JSON artifact cache is separate: new successful
+entries persist after graph commit, while deletion handling invalidates existing
+entries during archival. Matching compiled provenance supports cache recovery;
+see [Incremental compilation](INCREMENTAL_COMPILATION.md#failure-behavior).
 
 ## Batch And Bounded Operations
+
+Bulk reads and neighbor traversal clone records by default. Internal stages
+may request borrowed views but must not mutate them or return them as public
+mutable state. Final bounded public results are copied.
 
 The port includes helpers for storage-efficient operations:
 
@@ -261,7 +281,3 @@ activation/retrieval operations bounded instead of loading the whole graph.
 Query, analysis, and reporting paths should prefer these APIs for pagination,
 counts, and ranked candidates; `all_nodes` and `all_edges` should be reserved
 for intentional full exports or explicit administrative scans.
-
-`all_nodes` and `all_edges` remain available for exports, tests, and
-administrative operations where a full graph load is intentional.
-

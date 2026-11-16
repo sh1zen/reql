@@ -1,151 +1,86 @@
 # REQL MCP Server
 
-The optional REQL MCP server lets Codex, Claude Desktop, and other MCP clients
-query REQL as a bounded context substrate. Clients ask for compact
-context, ranked nodes, REQL rows, project status, or hubs instead of
-placing the whole graph in a prompt.
+REQL exposes bounded repository context and shared engineering work through
+stdio or HTTP JSON-RPC. `mcp.tools` owns handlers and schemas; `mcp.server` owns
+the standard-library transports. The core system does not require MCP.
 
-The core memory system does not depend on MCP. Tool behavior is implemented in
-`mcp.tools` as pure Python handlers, and `mcp.server` provides dependency-free
-stdio and HTTP JSON-RPC transports built with the Python standard library.
+Successful tool content is compact JSON text. Formatting preserves field values,
+source whitespace and Unicode; clients decode it with a standard JSON parser.
+Shared retrieval behavior is documented in [CLI retrieval](CLI.md#retrieval-commands),
+and work semantics in [Engineering coordination](COORDINATION.md).
 
 ## Start the Server
+
+After installing REQL and its dependencies:
+
+```bash
+reql-mcp --read-only
+reql-mcp --config ./reql.conf --set scan.max_file_size_mb=2 --read-only
+```
 
 From a source checkout:
 
 ```bash
-PYTHONPATH=src python -m mcp.server
+PYTHONPATH=src python -m mcp.server --read-only
 ```
 
 On PowerShell:
 
 ```powershell
 $env:PYTHONPATH = "src"
-python -m mcp.server
-```
-
-After installation, the `reql-mcp` console script is also available:
-
-```bash
-reql-mcp
-```
-
-To expose only read-only tools:
-
-```bash
-reql-mcp --read-only
-```
-
-If the console script is not available in the active environment, run the same
-server through the installed package:
-
-```bash
 python -m mcp.server --read-only
 ```
 
-To start MCP tools with a project config and process-level overrides:
-
-```bash
-reql-mcp --config ./reql.conf --set project.id=agent-a --read-only
-```
-
-To share the MCP server with clients on the same machine over HTTP, bind a
-local address and provide an API key:
+HTTP requires a Bearer key. This example binds only the local machine:
 
 ```bash
 REQL_MCP_API_KEY="change-this-key" reql-mcp --transport http --host 127.0.0.1 --port 8765 --read-only
 ```
 
-To share it with other machines on a trusted LAN, bind `0.0.0.0`:
-
-```bash
-REQL_MCP_API_KEY="change-this-key" reql-mcp --transport http --host 0.0.0.0 --port 8765 --read-only
-```
-
-HTTP clients send JSON-RPC requests to `/mcp` and must include:
-
-```text
-Authorization: Bearer change-this-key
-```
-
-The health endpoint is available at `/health`.
+`--api-key-env NAME` selects another environment variable; `--api-key` supplies
+the key directly. Requests go to `/mcp`; `/health` is the health endpoint.
+Binding `0.0.0.0` exposes all interfaces; see [Security notes](#security-notes).
 
 ## Tools
 
-Read-only tools are intended to be callable without server-side approvals. They
-return bounded JSON payloads and never return the full graph.
+| Read tool | Result |
+| --- | --- |
+| `query_context` | Working set, owners, tests, impact and bounded source/read commands |
+| `query_explore` | Selected dependency views such as owners, callers and serialization paths |
+| `query_graph` | Seeds, expanded nodes/edges, source records and graph diagnostics |
+| `query_memories` | Ranked memory/source texts |
+| `inspect_node` | Node, location, source excerpt and bounded adjacent relations |
+| `reql_query` | REQL columns, bounded rows and diagnostics; rejects mutating analysis statements |
+| `reql_project_status` | Registered project and last-compilation status |
+| `reql_work_context` | Focused shared work without opening the canonical project graph |
+| `reql_work_overview` | Project direction, workstreams, execution and next steps |
 
-- `reql_work_context`: retrieves focused shared engineering records by query,
-  files, workstream or record id; `include_history` admits obsolete records and
-  includes bounded revision history for an explicit record id. It does not open
-  the canonical graph or select a private agent.
-- `reql_work_overview`: projects goals, direction, workstreams, completed/active
-  outcomes, blockers and next ready steps across sessions.
-- `query_graph`: retrieves a structured agent context with seed nodes,
-  expanded graph nodes, edges, textual sources, filtered generic nodes, and a
-  compact rendered context block.
-- `query_context`: retrieves compact structured working-set context with owner
-  targets, targeted reads, bounded `read_plan` entries, snippets,
-  graph-derived `change_chain` steps, impact, tests, and structured next-step
-  commands for JSON clients. It returns the canonical `ContextResult` envelope;
-  projected context is nested under `payload`, with a bounded
-  `engineering_context` and independent work revision.
-- `query_explore`: retrieves dependency-oriented slices for coding agents:
-  owners, callers, public surface, serialization paths, docs mentions, explicit
-  structural template duplicates, and code working-set records.
-- `query_memories`: retrieves a compact ranked list of relevant memory/source
-  texts for clients that do not need graph debugging details.
-- `inspect_node`: resolves a node id from `query_memories`, `query_graph`,
-  `retrieve`, or REQL rows to the node payload, normalized source/location
-  hints, adjacent edges, and immediate neighbors.
-- `reql_query`: executes REQL and returns `columns`, bounded `rows`, and
-  metadata. Mutating analysis statements such as `COMMUNITIES`, `HUBS`, and
-  similar write-backed graph analysis statements are rejected by this read-only
-  tool.
-- `reql_project_status`: returns registered project/cache status for a path.
+Write tools are available unless the server starts with `--read-only`:
 
-Write/update tools modify the block-backed graph. Configure your client to ask
-for approval before using them.
+| Write tool | Effect |
+| --- | --- |
+| `reql_compile_project` | Incrementally compiles a project |
+| `reql_watch_project` | Performs bounded filesystem monitoring and compilation |
+| `reql_hubs` | Calculates and persists hub scores |
+| `reql_work_record` | Writes a revision-checked shared record with explicit provenance |
 
-- `reql_compile_project`: scans and incrementally compiles a project path.
-- `reql_watch_project`: performs bounded watchdog monitoring and incrementally
-  compiles dirty project artifacts.
-- `reql_hubs`: analyzes graph hubs and persists hub scores before returning
-  scores and reasons.
+Read-only mode hides and rejects write tools. The client controls authorization;
+the server does not provide an interactive approval step.
 
-Default limits are intentionally conservative: `top_k` is capped at 50,
-`max_depth` at 5, structured context nodes at 200, structured context edges at
-400, context items at 50, memory text snippets at 2000 characters, and REQL
-output rows at 200.
+Every tool accepts `storage_path` and optional `config_path`/`config_overrides`.
+Configuration uses the same owner and precedence as the CLI; see
+[Configuration](CONFIGURATION.md#overrides). Project tools discover `reql.conf`
+from their project path upward when no explicit config is supplied.
+The server also honors `REQL_CONFIG`, `REQL_CONFIG_OVERRIDES`, `--config` and
+repeated `--set` overrides.
 
-Every MCP tool accepts optional `config_path` and `config_overrides` arguments.
-`config_path` selects a project `reql.conf`; `config_overrides` is an object using
-nested sections or dotted keys. The server process also honors `REQL_CONFIG`
-and `REQL_CONFIG_OVERRIDES`. Tools that receive a project `path` search for
-`reql.conf` from that path upward when no explicit config is supplied, then
-join it with the protected internal configuration.
-
-`reql_work_record` is a write tool hidden/rejected in read-only mode. It accepts
-`storage_path`, `kind`, `content`, `agent_id`, `session_id` and optional `fields`
-(key, record_id, expected_revision, status, rationale, files, workstream, parent,
-depends_on, contradicts, supersedes, summarizes, next_action, importance). Supply stable caller
-provenance. Reconcile existing ids with their observed revisions; record a
-checkpoint at a session boundary. Direct MCP writes do not create private scratch
-or manage a roster session; Agent Workspace/CLI finish supplies automatic session
-checkpoints. Both adapters use the same shared transactional owner. See
-[Engineering coordination](COORDINATION.md) for record and lifecycle semantics.
+Limits depend on the tool: `top_k` is capped at 50, `max_depth` at 5, graph nodes
+at 200, graph edges at 400, context items at 50, memory text at 2,000 characters
+per snippet and REQL rows at 200. Query-context defaults are `20/3/20` for
+`top_k`/`max_depth`/`max_items`. Inspect the tool schema for required arguments
+and command-specific limits.
 
 ## Codex `config.toml`
-
-Example after installing the package:
-
-```toml
-[mcp_servers.reql]
-command = "reql-mcp"
-args = []
-```
-
-Read-only only:
 
 ```toml
 [mcp_servers.reql]
@@ -153,20 +88,12 @@ command = "reql-mcp"
 args = ["--read-only"]
 ```
 
-Tool calls should pass the storage path explicitly:
-
-```json
-{
-  "storage_path": "/absolute/path/to/project/.reql/memory.reql",
-  "query": "project compile behavior",
-  "config_path": "/absolute/path/to/Reql/reql.conf"
-}
-```
+Run the server from an allowed workspace root and pass storage paths explicitly.
+Client-specific configuration controls the server's working directory and permissions.
 
 ## HTTP JSON-RPC
 
-The HTTP transport accepts the same JSON-RPC MCP messages as stdio. Example
-request:
+HTTP uses the same JSON-RPC messages as stdio:
 
 ```bash
 curl -s http://127.0.0.1:8765/mcp \
@@ -175,24 +102,14 @@ curl -s http://127.0.0.1:8765/mcp \
   -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
 ```
 
-You can pass the key directly with `--api-key`, or set the environment variable
-named by `--api-key-env`:
-
-```bash
-reql-mcp --transport http --host 127.0.0.1 --port 8765 --api-key "change-this-key"
-reql-mcp --transport http --host 127.0.0.1 --port 8765 --api-key-env MY_REQL_MCP_KEY
-```
-
 ## Claude Desktop
-
-Example after installation:
 
 ```json
 {
   "mcpServers": {
     "reql": {
       "command": "reql-mcp",
-      "args": []
+      "args": ["--read-only"]
     }
   }
 }
@@ -200,7 +117,8 @@ Example after installation:
 
 ## Workflow
 
-1. Compile the project after approval:
+Compile or refresh through `reql_compile_project` when write tools are enabled
+and the operation is authorized by the client:
 
 ```json
 {
@@ -208,108 +126,33 @@ Example after installation:
   "arguments": {
     "storage_path": ".reql/memory.reql",
     "path": ".",
-    "cache_enabled": true,
-    "config_overrides": {"scan.max_file_size_mb": 2}
+    "cache_enabled": true
   }
 }
 ```
 
-Use bounded watchdog monitoring when the client wants to refresh memory after
-file changes without starting an unbounded MCP tool call. For continuous
-monitoring, run the CLI `reql project compile --watch` from the workspace as
-monitor mode and do not call `reql_compile_project` repeatedly while that
-monitor is responsible for updates.
-
-```json
-{
-  "tool": "reql_watch_project",
-  "arguments": {
-    "storage_path": ".reql/memory.reql",
-    "path": ".",
-    "max_iterations": 1,
-    "config_path": "reql.conf"
-  }
-}
-```
-
-2. Ask for bounded context before a task:
+Then retrieve the working set:
 
 ```json
 {
   "tool": "query_context",
   "arguments": {
     "storage_path": ".reql/memory.reql",
-    "query": "how does incremental compilation handle deleted files?",
-    "top_k": 20,
-    "max_depth": 3,
-    "max_items": 20,
-    "config_path": "reql.conf"
+    "query": "incremental compilation deleted files",
+    "scopes": ["code"]
   }
 }
 ```
 
-Use `query_memories` instead when the agent only needs a compact list of
-relevant memory/source texts:
+`query_context` returns the shared `ContextResult` envelope. Use `include_source:
+true` with explicit code/test scopes for verified bodies, or follow returned
+`inspect_node` ids for missing source. Source limits, statuses and freshness are
+the [same across Python, CLI and MCP](CLI.md#retrieval-commands).
 
-```json
-{
-  "tool": "query_memories",
-  "arguments": {
-    "storage_path": ".reql/memory.reql",
-    "query": "how does incremental compilation handle deleted files?",
-    "top_k": 12,
-    "max_depth": 2,
-    "limit": 8,
-    "config_path": "reql.conf"
-  }
-}
-```
-
-Use `query_graph` instead when the agent needs seed nodes, edges, source
-records, filtered-node diagnostics, and a rendered graph context:
-
-When retrieval returns relevant code nodes, `query_context` is informative by
-default. Pass `"scopes": ["code"]`, or booleans such as `"code": true`,
-`"docs": true`, or `"test": true`, to limit results to code,
-documentation/imported documents, or tests. Pass `"mode": "cleanup"` to return
-only safe-remove cleanup candidates matching the query for dead-code or
-unused-symbol work. Set `"include_archived": true` when archived graph records
-must participate. MCP uses the same typed request, canonical `20/3/20` budget,
-confidence calculation, and deterministic `graph_revision` as Python and CLI;
-it never calls the retrieval engine directly.
-
-Use `query_explore` when an agent needs dependency slices before reading source
-files or editing. Pass `views` to reduce output to one or more of `owners`,
-`callers`, `public_surface`, `serialization_paths`, `docs_mentions`,
-`structural_duplicates`, and `code`;
-the `code` view includes usage guidance, snippets, and targeted reads:
-
-```json
-{
-  "tool": "query_explore",
-  "arguments": {
-    "storage_path": ".reql/memory.reql",
-    "query": "remove stale storage field",
-    "views": ["owners", "code"],
-    "config_path": "reql.conf"
-  }
-}
-```
-
-```json
-{
-  "tool": "query_graph",
-  "arguments": {
-    "storage_path": ".reql/memory.reql",
-    "query": "how does incremental compilation handle deleted files?",
-    "top_k": 12,
-    "max_depth": 2,
-    "config_path": "reql.conf"
-  }
-}
-```
-
-3. Drill into graph records with REQL:
+Request only missing `query_explore` views, such as `owners`, `callers`,
+`public_surface`, `serialization_paths`, `docs_mentions`, `structural_duplicates`
+or `code`. Use `query_graph` for graph diagnostics and `query_memories` for short
+ranked texts. Drill into selected graph records with REQL:
 
 ```json
 {
@@ -317,48 +160,35 @@ the `code` view includes usage guidance, snippets, and targeted reads:
   "arguments": {
     "storage_path": ".reql/memory.reql",
     "statement": "FRAGMENTS WHERE relative_path CONTAINS 'compiler' LIMIT 20",
-    "limit": 20,
-    "config_overrides": {"project": {"id": "default"}}
+    "limit": 20
   }
 }
 ```
 
-4. Modify code in the repository using normal editor or agent tooling.
+After source changes and checks, refresh once. For bounded monitoring,
+`reql_watch_project` accepts `max_iterations`; for continuous monitoring, use
+the CLI `project compile --watch`. Leave an active watcher responsible for refresh
+instead of sending repeated compile calls. See
+[watch operation](CLI.md#incremental-compilation).
 
-5. Refresh the project graph after approved source changes:
-
-```json
-{
-  "tool": "reql_compile_project",
-  "arguments": {
-    "storage_path": ".reql/memory.reql",
-    "path": "."
-  }
-}
-```
+Shared work tools use the same record owner as the CLI. `reql_work_record`
+requires `kind`, `content`, `agent_id` and `session_id` in addition to storage;
+updates carry `record_id` and `expected_revision`. MCP-only clients write
+explicit checkpoints at session boundaries. See
+[work records](COORDINATION.md#work-records).
 
 ## Security Notes
 
-The MCP server does not run shell commands and does not expose destructive file
-operations. It only opens local filesystem paths. `storage_path`, project
-`path`, and `config_path` are resolved before use and must stay under an allowed
-MCP root. By default the allowed root is the process current working directory;
-set `REQL_MCP_ALLOWED_ROOTS` to an `os.pathsep`-separated list of absolute roots
-when a server intentionally needs to expose another workspace or storage
-directory. Project tools scan or compile the supplied project path through the
-same dependency-light project compiler used by the CLI.
+`storage_path`, project `path` and `config_path` must resolve inside an allowed
+MCP root. The default root is the server's current working directory.
+`REQL_MCP_ALLOWED_ROOTS` accepts an `os.pathsep`-separated list of absolute roots
+for servers intentionally exposing more than one workspace or storage directory.
+The server provides no shell execution or arbitrary filesystem-operation tool.
 
-HTTP transport requires a Bearer API key. Binding `0.0.0.0` exposes the server
-on all network interfaces; use it only on trusted networks, prefer
-`--read-only` for shared contexts, and put the server behind TLS or a trusted
-reverse proxy before exposing it outside a private network.
+HTTP requires a Bearer key. Use trusted networks and TLS or a trusted reverse
+proxy before exposing it outside a private network. Prefer `--read-only` for
+shared contexts.
 
-Read tools return compact, JSON-serializable payloads. User-controlled strings
-are bounded, control characters are stripped, and chat-template delimiters are
-neutralized before MCP returns them to agent clients. Use `reql_query` with a
-specific REQL statement and `limit` when drilling into records. For graph export,
-use the CLI intentionally rather than an MCP tool.
-
-
-
-
+MCP bounds user-controlled strings, strips control characters and neutralizes
+chat-template delimiters before returning results. Use specific queries and
+limits; intentional full graph export belongs to the [CLI](CLI.md#inspection-and-export).

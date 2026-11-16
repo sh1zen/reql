@@ -73,6 +73,8 @@ class ClauseParserMixin:
 
     def _parse_positive_int(self, name: str) -> int:
         value = self.expect_value()
+        if isinstance(value, bool) or isinstance(value, float):
+            raise REQLSyntaxError(f"{name} must be an integer")
         try:
             parsed = int(value)
         except (TypeError, ValueError) as exc:

@@ -69,7 +69,11 @@ class DeltaRepository:
         return node
 
     def list_deltas(self, *, limit: int = 20) -> list[GraphDelta]:
-        nodes = self.store.find_nodes_by_property("kind", "compilation", type_="GraphDelta", limit=max(limit * 5, limit))
+        """Limit deltas by compilation chronology, independently of later metric updates."""
+        limit = max(0, limit)
+        if not limit:
+            return []
+        nodes = self.store.find_nodes_by_property("kind", "compilation", type_="GraphDelta", limit=None, clone=False)
         deltas = [_delta_from_node(node) for node in nodes if node.type == "GraphDelta"]
         deltas.sort(key=lambda item: item.created_at, reverse=True)
         return deltas[:limit]

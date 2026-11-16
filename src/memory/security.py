@@ -2,20 +2,10 @@
 from __future__ import annotations
 
 import html
-import ipaddress
 import os
 from pathlib import Path
-import socket
-from urllib.parse import urlparse
 
 MCP_ALLOWED_ROOTS_ENV = "REQL_MCP_ALLOWED_ROOTS"
-
-_METADATA_HOSTS = {
-    "169.254.169.254",
-    "169.254.170.2",
-    "metadata.google.internal",
-    "metadata",
-}
 
 
 class SecurityError(ValueError):
@@ -45,22 +35,6 @@ def sanitize_agent_text(value: object, *, max_chars: int = 2000) -> str:
     return text
 
 
-def validate_url(url: str, *, allow_loopback: bool = False) -> str:
-    """Validate an outbound HTTP(S) URL against SSRF-sensitive destinations."""
-
-    parsed = urlparse(str(url).strip())
-    if parsed.scheme not in {"http", "https"}:
-        raise SecurityError("URL scheme must be http or https")
-    if not parsed.hostname:
-        raise SecurityError("URL must include a host")
-    host = parsed.hostname.rstrip(".").casefold()
-    if host in _METADATA_HOSTS:
-        raise SecurityError("URL host is blocked")
-    for address in _resolve_host(host):
-        _validate_address(address, allow_loopback=allow_loopback)
-    return url
-
-
 def validate_mcp_path(path: str | Path, *, name: str, must_exist: bool = False) -> Path:
     """Resolve an MCP-supplied local path and require it to stay under allowed roots."""
 
@@ -80,48 +54,6 @@ def validate_mcp_path(path: str | Path, *, name: str, must_exist: bool = False) 
         allowed = ", ".join(str(root) for root in roots)
         raise SecurityError(f"{name} must be inside an allowed MCP root: {allowed}")
     return resolved
-
-
-def _resolve_host(host: str) -> list[ipaddress.IPv4Address | ipaddress.IPv6Address]:
-    try:
-        literal = ipaddress.ip_address(host)
-        return [literal]
-    except ValueError:
-        pass
-    if host in {"localhost", "localhost.localdomain"}:
-        return [ipaddress.ip_address("127.0.0.1"), ipaddress.ip_address("::1")]
-    try:
-        infos = socket.getaddrinfo(host, None, type=socket.SOCK_STREAM)
-    except OSError as exc:
-        raise SecurityError(f"URL host could not be resolved: {host}") from exc
-    addresses: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
-    for info in infos:
-        sockaddr = info[4]
-        if not sockaddr:
-            continue
-        try:
-            address = ipaddress.ip_address(str(sockaddr[0]))
-        except ValueError:
-            continue
-        if address not in addresses:
-            addresses.append(address)
-    if not addresses:
-        raise SecurityError(f"URL host did not resolve to an IP address: {host}")
-    return addresses
-
-
-def _validate_address(address: ipaddress.IPv4Address | ipaddress.IPv6Address, *, allow_loopback: bool) -> None:
-    if address.is_loopback and allow_loopback:
-        return
-    if (
-        address.is_private
-        or address.is_loopback
-        or address.is_link_local
-        or address.is_multicast
-        or address.is_reserved
-        or address.is_unspecified
-    ):
-        raise SecurityError(f"URL resolves to a blocked address: {address}")
 
 
 def _mcp_allowed_roots() -> list[Path]:

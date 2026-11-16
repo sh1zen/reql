@@ -35,7 +35,6 @@ from ..artifacts.fingerprint import (
 from ..artifacts.models import ArtifactCompilationResult, ScanResult, SourceArtifact
 from ..artifacts.options import (
     CompilationOptions,
-    RawCompilationOptions,
     normalize_compilation_options,
 )
 from ..artifacts.project import ProjectRegistry
@@ -116,7 +115,7 @@ class IncrementalCompilationService:
         compiler: ArtifactCompiler | None = None,
         parser_version: str = DEFAULT_PARSER_VERSION,
         chunking_version: str = DEFAULT_CHUNKING_VERSION,
-        compile_options: RawCompilationOptions = None,
+        compile_options: CompilationOptions | None = None,
         retention_commits: int = 20,
         profile_logger: PerformanceLogger | None = None,
     ) -> None:
@@ -145,7 +144,7 @@ class IncrementalCompilationService:
         exclude_patterns: list[str] | None = None,
         config_path: str | Path | None = None,
         cache_enabled: bool = True,
-        parsing_options: RawCompilationOptions = None,
+        parsing_options: CompilationOptions | None = None,
     ) -> CompileProjectResult:
         profile = self.profile_logger
         compile_start = profile.span("compile.total", path=Path(path).expanduser().resolve(strict=False)) if profile else nullcontext()
@@ -179,7 +178,7 @@ class IncrementalCompilationService:
         exclude_patterns: list[str] | None,
         config_path: str | Path | None,
         cache_enabled: bool,
-        parsing_options: RawCompilationOptions,
+        parsing_options: CompilationOptions | None,
     ) -> CompileProjectResult:
         profile = self.profile_logger
         root = Path(path).expanduser().resolve(strict=False)
@@ -199,6 +198,10 @@ class IncrementalCompilationService:
             scan = scanner.scan(root)
         if profile:
             profile.event("compile.scan.result", category="counter", artifacts=len(scan.artifacts), skipped=len(scan.skipped_files), errors=len(scan.errors))
+        if scan.errors:
+            # An incomplete scan cannot prove deletions or a complete revision.
+            details = "; ".join(f"{error.relative_path or error.path}: {error.message}" for error in scan.errors)
+            raise StorageError(f"Project scan failed; the previous graph and cache were preserved. {details}")
         with (profile.span("compile.plan", artifacts=len(scan.artifacts), cache_enabled=cache_enabled) if profile else nullcontext()):
             if cache_enabled:
                 dirty = cache.dirty_set(scan, entries=cache_entries)
@@ -209,8 +212,7 @@ class IncrementalCompilationService:
                 )
             recovered_artifact_ids = cache.recoverable_artifact_ids(scan, dirty.changed_artifact_ids, entries=cache_entries) if cache_enabled else set()
             dirty.changed_artifact_ids.difference_update(recovered_artifact_ids)
-            if cache_enabled:
-                dirty.deleted_artifact_ids.update(cache.deleted_project_artifact_ids(scan))
+            dirty.deleted_artifact_ids.update(cache.deleted_project_artifact_ids(scan))
         run = self.deltas.new_run(project_id=scan.project.id)
         run.files_seen = len(scan.artifacts)
         run.files_changed = len(dirty.changed_artifact_ids)
@@ -362,7 +364,7 @@ class IncrementalCompilationService:
             with (profile.span("compile.refresh_structural_links", changed=len(dirty.changed_artifact_ids)) if profile else nullcontext()):
                 aggregate.merge(refresh_project_structural_links(self.store, scan.project.id, profile_logger=profile))
 
-        if dirty.changed_artifact_ids and self._document_ingest_enabled(compiler):
+        if dirty.changed_artifact_ids and compiler.options.ingest_documents:
             link_artifact_ids = self._document_code_link_scope(dirty.changed_artifact_ids, artifacts_by_id, compiler)
             with (profile.span("compile.link_documents_to_code", changed=len(dirty.changed_artifact_ids), scoped=link_artifact_ids is not None) if profile else nullcontext()):
                 link_result = link_document_fragments_to_code(
@@ -397,7 +399,7 @@ class IncrementalCompilationService:
             aggregate.archived_nodes.add(artifact_id)
             aggregate.affected_node_ids.add(artifact_id)
             cache_entry = cache.get_entry(scan.project.id, artifact_id)
-            if cache_enabled and cache_entry is not None:
+            if cache_entry is not None:
                 cache.archive_entry(cache_entry.id)
 
         if dirty.changed_artifact_ids or dirty.deleted_artifact_ids:
@@ -735,10 +737,6 @@ class IncrementalCompilationService:
             if artifact.artifact_type in {"markdown", "text", "config", "data", "unknown"} and compiler.document_ingest_enabled(artifact)
         }
 
-    @staticmethod
-    def _document_ingest_enabled(compiler: ArtifactCompiler) -> bool:
-        return bool(getattr(compiler, "ingest_documents", True))
-
     def cache_status(
         self,
         path: str | Path,
@@ -749,7 +747,7 @@ class IncrementalCompilationService:
         exclude_patterns: list[str] | None = None,
         config_path: str | Path | None = None,
         cache_enabled: bool = True,
-        parsing_options: RawCompilationOptions = None,
+        parsing_options: CompilationOptions | None = None,
     ) -> dict[str, object]:
         root = Path(path).expanduser().resolve(strict=False)
         options = self.default_options if parsing_options is None else normalize_compilation_options(parsing_options)

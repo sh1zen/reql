@@ -4,11 +4,16 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections import Counter
+from collections.abc import Mapping
 from functools import lru_cache
+from itertools import pairwise
+from types import MappingProxyType
 
 _WORD_RE = re.compile(r"[\w\u00C0-\u017F][\w\u00C0-\u017F'\-]{1,}", re.UNICODE)
 _SENTENCE_RE = re.compile(r"(?<=[.!?])\s+|\n+")
 _CAMEL_BOUNDARY_RE = re.compile(r"(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+TOKEN_ANALYSIS_CACHE_SIZE = 1024
+TOKEN_ANALYSIS_MAX_CHARS = 2048
 
 
 def strip_accents(value: str) -> str:
@@ -68,8 +73,9 @@ def _token_signal_score_stripped(token: str) -> float:
 
 
 def tokenize(value: str, *, keep_stopwords: bool = False) -> list[str]:
+    """Return independent tokens while reusing bounded immutable text analysis."""
     tokens, _ = _tokenize_with_signal_scores(value, keep_stopwords=keep_stopwords)
-    return tokens
+    return list(tokens)
 
 
 @lru_cache(maxsize=8192)
@@ -129,8 +135,22 @@ def singular_source_variants(token: str) -> tuple[str, ...]:
     return tuple(candidate for candidate in candidates if singular_token(candidate) == token)
 
 
-def _tokenize_with_signal_scores(value: str, *, keep_stopwords: bool = False) -> tuple[list[str], dict[str, float]]:
+def _tokenize_with_signal_scores(value: str, *, keep_stopwords: bool = False) -> tuple[tuple[str, ...], Mapping[str, float]]:
+    """Share short-text analysis without retaining large source bodies in this cache."""
     canonical = canonicalize(value)
+    if len(canonical) > TOKEN_ANALYSIS_MAX_CHARS:
+        return _analyze_token_signals(canonical, keep_stopwords)
+    return _cached_token_signals(canonical, keep_stopwords)
+
+
+@lru_cache(maxsize=TOKEN_ANALYSIS_CACHE_SIZE)
+def _cached_token_signals(canonical: str, keep_stopwords: bool) -> tuple[tuple[str, ...], Mapping[str, float]]:
+    """Memoize immutable results keyed by the actual normalized text and token policy."""
+    return _analyze_token_signals(canonical, keep_stopwords)
+
+
+def _analyze_token_signals(canonical: str, keep_stopwords: bool) -> tuple[tuple[str, ...], Mapping[str, float]]:
+    """Calculate the same ordered tokens and signal weights for cached and large inputs."""
     tokens: list[str] = []
     signal_scores: dict[str, float] = {}
     for match in _WORD_RE.finditer(canonical):
@@ -146,7 +166,7 @@ def _tokenize_with_signal_scores(value: str, *, keep_stopwords: bool = False) ->
             signal_scores[token] = score
         if score > 0.0:
             tokens.append(token)
-    return tokens, signal_scores
+    return tuple(tokens), MappingProxyType(signal_scores)
 
 
 def split_sentences(value: str) -> list[str]:
@@ -168,7 +188,7 @@ def keyword_scores(value: str, *, max_terms: int = 12) -> list[tuple[str, float]
         return []
     counts = Counter(tokens)
     # Add compact bigrams when both sides have useful structural signal.
-    for a, b in zip(tokens, tokens[1:]):
+    for a, b in pairwise(tokens):
         if token_scores[a] >= 0.5 and token_scores[b] >= 0.5:
             counts[f"{a} {b}"] += 1.25
     max_count = max(counts.values()) or 1

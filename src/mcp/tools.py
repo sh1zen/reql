@@ -190,6 +190,7 @@ def query_context(
     max_depth: int = DEFAULT_CONTEXT_MAX_DEPTH,
     max_items: int = DEFAULT_CONTEXT_MAX_ITEMS,
     include_archived: bool = False,
+    include_source: bool = False,
     config_path: str | None = None,
     config_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -209,6 +210,7 @@ def query_context(
             max_depth=max_depth,
             max_items=max_items,
             include_archived=include_archived,
+            include_source=include_source,
         )
     except (TypeError, ValueError) as exc:
         raise MCPToolError(str(exc)) from exc
@@ -292,7 +294,7 @@ def inspect_node(
     config_path: str | None = None,
     config_overrides: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Resolve a node id to its node payload, local edges, and source locations."""
+    """Resolve a node to graph evidence and bounded current source when verifiable."""
     config = _load_tool_config(config_path, config_overrides)
     node_id = _required_text(node_id, "node_id")
     limit = _bounded_int(limit, "limit", minimum=1, maximum=MAX_ITEMS)
@@ -465,7 +467,11 @@ def reql_watch_project(
 
     observer = Observer()
     observer.schedule(
-        _WatchdogChangeHandler(changed, ignored_paths=(root / ".reql",), on_change=mark_stale),
+        _WatchdogChangeHandler(
+            changed, ignored_paths=(root / ".reql",), storage_path=storage,
+            diagnostics_path=config.diagnostics.path if config.diagnostics.enabled else None,
+            on_change=mark_stale,
+        ),
         str(root),
         recursive=True,
     )
@@ -612,7 +618,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "inspect_node",
-        "description": "Read-only: resolve a REQL node id to its node payload, adjacent edges, neighbors, and source/location hints.",
+        "description": "Read-only: resolve a REQL node id to graph evidence, source locations, and bounded current source when the indexed code/test file can be verified.",
         "inputSchema": {
             "type": "object",
             "required": ["storage_path", "node_id"],
@@ -627,7 +633,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "query_context",
-        "description": "Read-only: retrieve a compact deterministic context block from REQL.",
+        "description": "Read-only: source owners, tests, impact and scoped work. Reuse this context; inspect only missing source.",
         "inputSchema": {
             "type": "object",
             "required": ["storage_path", "query"],
@@ -641,6 +647,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
                     "uniqueItems": True,
                     "default": None,
                 },
+                "include_source": {"type": "boolean", "default": False, "description": "Embed bounded current source verified against the committed graph. Requires code or test scopes without docs."},
                 "code": {"type": "boolean", "default": False},
                 "docs": {"type": "boolean", "default": False},
                 "test": {"type": "boolean", "default": False},
@@ -670,7 +677,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "query_graph",
-        "description": "Read-only: retrieve a structured query-centered REQL subgraph with seed nodes, edges, sources, and compact agent context.",
+        "description": "Read-only: nodes, edges and sources for graph debugging. Prefer query_context for coding tasks.",
         "inputSchema": {
             "type": "object",
             "required": ["storage_path", "query"],
@@ -692,7 +699,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "query_explore",
-        "description": "Read-only: retrieve dependency-oriented REQL slices plus structural template duplicates for coding agents.",
+        "description": "Read-only: missing dependency/refactor evidence or template duplicates. Select views; reuse existing query_context impact.",
         "inputSchema": {
             "type": "object",
             "required": ["storage_path", "query"],
@@ -716,7 +723,7 @@ TOOL_SCHEMAS: list[dict[str, Any]] = [
     },
     {
         "name": "query_memories",
-        "description": "Read-only: return a compact ranked list of relevant REQL memory/source texts for clients that do not need graph debugging details.",
+        "description": "Read-only: short ranked memory/source texts without graph-debug fields.",
         "inputSchema": {
             "type": "object",
             "required": ["storage_path", "query"],
@@ -866,6 +873,7 @@ def _open_graph(storage_path: str, config: REQLConfig, *, read_only: bool = Fals
         Path(storage_path),
         config=config,
         read_only=read_only,
+        defer_lexical_index=read_only,
         lock_timeout_seconds=0.05 if read_only else None,
     )
     try:

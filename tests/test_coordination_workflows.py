@@ -136,6 +136,33 @@ class CoordinationWorkflowTests(unittest.TestCase):
         self.assertLessEqual(len(render_work_context(result, max_chars=1700)), 1700)
         self.assertEqual(self.work.context("nonexistent-component")["records"], [])
 
+    def test_assigned_task_context_excludes_sibling_fanout_but_keeps_causal_work(self) -> None:
+        """Shared parents/contracts must not consume the assigned worker's budget."""
+        agent = self.agent("scoped")
+        parent = agent.add_task("Integrate protocol")["node"]
+        contract = agent.add_decision("Keep envelope", rationale="Compatibility")["node"]
+        opposing = agent.add_decision("Change envelope", rationale="New consumer",
+                                     contradicts=[contract["id"]])["node"]
+        assigned = agent.add_task("Verify producer", parent=parent["id"],
+                                  depends_on=[contract["id"]])["node"]
+        sibling = agent.add_task("Unrelated consumer lane", parent=parent["id"],
+                                 depends_on=[contract["id"]])["node"]
+        child = agent.add_task("Producer edge case", parent=assigned["id"])["node"]
+        dependent = agent.add_task("Deploy producer", depends_on=[assigned["id"]])["node"]
+        result = self.work.context(record_id=assigned["id"], limit=8)
+        rows = {item["id"]: item for item in result["records"]}
+        self.assertEqual(set(rows), {item["id"] for item in
+                                    (parent, contract, opposing, assigned, child, dependent)})
+        self.assertNotIn(sibling["id"], rows)
+        self.assertEqual(rows[assigned["id"]]["execution_state"], "needs_review")
+        self.assertEqual(rows[assigned["id"]]["obsolete_dependencies"], [contract["id"]])
+        self.assertIn(opposing["id"], rows[contract["id"]]["conflicts"])
+        self.assertIn(contract["id"], render_work_context(result))
+        # A contract-focused impact query still includes all its direct consumers.
+        impact = self.work.context(record_id=contract["id"], limit=8)
+        self.assertTrue({assigned["id"], sibling["id"]}.issubset(
+            {item["id"] for item in impact["records"]}))
+
     def test_E_overview_derives_next_steps_from_current_execution(self) -> None:
         agent = self.agent("overview")
         goal = agent.record("goal", "Improve context retrieval")["node"]
@@ -236,28 +263,12 @@ class CoordinationWorkflowTests(unittest.TestCase):
         ids = {record["id"] for record in self.work.records()}
         self.assertTrue({item["id"], old["id"], active["id"]}.issubset(ids))
 
-    def test_legacy_private_work_migrates_without_publishing_scratch(self) -> None:
-        agent = self.agent("legacy")
-        graph = MemoryGraph.open(agent.paths.agent_storage)
-        try:
-            graph.add_node(MemoryNode(id="legacy-task", type="task", label="Legacy outcome", text="Legacy outcome",
-                                     status="active", properties={"content": "Legacy outcome", "session_id": "legacy"}))
-            graph.add_node(MemoryNode(id="legacy-failure", type="rejected_approach", text="Rejected cache",
-                                     properties={"content": "Rejected cache", "metadata": {"reason": "Stale snapshot"}}))
-        finally:
-            graph.close()
-        agent.add_note("Private scratch")
-        agent.init("Resume migration")
-        self.assertEqual(self.work.show("legacy-failure")["rationale"], "Stale snapshot")
-        self.assertEqual(self.work.show("legacy-task")["origin_agent_id"], agent.agent_id)
-        graph = MemoryGraph.open(agent.paths.agent_storage, read_only=True)
-        try:
-            self.assertIsNone(graph.get_node("legacy-task"))
-        finally:
-            graph.close()
-        agent.finish("Legacy work retained")
-        self.assertNotIn("Private scratch", json.dumps(self.work.records()))
-        self.assertEqual(self.work.show("legacy-task")["content"], "Legacy outcome")
+    def test_agent_nodes_use_canonical_work_kinds(self) -> None:
+        """Create shared observations and private notes through their current APIs."""
+        agent = self.agent("node-kinds")
+        observation = agent.add_node("observation", "Current discovery")["node"]
+        self.assertEqual(self.work.show(observation["id"])["kind"], "observation")
+        self.assertEqual(agent.add_note("Private scratch")["node"]["type"], "private_note")
 
     def test_compiled_code_context_and_mcp_share_scoped_engineering_evidence(self) -> None:
         agent = self.agent("integration")
@@ -314,7 +325,7 @@ class CoordinationWorkflowTests(unittest.TestCase):
                                          "fields": {"record_id": created["id"], "expected_revision": 1, "status": "done"}})
         self.assertFalse(self.storage.exists())
 
-    def test_compatibility_views_and_reset_preserve_shared_owner(self) -> None:
+    def test_dashboard_views_and_reset_preserve_shared_owner(self) -> None:
         agent = self.agent("views")
         task = agent.add_task("Retained outcome")["node"]
         failure = agent.reject_approach("Rejected idea", "Breaks callers")["node"]

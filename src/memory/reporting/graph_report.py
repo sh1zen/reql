@@ -22,8 +22,7 @@ class GraphReportBuilder:
 
     def _project_summary(self, lines: list[str], c: dict[str, Any]) -> None:
         artifacts = c["artifacts"]
-        active = sum(1 for node in artifacts if node.status == "active")
-        archived = sum(1 for node in artifacts if node.status == "archived")
+        statuses = Counter(node.status for node in artifacts)
         lines.extend(["## Project summary", ""])
         project = c["project"]
         lines.append(f"- Project id: `{c['project_id']}`")
@@ -31,8 +30,8 @@ class GraphReportBuilder:
         lines.append(f"- Name: {project.label if project else _name(c['root_path'])}")
         lines.append(f"- Status: {project.status if project else 'unregistered'}")
         lines.append(f"- Total artifacts: {len(artifacts)}")
-        lines.append(f"- Active artifacts: {active}")
-        lines.append(f"- Archived artifacts: {archived}")
+        lines.append(f"- Active artifacts: {statuses['active']}")
+        lines.append(f"- Archived artifacts: {statuses['archived']}")
         self._counter(lines, "Artifact types", _count_prop(artifacts, "artifact_type"))
         self._counter(lines, "Languages", _count_prop(artifacts, "language"))
 
@@ -58,7 +57,11 @@ class GraphReportBuilder:
         lines.extend(["", "## Cache summary", ""])
         entries = c["cache_entries"]
         status = c.get("scan_status") or {}
-        lines.append(f"- Cached artifacts: {status.get('cached_artifacts', sum(1 for n in entries if n.status == 'active'))}")
+        cached_artifacts = (
+            status["cached_artifacts"] if "cached_artifacts" in status
+            else sum(1 for n in entries if n.status == "active")
+        )
+        lines.append(f"- Cached artifacts: {cached_artifacts}")
         lines.append(f"- Dirty artifacts: {status.get('dirty_artifacts', 0)}")
         lines.append(f"- Skipped artifacts: {len(c.get('skipped_files') or [])}")
         self._counter(lines, "Parser versions", _count_prop(entries, "parser_version"))

@@ -26,16 +26,18 @@ reql project explain --focus "order refund" --json
 reql project overview
 ```
 
-`project overview` uses the current working directory and adds every registered
-agent's rejected approaches, completed tasks, and open tasks to the repository
-explanation. It reads the project graph and private Agent Workspace stores
-separately; `--json` returns both sections as structured data. The dashboard
-prints the exact command at the end.
+`project overview` combines a compact source-backed architecture with shared
+engineering work from `agent-dashboard.reql`, including direction, execution,
+blockers and ready next steps. The default view does not open private stores.
+`--details` expands the architecture and reads available private sessions for
+per-agent details; JSON also includes their retained notes. `--json` returns
+structured project and operational sections. See
+[retrieval and overview](COORDINATION.md#retrieval-and-overview).
 
 The Python facade exposes the same projection:
 
 ```python
-from api import MemoryGraph
+from reql import MemoryGraph
 
 graph = MemoryGraph.open(".reql/memory.reql", read_only=True)
 try:

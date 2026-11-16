@@ -88,6 +88,25 @@ class TreeSitterExtractorBase(ABC):
             parser_version=self.parser_version,
         )
 
+    def _record_call(self, node: Any, scope: list[CodeSymbol], *, function_field: str) -> None:
+        """Record a call and its read reference in source traversal order."""
+        target_node = _field(node, function_field)
+        target = _call_target(self.source, target_node)
+        if not target or target.split(".")[0] in {"if", "for", "while", "switch", "catch", "function", "return", "class", "import", "export"}:
+            return
+        caller = _call_owner(scope)
+        self.references.append(_reference(self.artifact, caller or _parent(self.module, scope), target, _line(target_node), _column(target_node), "read"))
+        self.calls.append(
+            CodeCall(
+                id=stable_id("call", self.artifact.id, caller or "", target, _line(node), _column(node)),
+                artifact_id=self.artifact.id,
+                caller=caller,
+                target=target,
+                line=_line(node),
+                column=_column(node),
+            )
+        )
+
     @abstractmethod
     def _walk_root(self, root: Any) -> None:
         """Populate parse collections from the Tree-sitter root node."""
@@ -106,18 +125,10 @@ def _extractor_for(
 
 @lru_cache(maxsize=64)
 def _parser_for(language: str) -> Any:
+    """Build a cached parser with the supported Tree-sitter constructor."""
     tree_sitter = import_module("tree_sitter")
     language_obj = load_tree_sitter_language(tree_sitter, language)
-    parser_cls = getattr(tree_sitter, "Parser")
-    try:
-        return parser_cls(language_obj)
-    except TypeError:
-        parser = parser_cls()
-        try:
-            parser.language = language_obj
-        except AttributeError:
-            parser.set_language(language_obj)
-        return parser
+    return tree_sitter.Parser(language_obj)
 
 
 def _language(artifact: SourceArtifact) -> str:

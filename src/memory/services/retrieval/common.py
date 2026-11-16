@@ -156,7 +156,7 @@ def _canonical_token_overlap(value: str, query_tokens: set[str]) -> set[str]:
         return set()
     value_tokens = {
         token
-        for raw_token in value.split()
+        for raw_token in set(value.split())
         if len(token := raw_token.strip("_-")) >= 2
     }
     overlap = value_tokens & query_tokens

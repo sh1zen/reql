@@ -248,6 +248,7 @@ class ProjectRegistry:
         return summary
 
     def project_status(self, path: str | Path) -> dict[str, Any] | None:
+        """Report registered artifacts and the latest compile health without scanning source."""
         root = normalize_path(path)
         project = self.store.get_node_by_key("Project", root)
         if project is None:
@@ -259,11 +260,28 @@ class ProjectRegistry:
             artifact_type = str(artifact.properties.get("artifact_type") or "unknown")
             counts_by_type[artifact_type] = counts_by_type.get(artifact_type, 0) + 1
             status_counts[artifact.status] = status_counts.get(artifact.status, 0) + 1
+        runs = self.store.find_nodes_by_property(
+            "project_id", project.id, type_="CompilationRun", limit=100000, clone=False,
+        )
+        latest = max(runs, key=lambda node: (str(node.properties.get("started_at") or ""), node.id), default=None)
+        last_compilation = None
+        if latest is not None:
+            properties = latest.properties
+            errors = properties.get("errors") or []
+            last_compilation = {
+                "id": latest.id,
+                "status": properties.get("status"),
+                "started_at": properties.get("started_at"),
+                "completed_at": properties.get("completed_at"),
+                "error_count": len(errors),
+                "errors": list(errors[:5]),
+            }
         return {
             "project": project.to_dict(),
             "artifacts": len(artifacts),
             "counts_by_type": counts_by_type,
             "status_counts": status_counts,
+            "last_compilation": last_compilation,
         }
 
     def _archive_missing(self, project: Project, seen_paths: set[str]) -> int:

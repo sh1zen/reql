@@ -1,243 +1,143 @@
 # Incremental Compilation
 
-Incremental compilation is project `compile` mode. It builds a deterministic
-technical graph for programming agents from compile-time scanning plus AST/static
-analysis.
+`project compile`, `MemoryGraph.update_project` and watch mode use the same
+`IncrementalCompilationService`. The scanner reads files without changing them,
+hashes their full contents, and verifies size and nanosecond modification time
+before and after each read. Unstable files are retried, then reported as scan
+errors. Hashing uses a direct path for zero/one file, two workers for small scans
+and at most eight workers for larger scans, bounded by available CPUs.
 
-The scanner first runs read-only. It hashes the full content of every candidate
-file and verifies that size and nanosecond modification time remain stable across
-each read. Zero- and one-file scans use a direct path; small repositories use two
-workers, while larger scans scale to at most eight workers. Unstable files are retried and then reported
-as scan errors rather than indexed from a mixed snapshot. The compiler compares fingerprints and
-project-local cache entries before graph writes, then registers only changed or
-deleted artifact deltas so unchanged project metadata is not rewritten.
-The primary cache lives on disk at `<project>/.reql/artifact-cache.json`.
-If a project was already compiled but its disk cache or `ArtifactCacheEntry`
-nodes are missing, `project compile` recovers cache entries from active compiled
-`SourceArtifact` records with matching path, SHA-256, and size instead of
-recompiling every file from zero.
-The optimization path preserves deterministic graph output: for the same input
-and options, the same relevant node types, edge types, properties, provenance,
-confidence values, cache records, and `GraphDelta` shape are emitted. Runtime
-improvements come from parallel content hashing, lower-cost storage transactions, batched upserts, cache
-planning maps, set-backed delta aggregation, scoped context-scope metadata
-refresh, scoped document-code linking, borrowed read-only node batches, and an
-indexed retention fast path that avoids materializing the graph while the
-project remains within its commit window.
-
-Document classification recognizes `readme.txt`, changelog and FAQ files,
-WordPress Plugin Directory readme structure, and extensionless files with
-Markdown headings, underlines, lists, or fenced blocks. WordPress headings such
-as `=== Plugin ===` and `== Description ==` are compiled as document sections,
-so their fragments participate in `query_context --docs`.
+The compiler registers changed structure and reconciles deletions rather than
+rewriting unchanged project/file metadata. Effective policy is one immutable
+`CompilationOptions` model; see [Configuration](CONFIGURATION.md#loader).
+Code and document parsing are described in [Code analysis](CODE_ANALYSIS.md)
+and [Artifact ingestion](ARTIFACT_INGESTION.md).
 
 ## Flow
 
 ```text
 project compile
-  -> scan project read-only and hash candidate content
-  -> open and validate the current graph storage
-  -> compare artifacts with .reql/artifact-cache.json entries
-  -> recover missing cache entries from already compiled SourceArtifact records
-  -> register Project, Directory, File, and SourceArtifact deltas for dirty files
-  -> refresh context-scope metadata for dirty files or records missing that metadata
-  -> compile changed supported code artifacts into technical graph nodes
-  -> compile changed text document fragments structurally
-  -> refresh project-wide CSS findings once after all changed artifacts
-  -> derive structural links from indexed graph views and persist only differences
-  -> link document fragments to code symbols
-  -> archive fragments for deleted artifacts
-  -> write .reql/artifact-cache.json and ArtifactCacheEntry graph records
-  -> write CompilationRun and GraphDelta nodes
+  -> open and validate graph storage
+  -> scan and hash project files
+  -> plan changed, deleted and recoverable artifacts
+  -> graph transaction:
+       register changed structure and compile artifacts
+       derive structural/document links and findings
+       archive deleted artifacts and invalidate their cache entries
+       persist CompilationRun and GraphDelta
+       record ProjectRevision when the run succeeds and its manifest changes
+  -> persist new successful disk-cache entries
+  -> prune eligible history after a new successful revision
+  -> checkpoint storage when needed
 ```
 
-The public `update_project()` API uses the same incremental compile pipeline as
-`project compile`; it does not maintain a separate update path.
+Each artifact compiles inside a nested graph transaction. An artifact exception
+rolls back its writes while other artifacts can still succeed. Project-wide
+structural/unused/orphan analysis runs only at the stages whose error guards
+allow it; a failed run does not publish a committed project revision.
 
-One-shot `project compile` commands always open and validate `memory.reql`, and
-always record their `CompilationRun` and `GraphDelta`, including clean runs. The
-disk cache is a compilation planner, not an integrity shortcut. The writable storage open defers
-the separate lexical-postings record and loads only the structural indexes used
-by compilation. Deferred lexical changes are retained as an in-memory overlay,
-applied before any lexical query, persisted through the WAL, and folded into a
-checkpoint when the WAL threshold is reached.
-During active editing, one watch process reuses the verified compile pipeline.
-Monitor mode opens storage for each compile batch and releases it while idle;
-see [Reader/writer locking](STORAGE.md#readerwriter-locking).
+Document-only changes relink their dirty fragments. A code change relinks
+document fragments against the updated project symbol set. CSS surface findings
+refresh once after changed/deleted artifacts have been processed.
 
-With the current format, updating one or a few files is bounded by the structural delta
-instead of the total number of lexical postings in the project graph.
-No graph node, edge, property, provenance field, or supported source/document
-format is omitted to obtain this bound; the optimization changes index maintenance,
-not the expressive model compiled from the project.
+New successful cache entries are written as one disk batch **after** the graph
+transaction commits. Deletion handling invalidates existing entries during
+archival. The graph and JSON cache are separate persistence boundaries; completed
+artifact provenance permits recovery when a cache entry is missing. Mismatched
+existing entries require recompilation.
+See [Storage transactions](STORAGE.md#transactions).
 
-The human-readable compile summary separates storage work from source changes.
-The `Nodes` and `Edges` counters retain the complete graph upsert totals, while
-`Changed symbols` lists only added, removed, or semantically modified symbols.
-Line-number shifts and equivalent symbols reprocessed with a changed file are
-therefore omitted from that list. The structured `summary.updated_symbols` field
-uses the same focused semantics for API compatibility.
+Every run that reaches transaction persistence records a `CompilationRun` and
+`GraphDelta`, including clean and artifact-failure runs. A scan failure aborts
+before artifact registration and run persistence. CLI counters report graph
+upserts, while the changed-symbol summary excludes equivalent symbols and
+line-only movement; see [Project compilation](CLI.md#project-compilation).
 
-Watch mode wraps the same flow:
+Watch mode performs an initial verified compile, then processes source events
+through the same scanner and dirty planner. One watcher lease owns a project;
+the canonical graph is opened for compile batches and released while idle.
+`project watch-status` reads watcher state without opening the graph.
 
-```text
-project compile --watch
-  -> start a recursive Python watchdog observer
-  -> run one initial verified compile
-  -> wait for filesystem events
-  -> wait for debounce when file changes are detected
-  -> run one scan-and-compile cycle (without a separate status scan)
-  -> repeat until interrupted or --watch-iterations is reached
-```
+The shared handler excludes storage, WAL, lock, cache, usage and diagnostics
+sidecars. Read-only open/close and redundant parent-directory notifications do
+not trigger compilation; writes, creates, deletes and moves do. Moves across
+an ignored boundary still report the affected source path. See
+[watch commands and limits](CLI.md#incremental-compilation) and
+[storage locking](STORAGE.md#readerwriter-locking).
 
-The watcher uses Python `watchdog` filesystem events. Treat it as monitor mode
-for active editing: run it from the agent's working directory, keep one watcher
-running, and query the maintained graph instead of launching repeated manual
-compile/rebuild loops. Events emitted by the configured storage, WAL, locks,
-usage sidecars, diagnostics output, and the project `.reql` cache are ignored so
-the watcher cannot trigger itself.
+Cache entries compare:
 
-Check watcher liveness without inspecting operating-system processes:
+- artifact SHA-256, size and modification time;
+- parser and chunking versions;
+- effective compilation-options hash and active status.
 
-```bash
-reql project watch-status
-reql project watch-status --json
-```
+Both cache hits and recovery also require a matching successfully compiled
+digest and compiler-contract fingerprint on the active `SourceArtifact`.
+Scan-time metadata alone cannot validate compiled spans or failed work.
 
-The command reads the REQL lock sidecar without opening the graph and therefore
-works while the watcher owns the write lock. It distinguishes running, stopped,
-stale, and unknown-liveness states.
+The primary cache is `<project>/.reql/artifact-cache.json`. Planning builds one
+active project map from disk and graph cache records. Missing entries can be
+recovered from active compiled artifacts with matching identity, path, content
+and compiler provenance. Clearing the cache therefore does not necessarily
+recompile unchanged artifacts or reset the graph.
 
-The cache key includes:
+`cache_enabled=False` disables reuse and new successful-entry writes. It still
+reconciles deletions and invalidates their existing cache entries. Changing
+options without cache writes cannot make an earlier cache entry valid for a
+different graph snapshot.
 
-- artifact SHA-256;
-- file size;
-- modification time;
-- parser version;
-- chunking version;
-- options hash.
-
-If all fields match, the artifact is skipped. If any field differs, only that
-artifact is recompiled.
-When cache entries are absent but the graph already has a compiled
-`SourceArtifact` for the same artifact id, relative path, SHA-256, and size,
-the compiler treats it as clean and writes a replacement cache entry. Deleted
-compiled artifacts are still detected from the project graph in this recovery
-path.
-
-Cache planning builds the active cache map for the project once per run from
-`.reql/artifact-cache.json`, then merges historical `ArtifactCacheEntry` graph
-nodes when needed. The map is reused for clean/changed/deleted/recoverable
-decisions, which keeps detection rules unchanged while avoiding repeated
-per-artifact graph lookups during cold or dirty compiles.
-
-Context-scope metadata is written by the artifact and code/document node
-producers during compilation. Clean artifacts are not revisited only to repair
-missing scope metadata; if compiled graph records are incomplete, recompile the
-affected artifact so the owning producer writes the canonical fields.
+Context-scope metadata is written by artifact/code/document producers. Clean
+artifacts are not revisited to repair missing fields; recompile an incomplete
+artifact so its producer writes the canonical representation.
 
 ## Graph Records
 
-`.reql/artifact-cache.json` records the last successful compilation fingerprint
-for each project artifact. `ArtifactCacheEntry` nodes mirror those records in
-the graph so existing REQL `FIND` statements, reports, and recovery paths remain
-available.
+| Record | Meaning |
+| --- | --- |
+| `SourceArtifact` | Registered path/content metadata and successful compilation provenance |
+| `ArtifactCacheEntry` | Successful fingerprint mirrored for queries, reports and recovery |
+| `CompilationRun` | Invocation status, artifact counts, graph-write counts and errors |
+| `GraphDelta` | Added, updated and archived graph ids, plus affected nodes/communities |
+| `ProjectRevision` | Content-addressed manifest, parent revision and changed file paths |
 
-`CompilationRun` records one invocation of incremental compilation, including
-files seen, changed, skipped, deleted, node and edge update counts, and parser
-errors.
+Change collections use sets internally and ordered lists at persistence/public
+boundaries. Edges use the persisted ids returned by upserts, including when a
+canonical key resolves to an existing node. See [Schema](SCHEMA.md) for record
+fields and [Code analysis](CODE_ANALYSIS.md#extracted-graph) for technical output.
 
-`GraphDelta` records the actual graph IDs affected by a run:
-
-- added, updated, and archived nodes;
-- added, updated, and archived edges;
-- affected node IDs;
-- affected community IDs.
-
-During a run the compiler aggregates these IDs in internal sets to avoid
-duplicate list growth. The persisted and public `GraphDelta` record still uses
-ordered lists with the same field names.
-
-A successful run that changes the project manifest creates a `ProjectRevision`
-and is a REQL commit. After such a commit, retention keeps the latest
-`retention.commits` revisions (default `20`) and removes older project-owned
-`CompilationRun`, `GraphDelta`, `ProjectRevision`, archived/deleted graph
-records, and usage-journal entries. Clean runs still persist their run and
-delta records but do not advance or trigger the commit-count window. Failed
-runs do not trigger cleanup; shared stores retain data and mixed usage-event
-entries owned by other projects. The runs and deltas associated with retained
-commits are protected. A graph deletion triggers one compact rewrite so
-tombstones and old pages do not remain as wasted disk space.
-Retention first reads at most `retention.commits + 1` revisions through the
-project index. Project nodes and edges are loaded only when that bounded check
-shows that pruning is actually required.
-
-Supported code artifacts produce deterministic technical nodes such as
-`Module`, `Package`, `Class`, `Interface`, `Function`, `Method`, meaningful
-`Variable`, `Import`, `Dependency`, `Endpoint`, `Schema`, `Config`, and `Test`.
-Technical relations include `CONTAINS`, `DEFINES`, `IMPORTS`, `CALLS`,
-`REFERENCES`, `INHERITS`, `IMPLEMENTS`, `INSTANTIATES`, `READS`, `WRITES`,
-`RETURNS`, `RAISES`, `DECORATED_BY`, `HANDLES_ROUTE`, `TESTS`, `CONFIGURES`,
-and `DEPENDS_ON`.
-
-Every deterministic compile edge has `confidence=1.0` and provenance fields in
-edge properties: `source_id`, `target_id`, `type`, `confidence`,
-`source_file`, `line_start`, `line_end`, `extractor`, `evidence`,
-`created_at`, `updated_at`, `mode=compile`, `is_semantic=false`, and
-`is_technical=true`.
-
-Node and edge writes are batched where the compiler can safely do so, including
-source fragments and cohesive code-graph groups. When storage resolves an
-upsert to an existing node through `canonical_key`, subsequent edges use the
-persisted node ID returned by the store rather than the candidate ID.
-Diagnostics split structural linking into load, derive, and persist spans, and
-report project-wide application-surface refresh and lexical-index finalization
-separately.
-
-Document-code linking is scoped when only document artifacts changed: only the
-dirty document fragments are relinked. If any code artifact changed, the linker
-still performs full document-fragment relinking against project code nodes so
-existing documentation can link to new or renamed symbols. The linker keeps
-only high-signal matches, ignores generic headings and short common terms, and
-caps each fragment at 8 code targets.
-
-Unrecognized code-like artifacts are handled conservatively: only safe
-file-structure nodes and `CONTAINS` relations are emitted. They do not create
-compile errors. The compiler does not invent symbols, calls, imports, source
-fragments, topics, communities, or bridges when no normalized project language
-is known.
-
-`SourceFragment` nodes are created for supported code symbols and document
-artifacts so source-level queries can inspect parsed text. They are not the
-primary technical graph for compile mode. Non-code text fragments remain
-structural source context for provenance and query context.
+A successful changed manifest is a REQL commit. Clean and failed runs do not
+advance the commit-retention window. Project history, retained run/delta records,
+archived graph records and usage events follow the
+[configured retention policy](CONFIGURATION.md#behavior); physical cleanup is
+described in [Storage maintenance](STORAGE.md#inspection-compaction-and-clean-rebuilds).
 
 ## Deletions
 
-When a file disappears from a later scan, its `SourceArtifact` node is archived
-along with its `File` node and related `SourceFragment`/code nodes. Cache
-entries for deleted artifacts are also archived in the disk cache and graph
-cache so subsequent compiles remain idempotent.
+A later scan archives missing `SourceArtifact` and `File` nodes with their
+related fragments/code records. Deleted cache entries are invalidated in disk
+and graph metadata so later compiles remain idempotent. This also applies with
+cache reuse disabled and when an artifact's first compilation failed.
+An incomplete scan cannot establish deletions.
 
 ## Failure Behavior
 
-Parsing happens before graph writes for each changed artifact. If a parser fails,
-that artifact's previous fragments and cache entry are left intact. The
-`CompilationRun` is persisted with `failed` status and the error message, and a
-run-level `GraphDelta` is still persisted.
+Unreadable directories/files or repeatedly changing scan content raise
+`StorageError` with affected paths before compilation writes. Existing committed
+graph facts and cache entries remain available; resolve the error and retry.
 
-Compile writes run inside block-store transactions backed by a per-record
-rollback journal. The journal records only touched nodes, edges, pending WAL
-state, and small mutable side structures. On rollback, touched records are
-restored and indexes are rebuilt from materialized records; on commit, the WAL
-semantics remain unchanged. Nested transactions preserve outer work when an
-inner transaction rolls back.
+An artifact exception preserves that artifact's prior graph facts and skips its
+cache upsert. Returned parser errors also mark the run failed. Other successful
+artifacts and run/delta records can commit; a failed run is not a whole-project
+rollback and does not create a project revision. Source verification still
+requires committed revision provenance.
+
+If new disk-cache persistence fails after graph commit, the committed graph is
+not rolled back. After repairing cache storage, subsequent compilations validate
+entries against successful graph provenance, using graph cache records or
+recompiling where needed. Nested rollback and WAL behavior belong to the
+[storage transaction contract](STORAGE.md#transactions).
 
 ## Current Limitations
 
-The compiler creates deterministic source fragments and supported
-language-specific code graph nodes. Community impact is reserved for later
-phases, so `affected_community_ids` is currently empty unless future services
-populate it.
-
-
+Compilation does not recompute communities; `affected_community_ids` is currently
+empty. Invoke graph analysis explicitly when its persisted results need updating.

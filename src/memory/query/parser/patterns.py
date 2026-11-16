@@ -23,9 +23,24 @@ def parse_match_pattern(pattern: str) -> tuple[PatternNode, PatternEdge, Pattern
     m = regex.match(pattern)
     if not m:
         raise REQLSyntaxError(f"Invalid MATCH pattern: {pattern!r}")
-    left_alias = m.group("a") or "a"
-    edge_alias = m.group("r") or "r"
-    right_alias = m.group("b") or "b"
+    named = {role: value.lower() if (value := m.group(role)) else None for role in ("a", "r", "b")}
+    used_aliases = {alias for alias in named.values() if alias is not None}
+
+    def anonymous_alias(preferred: str) -> str:
+        """Keep anonymous pattern roles distinct from explicitly named variables."""
+        alias = preferred
+        suffix = 0
+        while alias in used_aliases:
+            suffix += 1
+            alias = f"{preferred}_{suffix}"
+        used_aliases.add(alias)
+        return alias
+
+    left_alias = named["a"] or anonymous_alias("a")
+    edge_alias = named["r"] or anonymous_alias("r")
+    right_alias = named["b"] or anonymous_alias("b")
+    if edge_alias in {left_alias, right_alias}:
+        raise REQLSyntaxError("MATCH edge alias must differ from its node aliases")
     link1 = m.group("link1")
     link2 = m.group("link2") or "-"
     if link1 == "<-":

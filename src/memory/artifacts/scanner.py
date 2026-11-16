@@ -19,8 +19,6 @@ from ..config import (
 )
 from ..domain.timeutils import utcnow_iso
 from .fingerprint import (
-    DEFAULT_CHUNKING_VERSION,
-    DEFAULT_PARSER_VERSION,
     artifact_id,
     normalize_path,
     project_id,
@@ -32,7 +30,7 @@ from .models import Project, ScanError, ScanResult, ScanSkippedFile, SourceArtif
 
 DEFAULT_MAX_FILE_SIZE_BYTES = default_config().scan.max_file_size_bytes
 SAMPLE_BYTES = 8192
-SMALL_SCAN_MAX_FILES = 512
+SMALL_SCAN_MAX_FILES = 64
 SMALL_SCAN_WORKERS = 2
 MAX_SCAN_WORKERS = 8
 
@@ -57,9 +55,6 @@ class ProjectScanner:
         self,
         *,
         max_file_size_bytes: int = DEFAULT_MAX_FILE_SIZE_BYTES,
-        parser_version: str = DEFAULT_PARSER_VERSION,
-        chunking_version: str = DEFAULT_CHUNKING_VERSION,
-        options: dict[str, object] | None = None,
         include_patterns: list[str] | None = None,
         exclude_patterns: list[str] | None = None,
         config_path: str | Path | None = None,
@@ -67,9 +62,6 @@ class ProjectScanner:
         use_gitignore: bool = False,
     ) -> None:
         self.max_file_size_bytes = max_file_size_bytes
-        self.parser_version = parser_version
-        self.chunking_version = chunking_version
-        self.options = options or {}
         self.include_patterns = include_patterns or []
         self.exclude_patterns = exclude_patterns or []
         self.exclude_rules = tuple(resolve_scan_exclude_pattern(pattern) for pattern in self.exclude_patterns)
@@ -268,6 +260,7 @@ def _normalized_scan_path(path: Path) -> str:
 
 
 def _scan_worker_count(candidate_count: int) -> int:
+    """Keep small scans lean and bound larger scans by available CPUs and eight workers."""
     if candidate_count <= 1:
         return candidate_count
     if candidate_count <= SMALL_SCAN_MAX_FILES:

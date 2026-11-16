@@ -7,6 +7,7 @@ from dataclasses import replace
 from time import perf_counter
 from typing import Iterable
 
+from ..code_analysis.symbol_table import is_computed_reference
 from ..diagnostics import PerformanceLogger
 from ..domain.ids import stable_id
 from ..domain.models import MemoryEdge, MemoryNode
@@ -413,7 +414,7 @@ def _resolve_symbol_reference(
     allowed_types: set[str],
 ) -> MemoryNode | None:
     clean = reference.strip()
-    if not clean:
+    if not clean or is_computed_reference(clean):
         return None
     root = clean.split(".", 1)[0].split("(", 1)[0]
     tail = clean.rsplit(".", 1)[-1].split("(", 1)[0]

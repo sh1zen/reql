@@ -5,11 +5,8 @@ from typing import Any
 
 from ..base import (
     TreeSitterExtractorBase,
-    _call_owner,
-    _call_target,
     _children,
     _clean_type_text,
-    _column,
     _end_line,
     _field,
     _has_direct_child,
@@ -21,13 +18,11 @@ from ..base import (
     _owner,
     _params,
     _parent,
-    _reference,
     _string_literal,
     _symbol,
     _text,
-    stable_id,
 )
-from ..models import CodeCall, CodeSymbol, SymbolKind
+from ..models import CodeSymbol, SymbolKind
 
 
 class JavaScriptTreeSitterExtractor(TreeSitterExtractorBase):
@@ -69,7 +64,7 @@ class JavaScriptTreeSitterExtractor(TreeSitterExtractorBase):
                 self._walk_javascript_children(node, [*scope, symbol])
                 return
         if node_type == "call_expression":
-            self._call(node, scope, function_field="function")
+            self._record_call(node, scope, function_field="function")
         self._walk_javascript_children(node, scope)
 
     def _walk_javascript_children(self, node: Any, scope: list[CodeSymbol]) -> None:
@@ -116,24 +111,6 @@ class JavaScriptTreeSitterExtractor(TreeSitterExtractorBase):
             return None
         kind: SymbolKind = "async_function" if _has_direct_child(value, "async") else "function"
         return _symbol(self.artifact, kind, _parent(self.module, scope), _node_text(self.source, name_node), _line(node), _end_line(value), args=_params(self.source, _field(value, "parameters")), returns=_clean_type_text(_node_text(self.source, _field(value, "return_type"))))
-
-    def _call(self, node: Any, scope: list[CodeSymbol], *, function_field: str) -> None:
-        target_node = _field(node, function_field)
-        target = _call_target(self.source, target_node)
-        if not target or target.split(".")[0] in {"if", "for", "while", "switch", "catch", "function", "return", "class", "import", "export"}:
-            return
-        caller = _call_owner(scope)
-        self.references.append(_reference(self.artifact, caller or _parent(self.module, scope), target, _line(target_node), _column(target_node), "read"))
-        self.calls.append(
-            CodeCall(
-                id=stable_id("call", self.artifact.id, caller or "", target, _line(node), _column(node)),
-                artifact_id=self.artifact.id,
-                caller=caller,
-                target=target,
-                line=_line(node),
-                column=_column(node),
-            )
-        )
 
 
 def _javascript_class_base(source: bytes, node: Any) -> str | None:

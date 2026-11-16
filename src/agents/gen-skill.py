@@ -1,4 +1,4 @@
-"""Generate REQL agent skills, instructions, and coding-agent rules."""
+"""Generate REQL skills and rules with ASD-STE100-style prose and unchanged code literals."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -26,57 +26,64 @@ PROJECT_SKILL_SOURCE = SkillSource(
     name="reql-agent",
     title="REQL Coding Workflow",
     description=(
-        "Use for every {platform_name} task involving a REQL-indexed repository, including small edits and "
-        "read-only investigations. Start with REQL project status and focused graph retrieval to establish "
-        "repository context before inspecting source."
+        "Use REQL to find source context and save shared work for {platform_name}. "
+        "Use this skill for changes, checks, and tasks that continue across sessions."
     ),
     summary=(
-        "REQL combines a source-backed repository graph with durable engineering work: goals, tasks, decisions, "
-        "constraints, failures and checkpoints. Retrieve local evidence and project direction, then verify current source. "
-        "Shared work survives agents and sessions; private notes are disposable scratch."
+        "The graph stores facts. Shared records store intent."
     ),
     workflow_steps=(
-        "Follow repository instructions. Run `{command_name} project status`; use `references/bootstrap.md` if the graph is missing or unusable. Do not compile a healthy graph to begin.",
-        "For substantial or resumed work, read `{command_name} project overview` first: goals, direction, workstreams, completed/active work, blockers and next ready outcomes. Drill with `project context --query \"<terms>\" --file <path>` or `agent show <id> --json`. These reads need no agent selection.",
-        "Use `{command_name} locate \"<path>\"` for a known file or `query_context --query \"<short literal terms>\" --code`. Context includes scoped engineering decisions, failures and dependencies. Read returned owners, spans, callers and tests; source is authoritative. If needed, refine once or use a targeted exact-name search. Do not rescan the whole repository once the working set is known.",
-        "For multi-step work, run `{command_name} agent init --name \"<outcome>\"` and `agent dashboard`. Use the host thread identity, or an explicit `--agent`/`--activity` when ambiguous. Reuse existing work ids before creating outcomes; read `references/agent-workspace.md` for structured commands.",
-        "Persist only changes that affect later reasoning: goal/outcome, decision with why, failed approach, constraint, unresolved question, or tested change with relevant files. `agent record <kind> <text>` stores shared work; `--parent`, `--depends-on` and `--workstream` connect it. Update by `--id` and `--revision` from `agent show`, rather than appending contradictory notes. Replace obsolete approaches with `--supersedes <id> --why <reason>`.",
-        "Keep execution current at natural boundaries: claim a task as `in_progress`, record `blocked` with why, complete it with `agent task done <id> <result and checks>`. Dependencies derive readiness and flag obsolete/conflicting assumptions. Reconcile before proceeding; never mark unfinished work done. Private `agent note` is scratch, not durable knowledge. Do not store secrets, source dumps or repetitive tool output.",
-        "Change the owning implementation and affected consumers, then run documented checks. After source changes, run `{command_name} project watch-status --json`; let a running watcher refresh or run one `project compile`. Skip refresh for read-only work.",
-        "At a substantial boundary, reconcile records and save an `agent record checkpoint` with outcome, evidence and next action. If this pass initialized or resumed a session, close it with `{command_name} agent finish \"<outcome, checks, unresolved work>\"`; it creates a checkpoint and releases private scratch while preserving shared work."
+        "Reuse a supplied working set and check current source. For missing context, run `{command_name} project status` once. For a missing graph, run `project compile --if-stopped`. Read `references/bootstrap.md` for setup failures.",
+        "Retrieve only missing context with `{command_name} locate \"<path>\"` or `query_context --query \"<literal terms>\" --code`. Inspect missing source with `inspect --node-id ID --limit 1` and reuse complete verified excerpts. Use text output unless you need structured fields. For requirements, use `--docs`. Refine once or search exactly. Stop when the owner, effects, and tests are clear.",
+        "Change the behavior owner. Preserve supported extension points.",
+        "For managed parallel work, use one stdin batch for linked records. Workers reuse its context and return results. Independent agents use `agent init --name NAME --task ID --revision N`. It returns task context and the current revision. Recover with `project context --task ID` or `agent show ID --json` for marked omissions. Use `{command_name} project overview` for unknown goals, direction, workstreams, and blockers.",
+        "Save each outcome once and use write receipts for ids and revisions. Read again for missing evidence, concurrent changes, or stale revisions. Update with `--revision`. Check dependencies and conflicts. Replace with `--supersedes ID --why REASON`. Keep the host's identity and activity.",
+        "Workers run focused checks. The coordinator runs integration checks and refreshes once after parallel work. Use one full-suite run when it covers worker checks. Repeat focused checks only for failures or uncovered behavior. Refresh with `{command_name} project compile --if-stopped`. Skip refresh for read-only work.",
+        "Close only sessions started or continued here. Use `agent finish SUMMARY --task ID --revision N` for assigned work. It completes the task, clears its next action, and returns the checkpoint id. Otherwise, use `agent finish`. Pass that id instead of writing another handoff."
     ),
     rule_points=(
         (
-            "Prefer `{command_name}`; fall back to `{command_path}`, then `{fallback_command}`. Start with `project status` and bootstrap "
-            "with `project compile` only when the graph is missing or unusable."
+            "Use `{command_name}`. If it is unavailable, try `{command_path}`, then `{fallback_command}`. "
+            "Reuse a supplied working set. For missing context, run `project status` from the project root. "
+            "Status reports compilation results, not current file changes."
         ),
         (
-            "If a path is known, use `{command_name} locate \"<path>\"`; otherwise start with `{command_name} query_context --query \"<short literal terms>\"`. "
-            "Let graph paths, owners, spans, relationships, and associated tests bound discovery, then inspect the current source and contracts needed to make the change safely."
+            "For missing context, use `{command_name} locate \"<path>\"` or `{command_name} query_context --query \"<short literal terms>\"`. "
+            "Inspect missing source with `inspect --node-id ID --limit 1` and reuse complete verified bodies. "
+            "Check the owners, line ranges, callers, and tests in the current source. "
+            "Change the implementation that owns the behavior. Preserve supported extension points. Avoid duplicate wrappers and overrides."
         ),
         (
-            "When graph context is insufficient, refine once or use a targeted exact-name/path search. Source is authoritative; REQL evidence "
-            "narrows work but does not replace code review, tests, or repository instructions."
+            "For insufficient context, try one narrower query or a specific source search. For unclear requirements, use `--docs`. "
+            "Follow the current source and repository instructions."
         ),
         (
-            "Keep retrieval and source reads bounded: use short literal queries, read returned paths and spans, ask for JSON only when structured fields are needed, "
-            "and stop discovery once ownership, impact, and tests are clear. Avoid repeated project compile or workspace-wide scans on a healthy graph."
+            "Keep source reads within the task. Stop when the owner, effects, and tests are clear. Reuse sufficient results. "
+            "Read a reference only when necessary. Use JSON only for structured fields."
         ),
         (
-            "Use Agent Workspace only for multi-step, resumed, or coordinated work. If `agent dashboard` is uninitialized, run `agent init --name \"<task>\"`; "
-            "read `project overview` from the project directory for durable goals, direction, blockers and ready work. Reuse structured work ids with `agent record --id ID --revision N`; Record a discarded approach "
-            "with `agent reject \"<approach>\" \"<reason>\"`; finish only a pass that initialized or resumed an Agent Workspace session."
+            "For managed parallel work, one coordinator owns shared records and workers return evidence. "
+            "Independent agents use `agent init --task ID --revision N` to claim work and read its context. "
+            "Use `project context --task ID` for read-only recovery. "
+            "For unknown project direction, read `project overview` from the project directory. Keep the host's identity and activity."
         ),
         (
-            "After changed project files pass their documented checks, run `{command_name} project watch-status --json`; let a running watcher refresh the graph or run one "
-            "`{command_name} project compile`. Skip refresh for read-only work and do not start watch mode unless continuous monitoring was requested."
+            "Pipe linked work records to `agent batch --name NAME --file - --finish SUMMARY`. "
+            "Independent agents use `agent finish SUMMARY --task ID --revision N` to complete work and close its session. "
+            "Update existing records with `--revision` and check dependencies and conflicts before changes. "
+            "Reuse write receipts for ids and revisions. Read again for missing evidence, concurrent changes, or stale revisions. "
+            "Save a failed approach with `agent reject \"<approach>\" \"<reason>\"`."
         ),
         (
-            "In the final response, report changed files, behavior, and checks actually run. Keep personal configuration actions separate and "
-            "never edit them unless requested."
+            "Run checks for changed behavior and reuse passing checks for unchanged code. "
+            "The coordinator runs one full-suite check after workers finish when it covers their checks. "
+            "Repeat focused checks for failures or uncovered behavior. "
+            "After checks, refresh once with `{command_name} project compile --if-stopped`. "
+            "Omit this update for read-only work. "
+            "Start watch mode only if the user asks for continuous monitoring."
         ),
     ),
-    deterministic_requirement="Keep REQL deterministic and local; the graph owns repository facts, shared work owns engineering intent and execution, and private notes are scratch.",
+    deterministic_requirement="Keep REQL local and deterministic. The graph stores source facts. Shared work records store plans and task status. Private notes are temporary.",
 )
 
 def skill_markdowns(
@@ -121,13 +128,7 @@ def skill_resources(
         command_path=command_path,
         fallback_command=fallback_command,
     )
-    agent_workspace = _agent_workspace_resource(
-        platform_name=platform_name,
-        scope=_scope(project),
-        command_name=command_name,
-        command_path=command_path,
-        fallback_command=fallback_command,
-    )
+    agent_workspace = _agent_workspace_resource(command_name=command_name)
     return (
         *(tuple((PROJECT_SKILL_SOURCE.name, item.path, item.content) for item in project_resources)),
         (PROJECT_SKILL_SOURCE.name, agent_workspace.path, agent_workspace.content),
@@ -144,18 +145,24 @@ def context_compact_skill(platform_name: str) -> str:
     manual_policy = "disable-model-invocation: true\n" if platform_name != "codex" else ""
     return f"""---
 name: reql-context-compact
-description: Run only when the user invokes /reql-context-compact to compact an exported coding-agent transcript with deterministic, exact-duplicate tool-output removal.
+description: Use only when the user asks for /reql-context-compact. Remove large repeated tool results from an exported JSON transcript.
 {manual_policy}---
 
 # REQL context compact
 
-Run only for an explicit `/reql-context-compact` invocation. Never activate during ordinary REQL use or automatically before a host's native compaction.
+Run only when the user asks for `/reql-context-compact`. Do not start this skill during ordinary REQL use. Do not start it automatically before host compaction.
 
-If the current host exposes an exported JSON transcript and accepts a replacement message list, pass the transcript through `python -m agents.context_compact` using stdin and apply its stdout only after validating the output. The input is a JSON message array or an object with a `messages` array. Each tool result must have `role: "tool"`, a nonempty `name`, and string `content`. The command has no network or model dependency and writes no files.
+First, check that the host can export a JSON transcript and accept a new message list. If it can, send the transcript to `python -m agents.context_compact` through stdin. Check stdout before the host uses the new list. The command uses no network or model. It writes no files.
 
-The algorithm retains every message, all metadata, every instruction and user/assistant turn, marked error results, the latest four messages, and the first full copy of each tool result. It only replaces old tool-result content of at least 512 characters when an earlier result from the same named tool is byte-identical. The replacement points to that retained message and includes its SHA-256 digest. If the host cannot supply or replace the active transcript, report that limitation; do not claim to have compacted the live context. Do not invoke a model-based `/compact` as a substitute.
+The input is a JSON message array or an object with a `messages` array. Each tool result must have `role: "tool"`, a nonempty `name`, and string `content`.
 
-For a harness with a JSON transcript file, a shell pipeline such as `python -m agents.context_compact < transcript.json > compacted.json` produces a reviewable copy. The host must explicitly choose to use it for subsequent turns. Never overwrite the source transcript or edit private host session files.
+The filter keeps every message and all metadata. It keeps instructions, user messages, assistant messages, marked error results, and the latest four messages. It keeps the first complete copy of each tool result.
+
+The filter changes only old tool content with at least 512 characters. An earlier result from the same tool must have identical bytes. The new content points to the retained message and includes its SHA-256 digest.
+
+If the host cannot export or replace the transcript, report this limit. Do not claim that the live context changed. Do not use a model-based `/compact` command instead.
+
+For an exported file, use `python -m agents.context_compact < transcript.json > compacted.json` to make a separate copy. The host must choose to use this copy for later messages. Do not overwrite the source transcript. Do not change private host session files.
 """
 
 
@@ -181,27 +188,24 @@ description: {source.description.format(platform_name=platform_name)}
 
 {workflow}
 
-## Load only when triggered
+## References
 
 {reference_routing}
 
-## Rules
-
-- Load a routed reference only when its trigger occurs. Load another only if the task later reaches that separate case; never preload all references.
-- Treat graph output as discovery evidence, current source as authoritative, and repository instructions as controlling.
-- Stop querying once the owner, impact, edit locations, and test targets are clear.
+Read only the necessary reference. Reuse it during the session.
 """
 
 
 def _reference_routing() -> str:
     return "\n".join(
         [
-            "- Missing/stale graph, compile, exclusions, command fallback -> `references/bootstrap.md`.",
-            "- Query choice, raw REQL, or insufficient context -> `references/query.md`.",
-            "- Watch/compile troubleshooting, custom storage, cache, deltas, or special local configuration -> `references/update-watch.md`.",
-            "- Reports, exports, hubs, communities, or MCP -> `references/reports-exports.md`.",
-            "- Document ingestion or local processing -> `references/document-semantics.md`.",
-            "- Durable planning, dashboard recovery, `project overview`, or `reql agent` -> `references/agent-workspace.md`.",
+            "- For setup or exclusions, read `references/bootstrap.md`.",
+            "- For queries, read `references/query.md`.",
+            "- For refresh failures, read `references/update-watch.md`.",
+            "- For reports or MCP, read `references/reports-exports.md`.",
+            "- For documents, read `references/document-semantics.md`.",
+            "- For individual record formats or session recovery, read `references/agent-workspace.md`. Use `agent dashboard` only to recover a session.",
+            "- For batch fields or recovery, read `references/agent-batch.md`.",
         ]
     )
 
@@ -217,105 +221,112 @@ def _project_skill_resources(
     usage = _command_usage(command_name=command_name, command_path=command_path, fallback_command=fallback_command)
     openai_yaml = """interface:
   display_name: "REQL Coding Workflow"
-  short_description: "Narrow coding work with REQL graph evidence."
-  default_prompt: "Use $reql-agent to retrieve source evidence and project direction, reconcile durable work at meaningful boundaries, verify source and tests, and refresh after edits."
+  short_description: "Find source context and save shared work."
+  default_prompt: "Use $reql-agent to find source context. Check the source and tests. Save important work results. Update the graph after changes."
 """
-    bootstrap = f"""# REQL reference: bootstrap and project state
+    bootstrap = f"""# REQL reference: graph setup and project status
 
-Load this when checking whether a workspace already has REQL graph context, when first compiling a project, or when deciding how to establish a bounded working set.
+Read this reference for graph setup, command failures, or compilation problems.
 
-## Command resolution
+## Command paths
 
 {usage}
 
-## Fast path: existing graph
+## Existing graph
 
-Start repository discovery here:
+Check the project status:
 
 ```bash
 {command_name} project status
 ```
 
-If status succeeds, treat `.reql/memory.reql` as the repository context index. Do not rebuild just because the user asked a natural-language codebase question. Query the graph until it identifies the relevant paths and spans, then read exact files only when edits, debugging, or tests require them.
+Run each command from the project root. The default store is `.reql/memory.reql` in that directory. The launcher path does not select the project. Do not create a second graph in a source subdirectory.
 
-## First-time bootstrap
+Successful status means that the project has a registration record. Check `Last compilation`, or `last_compilation` with `--json`:
 
-If status reports `Project not found`, run a one-shot compile from the runtime workspace root:
+- `completed` means that compilation succeeded.
+- `failed` includes compilation errors.
+- `none` means that no compilation result exists.
+
+Status does not scan current files. Do not compile only because the user asks a repository question. Use the graph to find related paths and line ranges. Then check the current source.
+
+## First compilation
+
+If status reports `Project not found` or no compilation result, run this command from the project root:
 
 ```bash
 {command_name} project compile
 ```
 
-The one-shot bootstrap is allowed without asking again because the installed workflow selected REQL project mode. If compile fails, report the error briefly and continue from the smallest source locations implied by the request.
+The installed instructions permit this initial compilation without further approval. Check for exit code zero and `Status: completed`. A failed compilation can leave file records and incomplete context. A successful status command does not prove that compilation succeeded.
 
-## Graph-defined working set
+If a parser dependency is missing, repair the declared REQL dependencies in the launcher Python environment. Then try compilation again. Do not repeat the same failed compilation without a change. If compilation remains unavailable or fails again, report the problem. Continue with specific source checks. Do not report incomplete results as complete evidence.
 
-Use REQL results to establish a bounded discovery set: candidate files, symbols, owners, source fragments, line ranges, relationships, and associated tests. When the first result is incomplete, make one narrower query or follow a specific graph edge with `query_explore`, `query_graph`, `query_memories`, or `inspect`.
+## Source selection
 
-For token-efficient work, request rendered context first and use `--json` only when its structured fields answer a specific next question. Keep source reads to the returned paths and spans plus callers, contracts, and tests needed for the change. Do not repeatedly compile a healthy graph or replace a narrow query with a whole-project file or text dump.
+Use REQL results to select files, symbols, owners, line ranges, relations, and tests. If information is missing, try one narrower query. For a missing relation, use `query_explore`, `query_graph`, `query_memories`, or `inspect`.
 
-Once the graph identifies specific paths or spans, inspect the current source plus the callers, contracts, and tests needed to verify the change. Use targeted exact-name or path searches when checking references the graph may not model, such as dynamic registrations. Stop discovery as soon as the owner, impact, edit locations, and test targets are clear.
+Use text output first. Use `--json` only when structured fields answer a specific question. Read the selected source and the related callers, contracts, and tests. Do not repeatedly compile a usable graph. Do not replace a specific query with a copy of the complete repository.
+
+For relations outside the graph, search for exact names or paths. Dynamic registrations can need this check. Stop when the owner, effects, change locations, and tests are clear.
 
 ## Exclusions
 
-Configure additional compile exclusions in the project's `reql.conf` under
-`scan.exclude`. Use `./` only for rules anchored to the config directory; omit
-it to match at any depth. The only wildcard form is `*suffix` in the final
-segment. Never use workspace-wide patterns such as `*`, `**`, or `**/*`. Never
-exclude source/framework roots needed for the task just to make indexing smaller.
+Set additional compilation exclusions under `scan.exclude` in the project `reql.conf` file. Use `./` for rules relative to the configuration directory. Omit `./` to match at any depth. Only the final path segment permits the wildcard form `*suffix`. Do not use patterns for the complete workspace, such as `*`, `**`, or `**/*`. Do not exclude source or framework roots that the task needs.
 
 ## Configuration
 
-Project commands search for `reql.conf` from the target path upward and join its lists with protected internal defaults. Keep the core compile path deterministic and usable without model providers.
+Project commands search for `reql.conf` from the target path through its parent directories. They combine its lists with protected internal defaults. Keep compilation deterministic and independent of model providers.
 
-Installed for: {platform_name} ({scope}).
+Installation: {platform_name} ({scope}).
 """
-    query = f"""# REQL reference: querying existing graph context
+    query = f"""# REQL reference: specific queries
 
-Load this when the user asks a question about a compiled project, architecture, dependencies, symbols, reports, memories, or source evidence.
+REQL matches terms and graph links. It does not interpret requirements. Use short literal identifiers, paths, or error text.
 
-## Choose the narrowest query
+For empty or insufficient results, refine once or search specific source files. For requirements, use `--docs`.
 
-- Use `{command_name} locate "path/to/known/file"` when the project-relative path is known or its documentation extension is omitted. It uses exact normalized path indexes without semantic ranking or graph expansion.
-- Use `{command_name} query_context --query "<terms from user request>"` first for most questions and small edits. Keep the query short and literal; for exact-name cleanup, `query_context --query "graphify"` is better than a long synthetic query.
-- Add `--code`, `--docs`, `--test`, or `--cleanup` only when the user request clearly needs that section. Start without `--json`; rendered context is usually enough for a coding agent to choose files and line ranges.
-- Use `{command_name} query_memories --query "<terms from user request>" --limit 8` for compact source/memory text rows when `query_context` is too broad.
-- Use `{command_name} query_explore --query "<terms from user request>" --view owners --view code` when a coding task needs a tighter function-level owner slice before source reads.
-- Use `{command_name} query_graph --query "<terms from user request>" --max-depth 2` when you need seed nodes, edges, sources, and filtered-node diagnostics.
-- Use `{command_name} query "RETRIEVE '<terms from user request>' LIMIT 8 RETURN id,type,text,score,relative_path,line_start,line_end"` when explicit custom REQL columns or source locations are needed.
-- Use `{command_name} inspect --node-id NODE_ID --json` after `query_memories`, `query_graph`, or a REQL statement prints an id and you need the node's source/location and immediate neighbors.
-- Use `{command_name} query "..."` for explicit REQL statements.
+Unknown freshness on an empty result does not require compilation. Current freshness describes saved graph or watcher state, unless source checks find changed files.
 
-Common REQL statements:
+Select the command for the missing information:
 
-```bash
-{command_name} query "PROJECTS"
-{command_name} query "ARTIFACTS LIMIT 20"
-{command_name} query "SYMBOLS TYPE Function WHERE name CONTAINS 'compile' LIMIT 20"
-{command_name} query "FRAGMENTS WHERE relative_path CONTAINS 'docs' LIMIT 20"
-{command_name} query "RETRIEVE 'office plant' LIMIT 8 RETURN id,type,text,score,relative_path,line_start,line_end"
-{command_name} query "FIND nodes WHERE text ILIKE '%office plant%' LIMIT 10"
-{command_name} query "FINDINGS WHERE finding_type IN ['unused_variable','unused_import','possibly_unused_function','possibly_unused_method','possibly_unused_class','possibly_orphan_directory'] RETURN finding_type,severity,cleanup_priority,symbol_type,symbol_name,qualified_name,relative_path,directory,file_count,files,line_start,reason"
-{command_name} query "MATCH (s)-[:HAS_FINDING]->(f:StaticAnalysisFinding) RETURN s.type,s.name,f.finding_type,f.relative_path,f.line_start"
-{command_name} query "HUBS LIMIT 20"
-{command_name} query "CACHE STATUS"
-```
+- For a known path, use `{command_name} locate "path/to/file"`.
+- For owners, callers, implementation links, and tests, use `query_context --query "<terms>" --code`.
+- For missing current source, use the returned `inspect --node-id ID --limit 1` command. Reuse complete verified bodies.
+- For callers and owners, use `query_explore --query "<terms>" --view owners --view callers --view code`.
+- For graph edges, use `query_graph --query "<terms>" --max-depth 2`.
+- For custom columns, more views, or unused code, read `query-advanced.md`.
 
-Useful `WHERE` operators include `LIKE`, `ILIKE`, `REGEX` or `MATCHES`,
-`BETWEEN ... AND ...`, `IN [...]`, `IS NULL`, and `IS NOT NULL`.
+Use `--json` for structured fields: `owner_candidates`, `read_plan`, `contracts`, `impact`, and `test_targets`.
+
+Add `--source` to `--code` or `--test` when you need source bodies. This reads current files and checks their hashes against the committed revision. It returns at most three files, six regions, 120 lines, and 6,000 source characters. Overlapping regions are merged. Files larger than 4 MiB are excluded.
+
+Reuse complete verified excerpts. Read missing or truncated ranges directly. For stale or unavailable rows, check the current file directly. The graph does not refresh during this query.
+
+Keep the selected files with the task. Stop queries when the owner, effects, and tests are clear.
+
+Check base implementations, wrappers, and callers before editing. Change the behavior owner and preserve supported extension points. Avoid replacement definitions or duplicate overrides.
+"""
+    query_advanced = f"""# REQL reference: raw queries, graph relations, and unused code
+
+Read this reference for custom rows, missing relations, or unused-code checks. For ordinary queries, read `query.md`.
+
+For project records, use `query "PROJECTS"` or `query "ARTIFACTS LIMIT 20"`.
+For analysis or cache records, use `query "HUBS LIMIT 20"` or `query "CACHE STATUS"`.
+`WHERE` permits LIKE, ILIKE, REGEX/MATCHES, BETWEEN, IN, IS NULL, and IS NOT NULL.
 
 ## Raw REQL Statements
 
-Use raw `{command_name} query "..."` statements when you need deterministic rows instead of a synthesized context block. Raw queries are for verification and narrowing: exact ids, custom columns, provenance, source locations, graph relationships, cleanup candidates, cache state, or a compact table that another tool can consume.
+Use `{command_name} query "..."` for exact ids, custom columns, source locations, graph relations, findings, or cache state. These queries return rows instead of a context summary.
 
-Use `RETRIEVE ... RETURN ...` when a natural-language query is still useful but you need explicit columns:
+For text search with specific columns, use `RETRIEVE ... RETURN ...`:
 
 ```bash
 {command_name} query "RETRIEVE 'office plant' LIMIT 8 RETURN id,type,text,score,relative_path,line_start,line_end"
 {command_name} query "RETRIEVE 'payment workflow' LIMIT 8 RETURN id,type,text,score,source_for,relation,direction,relative_path,line_start"
 ```
 
-Use `FIND`, `SYMBOLS`, `FRAGMENTS`, and `MATCH` when you already know a filter, id, file, symbol, or relationship:
+For a known filter, id, file, symbol, or relation, use `FIND`, `SYMBOLS`, `FRAGMENTS`, or `MATCH`:
 
 ```bash
 {command_name} query "FIND nodes WHERE id IN [document_term:abc, document_term:def] RETURN id,type,label,text"
@@ -324,21 +335,13 @@ Use `FIND`, `SYMBOLS`, `FRAGMENTS`, and `MATCH` when you already know a filter, 
 {command_name} query "MATCH (s)-[:REFERENCES]->(t) WHERE s.relative_path = 'README.md' RETURN s.id,s.text,t.type,t.name LIMIT 20"
 ```
 
-Keep raw queries bounded: include `LIMIT`, request only the columns needed for the next decision, and include `relative_path`, `line_start`, `line_end`, `source_for`, `relation`, or `direction` when provenance matters. Prefer raw queries after `query_context`, `query_explore`, `query_memories`, or `query_graph` has surfaced ids or candidate files; do not use raw queries as a reason to scan the whole repository manually.
+Set a `LIMIT` in each raw query. Request only the columns that the task needs. For source evidence, include location or relation fields. Examples are `relative_path`, `line_start`, `line_end`, `source_for`, `relation`, and `direction`.
 
-## Free-form Query Shape
+First, use `query_context`, `query_explore`, `query_memories`, or `query_graph` to get ids or file paths. Do not use raw queries to scan the complete repository.
 
-REQL is not an LLM. It uses tokenization, lexical matching, graph links, and activation, so free-form queries work best when they include 3-8 informative terms from the user's request and nearby context. Keep the user's language instead of translating. Preserve exact identifiers, file names, commands, error messages, fields, endpoints, APIs, and symbol names when available. Avoid empty, placeholder, or context-dependent pronoun queries; rewrite them into anchored terms before querying.
+## Dependencies
 
-## Query Types
-
-- Informative: use no mode flag for project knowledge, structure, documents, architecture, existence checks, and "is there anything like X" questions. Prefer `{command_name} query_context --query "<terms from user request>"`, `{command_name} query_memories --query "<terms from user request>"`, or `{command_name} query_graph --query "<terms from user request>" --max-depth 2`. Code-scoped `query_context` renders at most eight paths with owner symbols, bounded line ranges, and associated tests; use `--json` when graph links or planning fields are needed.
-- Scope filters: use `--code`, `--docs`, and `--test` with informative or cleanup queries when the user asks for a precise section. They restrict results to code symbols/source, documentation/imported documents, or tests.
-- Cleanup: use `--cleanup` for safe-remove dead code, unused imports, unused variables, and removal candidates. Start with `{command_name} query_context --query "<terms from user request>" --cleanup`, then remove only confirmed candidates. Use the explicit `FINDINGS` query below when reviewing public API, low-confidence, test-local, or validation-required candidates.
-
-## Dependency Exploration
-
-Use `query_explore` when you already know the task target but need the surrounding dependency chain:
+For dependencies around a known target, use `query_explore`:
 
 ```bash
 {command_name} query_explore --query "<terms from user request>" --view owners --view code
@@ -349,127 +352,88 @@ Use `query_explore` when you already know the task target but need the surroundi
 {command_name} query_explore --query "<terms from user request>" --view owners --view callers --view public_surface
 ```
 
-Prefer `owners` to find implementation homes, `callers` for impact, `public_surface` before removing or renaming exported symbols, `serialization_paths` before changing model/storage fields, `docs_mentions` for documentation/examples, `structural_duplicates` for template markup refactors, and `code` for working-set and targeted read ranges.
+Select the view for the required evidence:
 
-## Answering rules
+- Use `owners` for the implementation location.
+- Use `callers` for affected consumers.
+- Before symbol removal or name changes, use `public_surface` for exported symbols.
+- Before model or storage field changes, use `serialization_paths`.
+- Use `docs_mentions` for documentation and examples.
+- Use `structural_duplicates` for repeated template markup.
+- Use `code` for file selection and source line ranges.
 
-Use graph output as evidence, not as permission to invent missing links. Cite node ids, source files, source fragments, or REQL rows when making factual claims. The checked-out source is authoritative: inspect it before edits and whenever the graph is stale, ambiguous, or incomplete.
+## Unused code
 
-Let graph queries establish a bounded discovery set, while still reading enough implementation, callers, contracts, and tests to understand the behavior being changed.
+For unused-code tasks, start with REQL findings. Do not create a second repository scanner. Check each possible removal in the current source. Public APIs, callbacks, entry points, reflection targets, and plugin hooks can have uses outside the graph.
 
-## Graph-led source inspection
+Use these steps:
 
-Start with `locate` for a known path or `query_context` for task terms. Use `query_explore`, `query_graph`, `query_memories`, `inspect`, or bounded raw REQL only when the first result leaves a specific relationship or location unresolved.
-
-Keep the working set in the task: record the owner, affected callers, contract, and test targets once, then reuse that map during implementation. Use Agent Workspace for durable task status and decisions when the work spans sessions. Its operational history complements graph evidence; it is not a copy of the project graph.
-
-After REQL returns candidate paths, symbols, owners, source fragments, or line ranges, inspect the current files for verification and implementation. If context is insufficient, make one narrower graph query or use a targeted exact-name/path search. Broad repository scans remain a last resort, but direct source inspection is part of the normal coding workflow.
-
-## Code-Scoped Workflow
-
-When the task asks for an implementation, bug fix, refactor, or behavior change:
-
-1. Build a query from the user request's own feature, behavior, file, command, error, field, endpoint, API, or symbol terms; then run `{command_name} query_context --query "<terms from user request>" --code`.
-2. For exact identifiers, legacy names, or one-off removals, try the plain shortest form first, for example `{command_name} query_context --query "graphify"`.
-3. For a clear one-file or exact-symbol edit, stop after the first sufficient result or targeted read; skip Agent Workspace and extra graph views unless ambiguity appears.
-4. Use rendered files, symbols, line ranges, and structured fields such as `owner_candidates`, `read_plan`, `change_chain`, `contracts`, `impact`, `targeted_reads`, and `test_targets` to choose the initial files and spans.
-5. Read enough surrounding implementation to understand invariants and evaluation order. Read a full file when its size or structure makes that safer than stitching together isolated spans.
-6. Run `{command_name} query_explore --query "<terms from user request>" --view owners --view code` when the context is noisy or you need owners and code slices before choosing files.
-7. If the context still lacks enough code, retrieve exact locations with `{command_name} inspect --node-id NODE_ID --json` or `{command_name} query "RETRIEVE '<terms from user request>' LIMIT 8 RETURN id,type,text,score,relative_path,line_start,line_end"`.
-8. Confirm references with a targeted exact-name/path search when dynamic use, public exports, generated code, or framework registration may not be represented in the graph.
-9. Modify the existing authoritative owner when one exists; preserve contracts and update affected consumers and tests together.
-10. If context remains broad or irrelevant after one refinement, state the evidence gap and continue with targeted source inspection instead of repeatedly querying.
-
-## Unused-Code Cleanup
-
-When the user asks to find or remove unused code, start from REQL's deterministic cleanup findings instead of inventing a new repository scanner. Use the compiled graph to collect candidates, then verify each likely removal with targeted source inspection because some symbols can be public APIs, framework callbacks, entry points, reflection targets, or dynamically referenced plugin hooks.
-
-Recommended sequence:
-
-1. Ensure project status is active or bootstrap compile has completed.
-2. Retrieve a natural-language context block with `{command_name} query_context --query "unused code dead code cleanup" --cleanup`.
-3. List concrete findings with:
+1. Check that compilation completed.
+2. Run `{command_name} query_context --query "unused code dead code cleanup" --cleanup`.
+3. List the findings:
 
 ```bash
 {command_name} query "FINDINGS WHERE finding_type IN ['unused_variable','unused_import','possibly_unused_function','possibly_unused_method','possibly_unused_class','possibly_orphan_directory'] RETURN finding_type,severity,cleanup_priority,symbol_type,symbol_name,qualified_name,relative_path,directory,file_count,files,line_start,reason,evidence_scope,confidence ORDER BY cleanup_priority LIMIT 100"
 ```
 
-4. Expand provenance for ambiguous rows with:
+4. For unclear rows, get source evidence:
 
 ```bash
 {command_name} query "MATCH (s)-[:HAS_FINDING]->(f:StaticAnalysisFinding) RETURN s.type,s.name,s.qualified_name,f.finding_type,f.relative_path,f.line_start,f.reason LIMIT 100"
 ```
 
-5. Inspect only the candidate files and nearby callers/importers. Use targeted symbol searches when needed to check entry points, tests, public exports, callbacks, dynamic `getattr`/reflection, and documentation examples.
-6. Classify results separately: safe removals, likely dead but public/API-risk, directory-level review items, and false positives. Treat `possibly_unused_function`, `possibly_unused_method`, and `possibly_unused_class` as local cleanup candidates, not whole-program proof.
+5. Check the selected files and their callers and importers. If necessary, search for entry points, tests, public exports, callbacks, reflection, and documentation examples.
+6. Separate safe removals, possible public API risks, directory checks, and incorrect findings.
 
-Prefer high-priority `unused_variable` and `unused_import` findings for direct edits. `possibly_orphan_directory` findings aggregate multiple isolated code files under one containing directory with `file_count` and `files`; validate entrypoints, plugins, scripts, dynamic imports, and external users before deleting that directory. Require stronger evidence before deleting public functions, methods, classes, scripts, generated adapters, CLI/MCP tools, or framework lifecycle methods.
+The `possibly_unused_function`, `possibly_unused_method`, and `possibly_unused_class` findings do not prove that code has no external users. First, check high-priority `unused_variable` and `unused_import` findings.
 
-## JSON mode
+The `possibly_orphan_directory` finding groups isolated code files under one directory. Its `file_count` and `files` fields identify those files. Before directory removal, check entry points, plugins, scripts, dynamic imports, and external users. Get stronger evidence before removal of public symbols, generated adapters, CLI/MCP tools, or framework lifecycle methods.
 
-Use `--json` only when another tool or script needs structured fields, when you must programmatically consume keys such as `owner_candidates`, `working_set`, `read_plan`, `change_chain`, `contracts`, `impact`, `targeted_reads`, `test_targets`, or `cleanup_candidates`, or when rendered text is ambiguous:
+"""
+    update_watch = f"""# REQL reference: graph updates and watcher problems
+
+Read this reference for graph update problems, `stale` or `unknown` watcher status, cache checks, or deltas.
+
+## Graph updates
+
+After source checks, request one safe refresh:
 
 ```bash
-{command_name} query_context --query "<terms from user request>" --code --json
-{command_name} query_graph --query "<terms from user request>" --max-depth 2 --json
-{command_name} query_explore --query "<terms from user request>" --view owners --view code --json
-{command_name} query_memories --query "<terms from user request>" --limit 8 --json
-{command_name} inspect --node-id NODE_ID --json
+{command_name} project compile --if-stopped
 ```
-"""
-    update_watch = f"""# REQL reference: update and watcher troubleshooting
 
-Load this only when post-edit refresh does not behave as expected, watcher status is `stale` or `unknown`, monitor mode or storage is non-default, cache/delta inspection is needed, or a local configuration requirement must be reported.
-
-## Diagnose post-edit refresh
-
-Check watcher state through REQL rather than querying the operating-system process table:
+This command compiles when the watcher is stopped. It leaves refresh to a running watcher. Uncertain status stops the command before graph access. For troubleshooting, inspect the watcher:
 
 ```bash
 {command_name} project watch-status --json
 ```
 
-If the result is `stopped`, refresh the graph with:
+The cache limits compilation to changed or deleted artifacts. If the watcher is `running`, let it process the file event. Do not start another compilation. For `stale` or `unknown` status, check the reported lock metadata. Use `storage locks` for lock details. Do not use `ps`, `Get-CimInstance`, or other process listings.
 
-```bash
-{command_name} project compile
-```
-
-This refreshes only changed/deleted artifacts through the incremental cache. If the watcher is `running`, allow it to process the filesystem event instead of starting another compile. For `stale` or `unknown`, inspect the reported lock metadata and use `storage locks`; do not inspect `ps`, `Get-CimInstance`, or equivalent process listings.
-
-Monitor mode and `watch-status` use the same project-local `.reql/memory.reql` store.
-
-## Final change classification
-
-Keep repository changes and machine-local setup separate in the final response:
-
-- Under `Versioned functional changes`, list only source, tests, documentation, examples, and versioned configuration templates that changed in the repository.
-- If the implementation adds a required configuration field, verify whether the user's personal `config.json` must supply it. If so, add a separate `Local configuration required` item naming the field path, the expected value or how to obtain it, and the relevant personal config location when known.
-- Never include the personal `config.json` in the versioned changed-file list. Do not edit it unless the user explicitly requested that local change.
-- If defaults, migration, or backward-compatible loading make a personal update unnecessary, state `Local configuration required: none` rather than implying manual action.
+Watch mode and `watch-status` use the same project `.reql/memory.reql` store.
 
 ## Watch mode
 
-Use watch mode when the user asked for monitoring/continuous REQL updates or a long-running background process is appropriate:
+Start watch mode only if the user asks for continuous monitoring:
 
 ```bash
 {command_name} project compile --watch
 ```
 
-The watcher performs an initial cache check, then compiles only dirty or deleted artifacts. Use bounded options for scripts and tests:
+The watcher first checks the cache. Then it compiles changed or deleted artifacts. For scripts and tests, set a limit or interval:
 
 ```bash
 {command_name} project compile --watch --watch-iterations 1
 {command_name} project compile --watch --watch-interval 2 --watch-debounce 0.5
 ```
 
-At any time, `{command_name} project watch-status` reports `running`, `stopped`, `stale`, or `unknown`, including PID and liveness when available. It reads the lock sidecar directly, so it works while the watcher owns the graph write lock.
+The `{command_name} project watch-status` command reports `running`, `stopped`, `stale`, or `unknown`. When available, it includes the PID and process status. It reads the lock sidecar directly. Thus, it can operate while the watcher holds the graph write lock.
 
-Ask before starting watch mode or `cache clear` unless the user explicitly requested that operation.
+If the user did not request `cache clear`, ask before this command.
 
 ## Cache and deltas
 
-Inspect cache state and recent compile changes with:
+Check the cache and recent compilation changes:
 
 ```bash
 {command_name} cache status
@@ -477,21 +441,21 @@ Inspect cache state and recent compile changes with:
 {command_name} query "DELTAS WHERE id = 'delta:...' LIMIT 1" --json
 ```
 
-Use `{command_name} project compile` for manual incremental refreshes as well as bootstrap and normal after-edit refreshes.
+Use `{command_name} project compile` for initial compilation and later graph updates.
 """
-    reports_exports = f"""# REQL reference: reports, graph analysis, exports, and MCP
+    reports_exports = f"""# REQL reference: reports, exports, and MCP
 
-Load this when the task needs project reports, graph analysis records, visual exports, JSON artifacts, or MCP wiring.
+Read this reference for project reports, graph analysis, exports, or MCP setup.
 
 ## Reports
 
-Write project reports with:
+Write the project reports:
 
 ```bash
 {command_name} project report --output reports/
 ```
 
-The report set includes `GRAPH_REPORT.md`, `GRAPH_DELTAS.md`, and `CACHE_REPORT.md`. Use it when the user asks for an audit-style project summary, cache/delta state, symbols, communities, or hubs.
+The output includes `GRAPH_REPORT.md`, `GRAPH_DELTAS.md`, and `CACHE_REPORT.md`. Use these reports for project summaries, cache status, deltas, symbols, communities, and hubs.
 
 ## Analysis commands
 
@@ -502,7 +466,7 @@ The report set includes `GRAPH_REPORT.md`, `GRAPH_DELTAS.md`, and `CACHE_REPORT.
 {command_name} query "EXPLAIN HUB 'NODE_ID'" --json
 ```
 
-`COMMUNITIES` and `HUBS` persist analysis records. Treat those REQL statements as write/update operations when approvals are relevant.
+The `COMMUNITIES` and `HUBS` commands save analysis records. Apply the same approval rules as for other write commands.
 
 ## Exports
 
@@ -512,7 +476,7 @@ The report set includes `GRAPH_REPORT.md`, `GRAPH_DELTAS.md`, and `CACHE_REPORT.
 {command_name} export --html --json --out reql-graph-out
 ```
 
-HTML export creates a standalone `graph.html` with embedded data, search, filters, and node inspection. JSON export writes `graph.json`.
+HTML export creates `graph.html` with embedded data, search, filters, and node details. JSON export writes `graph.json`.
 
 ## MCP
 
@@ -523,99 +487,173 @@ reql-mcp --read-only
 reql-mcp --config reql.conf --set project.id=agent-a --read-only
 ```
 
-If the `reql-mcp` console script is unavailable but the REQL Python package is
-installed, use `python -m mcp.server --read-only` (and pass the same `--config`
-or `--set` options when needed).
+If the package is installed but `reql-mcp` is unavailable, use `python -m mcp.server --read-only`. If necessary, use the same `--config` or `--set` options.
 
-Use read-only mode for context retrieval. Use write tools such as compile/watch/hubs only with the same approval discipline as the CLI commands.
+Use read-only mode for context queries. Apply CLI approval rules to write tools, such as compilation, watch mode, and hubs.
 """
     document_semantics = f"""# REQL reference: document structure
 
-Load this only when compiling documents or changing document parsing/linking behavior.
+Read this reference for document compilation or changes to document parsing and links.
 
 ## Default behavior
 
-Project compile is deterministic. Code is parsed structurally. Markdown, plain text, and PDF artifacts are registered and fragmented as source context.
+Project compilation is deterministic. REQL parses code structure. It registers Markdown, plain text, and PDF artifacts. It divides their content into source fragments.
 
-Compile projects with:
+Compile the project:
 
 ```bash
 {command_name} project compile
 ```
 
-Document fragments are linked back to source artifacts. REQL also runs a local deterministic document processor that emits ranked document terms, raw observation events, term co-occurrence edges, and code links when document text explicitly names code symbols.
+Each document fragment links to its source artifact. A local document processor creates ranked terms, raw observation events, and term co-occurrence edges. It creates code links when the text names code symbols.
 
 ## Deterministic document processor
 
-The document layer is language-agnostic and structure-agnostic. It tokenizes Unicode text locally, ranks useful terms and compact phrases, records raw `RawEvent` observations below each term, and creates `CO_OCCURS_WITH` relationships for terms seen together in a fragment.
+The document layer does not require a specific language or document structure. It splits Unicode text into tokens locally. It ranks useful terms and short phrases. It records `RawEvent` observations below each term. It creates `CO_OCCURS_WITH` relations for terms in the same fragment.
 
 The processor writes:
 
-- `Concept` nodes with `extractor: document_processor`, `rank`, `term_frequency`, `fragment_count`, and `raw_event_count`.
-- `RawEvent` nodes with the source fragment, observed term, occurrence count, rank, line range, and evidence text.
-- `MENTIONS`, `EVIDENCED_BY`, `DERIVED_FROM`, and `CO_OCCURS_WITH` edges with source provenance.
-- `REFERENCES` edges from ranked document terms to code symbols when the same compiled document fragment explicitly mentions a code symbol.
+- It writes `Concept` nodes with `extractor: document_processor`, `rank`, `term_frequency`, `fragment_count`, and `raw_event_count`.
+- It writes `RawEvent` nodes with source fragments, terms, occurrence counts, ranks, line ranges, and evidence text.
+- It writes `MENTIONS`, `EVIDENCED_BY`, `DERIVED_FROM`, and `CO_OCCURS_WITH` edges with source evidence.
+- It writes `REFERENCES` edges from document terms to code symbols that the same compiled fragment names.
 
-Do not add manual document import steps. The core compile path must remain deterministic and local.
+Do not add manual document import steps. Keep compilation deterministic and local.
+"""
+    agent_batch = f"""# REQL reference: related work records
+
+## Choose the work owner
+
+For managed parallel work, one coordinator can own the shared records. Workers use its graph-backed briefs and return actual files, checks, and blockers. They need no private sessions for that work. The coordinator reviews outcomes and writes them with observed revisions. This keeps revision, dependency, conflict, and provenance checks at the existing owner.
+
+State who owns records in each worker brief. Include the contract, source paths, relevant tests, task ids, and observed revisions. Workers retrieve only missing evidence with `project context --task ID`. Keep the host's identities unchanged. Use individual claim and finish commands when agents must continue work independently.
+
+A sufficient brief replaces another overview or plan-file read. Check current source at the supplied paths. Use overview only when direction is unknown. Read the current task when evidence is missing or revisions have changed.
+
+## Save a plan
+
+Pipe one batch for a linked plan or several related updates. Start the named session and finish after successful writes in the same command. Use the host's stdin support instead of a separate file-write command.
+
+The input is a UTF-8 JSON array of 1-40 record objects. Use a project-local file or stdin with `--file -`. Keep input files under `.reql/` to exclude them from the source graph. The file is input, not the current task status. Fields use Python API names, such as `rationale`, `record_id`, `expected_revision`, and `next_action`.
+
+PowerShell example:
+
+```powershell
+@'
+[
+  {{"ref":"goal","kind":"goal","content":"Preserve the delivery contract","key":"delivery"}},
+  {{"ref":"contract","kind":"decision","content":"Keep the wire schema","rationale":"Existing consumers","parent":{{"ref":"goal"}}}},
+  {{"ref":"backend","kind":"task","content":"Update the producer","status":"in_progress","parent":{{"ref":"goal"}},"depends_on":[{{"ref":"contract"}}],"files":["src/producer.py","tests/test_producer.py"]}},
+  {{"ref":"surface","kind":"task","content":"Update the consumer","status":"in_progress","parent":{{"ref":"goal"}},"depends_on":[{{"ref":"contract"}}],"files":["src/consumer.py","tests/test_consumer.py"]}},
+  {{"ref":"integration","kind":"task","content":"Verify integration","parent":{{"ref":"goal"}},"depends_on":[{{"ref":"backend"}},{{"ref":"surface"}}]}}
+]
+'@ | {command_name} agent batch --name "Plan delivery" --file - --finish "Contract agreed and workers assigned"
+```
+
+In Bash, supply the same array with a quoted here-document. Use `--file .reql/plan.json` for saved plans and recovery.
+
+The optional `ref` names an entry inside this batch. A reference object selects an earlier entry's id. Forward or duplicate references are errors. Existing string ids also work. Update existing records with `record_id` and `expected_revision`. Use `next_action: ""` to clear an action without shell quoting.
+
+For updates, omit unchanged `kind` and `content`. The store retains them inside the revision-checked transaction. Do not retrieve full records only to copy their text into updates. Supply a `rationale` for decisions, failures, blockers, replacements, and reopened work.
+
+Text receipts return each ref, id, kind, status, and revision. Receipts describe each applied operation. Later writes can change an earlier record. Pass task ids and revisions to workers. Include graph-backed paths and relevant tests in their handoffs. Use `--json` only for compact machine-readable receipts.
+
+Use these receipts for the handoff. Do not query all records to confirm a successful write. Read again for missing evidence, concurrent changes, or stale revisions. Check failed or partial batches before retrying.
+
+## Accept managed results
+
+For managed dispatch, set worker tasks to `in_progress` in the plan. After source review and passing integration checks, accept outcomes in dependency order. Complete worker tasks before integration, then complete the goal. Keep the worker evidence in each result's `rationale`. The coordinator records acceptance under its own identity.
+
+```powershell
+@'
+[
+  {{"record_id":"BACKEND_ID","expected_revision":1,"status":"done","rationale":"Backend worker: producer checks passed","next_action":""}},
+  {{"record_id":"SURFACE_ID","expected_revision":1,"status":"done","rationale":"Surface worker: consumer checks passed","next_action":""}},
+  {{"record_id":"INTEGRATION_ID","expected_revision":1,"status":"done","rationale":"Coordinator: integration checks passed","next_action":""}},
+  {{"record_id":"GOAL_ID","expected_revision":1,"status":"done","rationale":"Reviewed outcomes satisfy the goal","next_action":""}}
+]
+'@ | {command_name} agent batch --name "Accept delivery" --file - --finish "Verified outcomes and remaining work"
+```
+
+Use the actual ids, revisions, and observed checks. Finish returns a checkpoint receipt with its id and revision. Pass that id and needed task receipts to the next agent. Use `project context --task CHECKPOINT_ID` for recovery. It reads current linked records, not a copy of the input plan.
+
+Do not create another receipt file or handoff document to repeat these records. Save separate evidence only when it adds information absent from the records. If the user requests a handoff file, create it. Keep full test logs in files and return the summary or failing sections.
+
+Workers run focused tests. After integration, run the documented full suite once when it includes those tests. Repeat focused suites only for failures, changed dependencies, or behavior outside the full suite. Reuse a passing baseline only when its tested source and dependencies are unchanged. Do not omit checks required by repository instructions.
+
+Record blocked or failed work accurately instead of accepting it. A stale revision stops the batch with partial receipts. Reconcile current work before another attempt. Do not copy results into separate observations or public notes. One coordinator refreshes the source graph after integration.
+
+## Recover partial writes
+
+Each record uses atomic revision and dependency checks. The whole batch is not atomic. On failure, earlier successful records remain saved. The command stops and reports their receipts and the failed entry. Do not assume that finish ran after an error. Recover current state before correction.
+
+Use one result per outcome. Do not copy the same checks into observations, checkpoints, and public notes. The finish checkpoint already retains outcomes and remaining work. For assigned-task completion, use `agent finish SUMMARY --task ID --revision N` instead of several record commands.
 """
     return (
         SkillResource("agents/openai.yaml", openai_yaml),
         SkillResource("references/bootstrap.md", bootstrap),
         SkillResource("references/query.md", query),
+        SkillResource("references/query-advanced.md", query_advanced),
         SkillResource("references/update-watch.md", update_watch),
         SkillResource("references/reports-exports.md", reports_exports),
         SkillResource("references/document-semantics.md", document_semantics),
+        SkillResource("references/agent-batch.md", agent_batch),
     )
 
 
 def _agent_workspace_resource(
     *,
-    platform_name: str,
-    scope: str,
     command_name: str,
-    command_path: Path,
-    fallback_command: str,
 ) -> SkillResource:
-    usage = _command_usage(command_name=command_name, command_path=command_path, fallback_command=fallback_command)
     agent_workspace = f"""# REQL reference: Agent Workspace
 
-Load this when using `{command_name} agent` for durable task planning and coordination.
-
-## Command resolution
-
-{usage}
-
-## Mental model
-
-The compiled graph owns source facts; `.reql/agent-dashboard.reql` owns durable engineering work. Private session stores under `.reql/agents/` hold only scratch notes and session lifecycle. Shared records survive finish, reset and agent roster retention. Old private tasks/decisions/rejections migrate on resume or cleanup; already-deleted private history cannot be recovered.
-
-`project overview` needs no path or agent id. It shows bounded goals, direction, workstreams, completed/active work, blockers, failures and next ready outcomes. `project explain` drills into source-backed architecture; `project overview --details` includes full legacy history. `project context --query TERMS --file PATH --task ID --workstream NAME` ranks text/file anchors and traverses dependencies, parent goals, conflicts and replacements. Use only applicable flags. Default retrieval omits obsolete records; add `--history` to audit earlier approaches. `agent show ID --json` retrieves full evidence and the last eight revisions.
-
-## Record outcomes, not a running diary
-
-Use `agent init --name "<outcome>"` before writing. The host thread id selects the session where supported; otherwise use explicit `agent --agent ID --activity SESSION init`. Different sessions can edit the same shared work id. Query existing work first. A repeated identical record is a no-op; changed content under an existing key requires its revision. Only kind/content are needed for a simple outcome; add files, why and links when meaningful.
+For an assigned task, use its id and observed revision:
 
 ```bash
-{command_name} agent record goal "<desired outcome>" --key <stable-name>
-{command_name} agent record task "<remaining outcome>" --parent GOAL_ID --workstream <name> --file src/module.py
-{command_name} agent record decision "<chosen approach>" --why "<reason>" --parent TASK_ID
-{command_name} agent record task "<outcome>" --id TASK_ID --revision 1 --status in_progress
-{command_name} agent record question "<unresolved contract>" --parent TASK_ID --next "<how to resolve>"
-{command_name} agent record decision "<replacement>" --supersedes OLD_ID --why "<why the plan changed>"
-{command_name} agent task done TASK_ID "<what changed; checks and observed results>"
-{command_name} agent reject "<approach tried>" "<failure and why it matters>"
-{command_name} agent finish "<implemented outcome; checks; unfinished work>"
+{command_name} agent init --name "<work>" --task TASK_ID --revision N
 ```
 
-Supported kinds: goal, task, decision, constraint, failure, question, change, observation, checkpoint. States: active/open/in_progress/blocked, done/resolved, superseded/invalidated/abandoned. For blocked or obsolete work and reopening, provide `--why`. Decisions and failures always need why. `--depends-on ID` derives waiting/ready state; dependencies on replaced work require review, rather than pretending the old assumptions still hold. `--contradicts ID` exposes both sides of a conflict. Repeated link flags accept multiple ids. The Python API accepts empty lists to clear reconciled links.
+This starts the session, claims the task, and returns its current revision and scoped context. Read that context before changes. Reuse the coordinator's working set. Check current source at those paths. Retrieve only missing facts. Keep the host's agent identity and activity.
 
-On a revision conflict, reread and reconcile; do not blindly retry. Update current knowledge by id/revision. `--supersedes` atomically retires the old record and retains the reason and replacement id. When an approach changes, reconcile affected tasks explicitly. REQL flags obsolete dependencies but never assumes that old work transfers to a new approach.
+`project context --task ID` keeps complete outcome text within the shared budget. It follows replacement chains and includes current causal work. Inspect marked omissions with `agent show ID --json`. Recover the relevant contract and results once. Do not query every historical id when the supplied context is sufficient.
 
-At natural boundaries (decision, failed attempt, completed group, interruption), update affected records with relevant paths, rationale and `--next`. Finish creates a shared checkpoint containing the session's work ids, evidence paths and remaining tasks. Ending a session never completes its tasks. `agent note` is private scratch; `note --public` is a retained message, useful for announcements but not an authoritative decision or plan. Do not paste source files, broad search output, credentials or personal data into work records.
+After the owned checks pass, complete the task and close the session:
 
-Unreferenced terminal work retains the latest 200 outcomes; live work and referenced causal evidence remain. Revision history is bounded to eight versions per record. `retention.agent_sessions` bounds legacy public messages/roster only. Finish removes the private store and sidecars once no activity remains. Record useful engineering knowledge before finish; private scratch is deliberately disposable.
+```bash
+{command_name} agent finish "<result, checks, remaining work>" --task TASK_ID --revision CURRENT_N
+```
 
-Installed for: {platform_name} ({scope}).
+This saves the result, clears its next action, and returns the finish checkpoint id and revision. Pass that id for recovery instead of another handoff copy. Stale revisions or unresolved dependencies reject completion. Keep the session open for correction after an error. Do not repeat an update with a new revision without checking its meaning.
+
+For a plan or several related writes, read `agent-batch.md`. Save each outcome once. A task result and its checkpoint already retain checks. Do not add equivalent observations, checkpoints, or public notes.
+
+Use write receipts for ids and revisions. Plain `agent record` does not repeat the submitted text. Use `--json` when you need the complete saved record. Read again for missing evidence, concurrent changes, or stale revisions.
+
+For status or evidence updates, use `agent record --id ID --revision N` with the changed flags. The store retains omitted text inside the transaction. Creation and content replacement still use the kind and content arguments. Do not copy unchanged task text into updates.
+
+For read-only recovery, use `project context --task ID` or `--query TERMS --file PATH --workstream NAME`. The `project overview` command needs no path or agent id. Use `--history` for obsolete work. The `agent show ID --json` command includes the last eight revisions. Plain text omits full history.
+
+Use `agent dashboard` only for session recovery. Use explicit `agent --agent ID --activity SESSION` when the host cannot select identity safely. For work without an assignment, use `agent init --name NAME` and plain `agent finish SUMMARY`. Plain finish does not complete unfinished tasks.
+
+Kinds are goal, task, decision, constraint, failure, question, change, observation, and checkpoint. States are active/open/in_progress/blocked, done/resolved, and superseded/invalidated/abandoned. Decisions, failures, blocked or obsolete work, and reopened work need a reason.
+
+For individual updates, use the existing record id and revision:
+
+```bash
+{command_name} agent record question "<question>" --id ID --revision N --status resolved --why "<answer and evidence>" --next=
+{command_name} agent record decision "<replacement>" --supersedes OLD_ID --why "<reason>"
+{command_name} agent reject "<approach>" "<failure and reason>"
+```
+
+Use `--next=` for an empty value in every shell. PowerShell can drop a separate empty quoted argument. Replacement keeps its reason and old id. Check affected tasks before more work. Use `--depends-on ID` for prerequisites and `--contradicts ID` for conflicts.
+
+Checkpoints describe earlier work. Check current linked statuses before action. Use private notes only for temporary information. Do not paste source files, broad search output, credentials, or personal data.
+
+Workers run focused checks and report outcomes. The coordinator runs integration checks and refreshes the source graph once after integration. Read source in bounded ranges. If a tool truncates output, read the missing range instead of the same complete files.
+
+Shared records remain after finish. Finish removes the private store and sidecars when no activity remains. Active and referenced work remain. REQL keeps 200 unreferenced terminal outcomes. The `retention.agent_sessions` setting limits only public messages and the roster.
+
+Private stores contain sessions, private notes, and directed notes. Save durable work as shared records. The `agent reset` command discards private scratch and preserves shared work.
 """
     return SkillResource("references/agent-workspace.md", agent_workspace)
 
@@ -641,8 +679,8 @@ def instruction_section(
     return f"""{section_start}
 ## REQL
 
-REQL is installed ({scope}) for source context and durable engineering coordination.
-This generated section is shared by supported coding assistants: {supported_clients}.
+REQL uses {scope} installation paths for source context and shared work.
+These coding assistants use this generated section: {supported_clients}.
 
 {body}
 {section_end}
@@ -652,7 +690,7 @@ This generated section is shared by supported coding assistants: {supported_clie
 def cursor_rule(*, command_name: str, command_path: Path, fallback_command: str, section_start: str, section_end: str) -> str:
     body = _cursor_body(command_name=command_name, command_path=command_path, fallback_command=fallback_command)
     return f"""---
-description: Use REQL deterministic memory to establish bounded repository context
+description: Use REQL to find source context and save shared work.
 alwaysApply: true
 ---
 
@@ -718,7 +756,7 @@ def shared_rule_body(
     return f"""{section_start}
 # REQL
 
-Use REQL deterministic memory to establish the working set when {client_name} needs repository context.
+Use REQL to select source files when {client_name} needs repository context.
 
 {body}
 {section_end}
@@ -731,7 +769,7 @@ def _scope(project: bool) -> str:
 
 def _embedded_rule_points() -> tuple[str, ...]:
     return (
-        "For every task involving this REQL-indexed repository, use the generated `reql-agent` skill or this concise REQL rule to establish the repository working set. `/reql` also invokes it explicitly.",
+        "For each task in this REQL-indexed repository, use `reql-agent` or these rules to select source files. Use `/reql` to start the skill directly.",
         *PROJECT_SKILL_SOURCE.rule_points,
         PROJECT_SKILL_SOURCE.deterministic_requirement,
     )
@@ -739,8 +777,11 @@ def _embedded_rule_points() -> tuple[str, ...]:
 
 def _command_usage(*, command_name: str, command_path: Path, fallback_command: str) -> str:
     return (
-        f"Prefer `{command_name}` for REQL commands. If it is not on `PATH`, use the installed shim at "
-        f"`{command_path}`. If that is unavailable, use `{fallback_command}`."
+        f"Use `{command_name}` for REQL commands. If it is not on `PATH`, use the installed launcher at "
+        f"`{command_path}`. If that path is unavailable, use `{fallback_command}`.\n\n"
+        "In PowerShell, use `&` before a quoted executable path. If both saved paths are obsolete, use Python from the active REQL environment. "
+        "Run that Python with `-m memory.cli` or an absolute checkout `cli.py` path. "
+        "Keep the working directory at the project root."
     )
 
 

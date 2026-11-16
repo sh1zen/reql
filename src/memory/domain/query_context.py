@@ -54,6 +54,7 @@ class QueryContextRequest:
     scopes: frozenset[ContextScope] = field(default_factory=frozenset)
     budget: RetrievalBudget = field(default_factory=RetrievalBudget)
     include_archived: bool = False
+    include_source: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.text, str) or not self.text.strip():
@@ -69,6 +70,10 @@ class QueryContextRequest:
             raise TypeError("budget must be a RetrievalBudget")
         if not isinstance(self.include_archived, bool):
             raise TypeError("include_archived must be a bool")
+        if not isinstance(self.include_source, bool):
+            raise TypeError("include_source must be a bool")
+        if self.include_source and (not self.scopes or not self.scopes <= {"code", "test"}):
+            raise ValueError("include_source requires explicit code or test scopes without docs")
 
     @classmethod
     def from_raw(
@@ -81,6 +86,7 @@ class QueryContextRequest:
         max_depth: int = DEFAULT_MAX_DEPTH,
         max_items: int = DEFAULT_MAX_ITEMS,
         include_archived: bool = False,
+        include_source: bool = False,
     ) -> "QueryContextRequest":
         """Normalize provider primitives into the canonical typed request."""
         try:
@@ -104,6 +110,7 @@ class QueryContextRequest:
             scopes=frozenset(normalized_scopes),
             budget=RetrievalBudget(top_k=top_k, max_depth=max_depth, max_items=max_items),
             include_archived=include_archived,
+            include_source=include_source,
         )
 
 

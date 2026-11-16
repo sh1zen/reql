@@ -482,7 +482,7 @@ def _components(
             PipelineComponent(
                 id=component_id_by_key[key],
                 key=key,
-                name=_component_name(key, group, degree_by_id),
+                name=_component_name(group, degree_by_id),
                 layer=_infer_layer(key, group.paths),
                 paths=sorted(group.paths),
                 symbols=symbols,
@@ -551,7 +551,8 @@ def _component_key(node: MemoryNode) -> str:
     return f"unlocated-{node.type.casefold()}"
 
 
-def _component_name(key: str, group: _CapabilityGroup, degree_by_id: dict[str, int]) -> str:
+def _component_name(group: _CapabilityGroup, degree_by_id: dict[str, int]) -> str:
+    """Name a component using its representative path or capability."""
     if group.paths:
         path = PurePosixPath(group.paths.most_common(1)[0][0].replace("\\", "/"))
         stem = path.stem

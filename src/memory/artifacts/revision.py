@@ -113,14 +113,17 @@ class RevisionRepository:
         return revisions[0] if revisions else None
 
     def list(self, *, project_id: str | None = None, limit: int = 20) -> list[ProjectRevision]:
+        """Select the newest committed sequences before applying the caller's limit."""
         limit = max(0, limit)
+        if not limit:
+            return []
         property_name = "project_id" if project_id is not None else "kind"
         property_value = project_id if project_id is not None else "project_revision"
         nodes = self.store.find_nodes_by_property(
             property_name,
             property_value,
             type_="ProjectRevision",
-            limit=max(limit * 5, 100),
+            limit=None,
             clone=False,
         )
         revisions = [

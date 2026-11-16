@@ -95,9 +95,9 @@ retention:
   ignore matcher are discarded, so the project lists replace them completely.
   In this mode, add operational paths such as `.reql/` and `.git/` explicitly
   when they must remain excluded.
-- Default exclusions also skip the project-local generated REQL skill at
-  `.codex/skills/reql-agent/` so installing agent guidance does not add it to
-  the repository graph.
+- Default exclusions skip generated REQL bundles at `skills/reql-agent/` and
+  `skills/reql-context-compact/` at any depth, across supported agent profiles.
+  Other skills and project instructions remain eligible for indexing.
 - `scan.use_gitignore: true` loads the `.gitignore` in the compiled project
   root. Its rules are joined with protected internal ignores and the effective
   `scan.exclude` list; protected and local exclusions cannot be negated by
@@ -107,7 +107,7 @@ retention:
 - `compile.ingest_documents` is the global document-ingestion switch.
   `compile.documents` maps format names to booleans; every built-in format is
   disabled by default, and a project `reql.conf` only needs to list the formats
-  it wants to change. The protected `compile.document_formats` registry in the
+  it wants to change. The internal `compile.document_formats` registry in the
   internal `conf.yaml` maps each format to its `extensions` and optional
   `filenames`. Projects may override these definitions too. Tree-sitter is
   always used for supported code parsing. PDF
@@ -122,8 +122,9 @@ retention:
   immutable `CompilationOptions` object, including normalized typed
   `DocumentPolicy` entries. The same object drives scanning, parsing, watch
   mode, and the cache options hash.
-- `cache.enabled = false` disables incremental skip decisions. Compilation
-  still runs, but `.reql/artifact-cache.json` is not read or updated.
+- `cache.enabled = false` disables cache reuse and new successful-entry
+  writes. Compilation still reconciles deleted artifacts and invalidates their
+  existing cache entries; it can read and update cache metadata for that cleanup.
 - `analysis.enable_hubs` is respected by the MCP `reql_hubs` tool. CLI REQL
   statements such as `HUBS` and `COMMUNITIES` are explicit analysis requests
   and run when invoked.
@@ -144,8 +145,8 @@ retention:
   together; active sessions are never removed. Init, finish, and terminate enforce
   this limit and remove completed private stores independently of it.
 
-REQL never downloads parser dependencies at runtime. Project compile and
-document processing are deterministic local operations.
+Install parser dependencies before compilation; see
+[Tree-sitter dependencies](CODE_ANALYSIS.md#tree-sitter-dependencies).
 
 ## Overrides
 
@@ -174,7 +175,8 @@ scan:
 Precedence is:
 
 1. Packaged internal `conf.yaml` defaults.
-2. The nearest project `reql.conf`, or the file selected with `REQL_CONFIG`.
+2. An explicit config path, otherwise `REQL_CONFIG`, otherwise the nearest project
+   `reql.conf`.
 3. `REQL_CONFIG_OVERRIDES`.
 4. Explicit caller overrides such as MCP `config_overrides`.
 5. Command-specific flags such as `--max-file-size-mb` and `--output`.
@@ -212,8 +214,16 @@ external YAML dependency is required.
 
 Invalid sections, unknown options, or wrong value types raise a clear
 `ConfigError`.
+Quoted values preserve `#` and escaped quotes. Comments start at a separated
+`#` outside quotes. Unterminated quotes and duplicate mapping keys report the
+configuration path and line instead of silently changing a setting.
+File-size limits must be positive finite numbers. Nested and dotted caller
+overrides are merged without mutating the supplied mappings.
 
-Shared engineering work has independent lifecycle and retention;
-`retention.agent_sessions` applies only to legacy public messages and roster.
-See [Engineering coordination](COORDINATION.md) for work-record fields,
-status transitions, relation validation and bounded revisions.
+Python compilation overrides accept `CompilationOptions` or `None`.
+Build options with `CompilationOptions.from_config(config)` or
+construct typed `DocumentPolicy` entries. CLI and MCP still load `reql.conf`
+through the configuration owner.
+
+Shared work has an independent [coordination lifecycle](COORDINATION.md#retention);
+the session-retention setting above governs public messages and roster only.

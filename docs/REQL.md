@@ -41,6 +41,18 @@ These commands support `WHERE`, `LIMIT`, and `ORDER BY` where applicable. Fields
 resolve against node properties first-class, so artifact fields such as
 `artifact_type` and symbol fields such as `name` can be filtered directly.
 
+`FIND`, typed listings, and `MATCH` apply predicates and ordering to the complete
+eligible type scope before `LIMIT`. The limit controls returned rows, not a
+candidate window. Type filters and equality comparisons are case-insensitive;
+native fields, custom or nested properties, and source-span aliases share the
+same field resolution. Explicit `SYMBOLS TYPE` lists retain every requested type.
+`STATS TYPE` uses the same type matching.
+
+`LIMIT`, `TOP`, and `DEPTH` require non-negative integers; fractional numbers and
+booleans are errors. `LIMIT 0` returns no rows. Numeric comparisons and ordering
+preserve integer precision. Mixed sort values order nulls before numbers and
+numbers before text in ascending order.
+
 `WHERE` supports boolean composition with `AND`, `OR`, and `NOT`, comparison
 operators (`=`, `!=`, `>`, `>=`, `<`, `<=`), list membership with `IN`, text
 operators (`CONTAINS`, `STARTS WITH`, `ENDS WITH`, `LIKE`, `ILIKE`, `REGEX` or
@@ -69,6 +81,11 @@ List resolved function calls:
 MATCH (f:Function)-[:CALLS]->(g)
 RETURN f.name,g.name
 ```
+
+`MATCH` aliases are case-insensitive and bind only to their declared pattern
+roles. Without `RETURN`, column names use those aliases. Anonymous roles receive
+distinct aliases. Repeating a node alias requires the same node at both ends;
+an edge alias cannot also name a node. Undirected self-loops produce one row.
 
 Find imported modules:
 

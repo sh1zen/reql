@@ -33,11 +33,12 @@ from memory.analysis.hubs import HubReport
 from memory.artifacts.project import ProjectRegistry
 from memory.artifacts.revision import ProjectRevision, RevisionRepository
 from memory.artifacts.fingerprint import normalize_relative_lookup_path
-from memory.artifacts.options import CompilationOptions, RawCompilationOptions
+from memory.artifacts.options import CompilationOptions
 from memory.services.incremental_compilation import CompileProjectResult, IncrementalCompilationService
 from memory.services.project_watch import ProjectWatchEvent, ProjectWatchService
 from memory.services.query_context import QueryContextService
 from memory.services.retrieval import RetrievalEngine
+from memory.services.retrieval.context.source import capture_source_excerpts
 from memory.explanation import RepositoryExplanation, RepositoryExplanationService
 from memory.pipeline import ProjectPipeline, ProjectPipelineService
 
@@ -249,6 +250,7 @@ class MemoryGraph:
         mode: str = "informative",
         scopes: list[str] | set[str] | tuple[str, ...] | None = None,
         include_archived: bool = False,
+        include_source: bool = False,
     ) -> str:
         """Return the compact deterministic context block for a query."""
         result = self.query_context_result(
@@ -260,6 +262,7 @@ class MemoryGraph:
                 max_depth=max_depth,
                 max_items=max_items,
                 include_archived=include_archived,
+                include_source=include_source,
             )
         )
         return self.query_context_service.render(result)
@@ -280,6 +283,7 @@ class MemoryGraph:
         mode: str = "informative",
         scopes: list[str] | set[str] | tuple[str, ...] | None = None,
         include_archived: bool = False,
+        include_source: bool = False,
     ) -> dict[str, Any]:
         """Return the versioned structured query-context envelope."""
         return self.query_context_result(
@@ -291,6 +295,7 @@ class MemoryGraph:
                 max_depth=max_depth,
                 max_items=max_items,
                 include_archived=include_archived,
+                include_source=include_source,
             )
         ).to_dict()
 
@@ -438,7 +443,7 @@ class MemoryGraph:
         exclude_patterns: list[str] | None = None,
         config_path: str | Path | None = None,
         cache_enabled: bool = True,
-        parsing_options: RawCompilationOptions = None,
+        parsing_options: CompilationOptions | None = None,
     ) -> CompileProjectResult:
         return self.incremental.compile_path(
             path,
@@ -460,7 +465,7 @@ class MemoryGraph:
         exclude_patterns: list[str] | None = None,
         config_path: str | Path | None = None,
         cache_enabled: bool = True,
-        parsing_options: RawCompilationOptions = None,
+        parsing_options: CompilationOptions | None = None,
     ) -> CompileProjectResult:
         """Incrementally update a project through the compile pipeline."""
         return self.compile_project(
@@ -483,7 +488,7 @@ class MemoryGraph:
         exclude_patterns: list[str] | None = None,
         config_path: str | Path | None = None,
         cache_enabled: bool = True,
-        parsing_options: RawCompilationOptions = None,
+        parsing_options: CompilationOptions | None = None,
         interval_seconds: float = 0.5,
         debounce_seconds: float = 0.1,
         max_iterations: int | None = None,
@@ -512,7 +517,7 @@ class MemoryGraph:
         exclude_patterns: list[str] | None = None,
         config_path: str | Path | None = None,
         cache_enabled: bool = True,
-        parsing_options: RawCompilationOptions = None,
+        parsing_options: CompilationOptions | None = None,
     ) -> ProjectWatchEvent:
         """Poll once and compile dirty project artifacts when needed."""
         return self.project_watcher.poll_once(
@@ -535,7 +540,7 @@ class MemoryGraph:
         exclude_patterns: list[str] | None = None,
         config_path: str | Path | None = None,
         cache_enabled: bool = True,
-        parsing_options: RawCompilationOptions = None,
+        parsing_options: CompilationOptions | None = None,
     ) -> dict[str, object]:
         return self.incremental.cache_status(
             path,
@@ -630,10 +635,10 @@ class MemoryGraph:
         *,
         limit: int = 30,
     ) -> dict[str, Any]:
-        """Return a node, its local graph context, and source/location hints."""
+        """Return local graph evidence and a bounded current source excerpt when indexed."""
         node = self.store.get_node(node_id)
         if node is None:
-            return {"id": node_id, "found": False, "node": None, "location": None, "sources": [], "neighbors": [], "outgoing": [], "incoming": []}
+            return {"id": node_id, "found": False, "node": None, "location": None, "source_excerpt": None, "sources": [], "neighbors": [], "outgoing": [], "incoming": []}
 
         limit = max(1, int(limit))
         outgoing = self.store.get_edges(from_id=node_id, limit=limit)
@@ -650,11 +655,20 @@ class MemoryGraph:
             self._inspect_neighbor_payload(edge, adjacent.get(edge.from_id), direction="incoming")
             for edge in incoming
         )
+        location = self._location_payload(node)
+        excerpt = None
+        if location and node.properties.get("context_scope") in ("code", "test"):
+            excerpts = capture_source_excerpts(self.store, [{
+                "path": location["relative_path"], "node_id": node.id,
+                "line_start": location["line_start"], "line_end": location["line_end"],
+            }])
+            excerpt = excerpts[0] if excerpts else None
         return {
             "id": node_id,
             "found": True,
             "node": node.to_dict(),
-            "location": self._location_payload(node),
+            "location": location,
+            "source_excerpt": excerpt,
             "sources": sources,
             "neighbors": neighbors,
             "outgoing": [edge.to_dict() for edge in outgoing],

@@ -104,6 +104,7 @@ def tree_sitter_language_key(path: str, language: str | None) -> str:
 
 
 def load_tree_sitter_language(tree_sitter: Any, language: str) -> Any:
+    """Accept current grammar capsules or already constructed Language objects."""
     language_cls = getattr(tree_sitter, "Language")
     raw = _load_direct_language(language)
     if raw is None:
@@ -112,10 +113,9 @@ def load_tree_sitter_language(tree_sitter: Any, language: str) -> Any:
         raise ValueError(f"Unsupported Tree-sitter language: {language}")
     if isinstance(raw, int):
         raise ValueError("Tree-sitter integer grammar pointers are unsupported")
-    try:
-        return language_cls(raw)
-    except TypeError:
+    if isinstance(raw, language_cls):
         return raw
+    return language_cls(raw)
 
 
 def _load_direct_language(language: str) -> Any | None:

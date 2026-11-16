@@ -156,7 +156,5 @@ Unused-code cleanup candidates are materialized as `StaticAnalysisFinding`
 nodes with `evidence_scope`, `confidence`, `cleanup_priority`, and numeric
 `cleanup_rank`.
 
-Shared engineering work has independent lifecycle and retention;
-`retention.agent_sessions` applies only to legacy public messages and roster.
-See [Engineering coordination](COORDINATION.md) for work-record fields,
-status transitions, relation validation and bounded revisions.
+Shared `work_record` nodes belong to a separate store. Their fields, relations
+and lifecycle are defined in [Engineering coordination](COORDINATION.md#work-records).

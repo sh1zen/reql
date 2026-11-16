@@ -50,6 +50,7 @@ class ContextServiceMixin:
         max_items: int = 20,
         query_mode: str = "informative",
         query_scopes: Sequence[str] | None = None,
+        include_source: bool = False,
     ) -> dict[str, Any]:
         """Return compact structured agent context without duplicated rendered Markdown."""
         query_mode = self._normalize_query_context_mode(query_mode)
@@ -65,7 +66,7 @@ class ContextServiceMixin:
         if not document_scope and not exact_document_path and (
             explicit_code_scope or self._should_render_code_context(subgraph, max_items=max_items)
         ):
-            payload = self._code_agent_context_payload(subgraph, query_mode=query_mode, max_items=max_items)
+            payload = self._code_agent_context_payload(subgraph, query_mode=query_mode, max_items=max_items, include_source=include_source)
         else:
             payload = self._general_agent_context_payload(subgraph, query_mode=query_mode, max_items=max_items)
         visible_scores = (

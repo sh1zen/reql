@@ -7,17 +7,14 @@ import unittest
 from api import MemoryGraph
 from mcp.tools import MCPToolError, call_tool, list_tools
 from memory.domain.models import MemoryEdge, MemoryNode
-from memory.security import SecurityError, validate_url
 
 
 class SecurityBoundaryTests(unittest.TestCase):
-    def test_validate_url_blocks_private_and_metadata_destinations(self) -> None:
-        with self.assertRaises(SecurityError):
-            validate_url("http://169.254.169.254/latest/meta-data", allow_loopback=True)
-        with self.assertRaises(SecurityError):
-            validate_url("http://10.0.0.1/api", allow_loopback=True)
-        with self.assertRaises(SecurityError):
-            validate_url("file:///etc/passwd", allow_loopback=True)
+    def test_mcp_rejects_urls_at_the_local_storage_boundary(self) -> None:
+        """MCP storage inputs are local paths, with no outbound URL resolution."""
+        for path in ("http://169.254.169.254/latest/meta-data", "http://10.0.0.1/api", "file:///etc/passwd"):
+            with self.subTest(path=path), self.assertRaisesRegex(MCPToolError, "local filesystem path"):
+                call_tool("query_memories", {"storage_path": path, "query": "anything"})
 
     def test_mcp_rejects_storage_paths_outside_allowed_root(self) -> None:
         outside = Path.home() / "outside-reql-security-test.reql"

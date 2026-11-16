@@ -87,6 +87,7 @@ KEYWORDS = {
 }
 
 PUNCTUATION = {"(", ")", "[", "]", ",", ":", ".", "*", ";", "-", "|"}
+_STRING_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", "'": "'", '"': '"'}
 
 
 def tokenize_reql(source: str) -> list[Token]:
@@ -98,11 +99,7 @@ def tokenize_reql(source: str) -> list[Token]:
         if ch.isspace():
             i += 1
             continue
-        if ch == "#":
-            while i < length and source[i] != "\n":
-                i += 1
-            continue
-        if source.startswith("//", i):
+        if ch == "#" or source.startswith("//", i):
             while i < length and source[i] != "\n":
                 i += 1
             continue
@@ -130,8 +127,7 @@ def tokenize_reql(source: str) -> list[Token]:
                     if i >= length:
                         raise REQLSyntaxError(f"Unterminated escape sequence at position {start}")
                     esc = source[i]
-                    mapping = {"n": "\n", "t": "\t", "r": "\r", "\\": "\\", "'": "'", '"': '"'}
-                    chars.append(mapping.get(esc, esc))
+                    chars.append(_STRING_ESCAPES.get(esc, esc))
                     i += 1
                     continue
                 if c == quote:

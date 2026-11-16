@@ -15,7 +15,8 @@ except ImportError:  # pragma: no cover - exercised in environments without opti
     Observer = None  # type: ignore[assignment]
 
 from ..domain.timeutils import utcnow_iso
-from ..artifacts.options import RawCompilationOptions
+from ..freshness import watch_state_path
+from ..artifacts.options import CompilationOptions
 from .incremental_compilation import CompileProjectResult, IncrementalCompilationService
 
 
@@ -67,7 +68,7 @@ class ProjectWatchService:
         exclude_patterns: list[str] | None = None,
         config_path: str | Path | None = None,
         cache_enabled: bool = True,
-        parsing_options: RawCompilationOptions = None,
+        parsing_options: CompilationOptions | None = None,
         interval_seconds: float = 0.5,
         debounce_seconds: float = 0.1,
         max_iterations: int | None = None,
@@ -86,8 +87,13 @@ class ProjectWatchService:
         root = Path(path).expanduser().resolve(strict=False)
         change_event = Event()
         observer = Observer()
+        profile = self.incremental.profile_logger
         observer.schedule(
-            _WatchdogChangeHandler(change_event, ignored_paths=self._internal_watch_paths(root)),
+            _WatchdogChangeHandler(
+                change_event, ignored_paths=(root / ".reql",),
+                storage_path=getattr(self.incremental.store, "path", None),
+                diagnostics_path=profile.path if profile is not None else None,
+            ),
             str(root),
             recursive=True,
         )
@@ -145,7 +151,7 @@ class ProjectWatchService:
         exclude_patterns: list[str] | None = None,
         config_path: str | Path | None = None,
         cache_enabled: bool = True,
-        parsing_options: RawCompilationOptions = None,
+        parsing_options: CompilationOptions | None = None,
     ) -> ProjectWatchEvent:
         return self._poll_once(
             path,
@@ -172,7 +178,7 @@ class ProjectWatchService:
         exclude_patterns: list[str] | None,
         config_path: str | Path | None,
         cache_enabled: bool,
-        parsing_options: RawCompilationOptions,
+        parsing_options: CompilationOptions | None,
         debounce_seconds: float,
         sleeper: SleepFn,
     ) -> ProjectWatchEvent:
@@ -207,25 +213,6 @@ class ProjectWatchService:
             errors=errors,
         )
 
-    def _internal_watch_paths(self, root: Path) -> tuple[Path, ...]:
-        paths = {root / ".reql"}
-        store_path = getattr(self.incremental.store, "path", None)
-        if store_path is not None:
-            storage = Path(store_path).expanduser().resolve(strict=False)
-            paths.update(
-                {
-                    storage,
-                    storage.with_name(f"{storage.name}.wal"),
-                    storage.with_name(f"{storage.name}.lock"),
-                    storage.with_name(f"{storage.name}.readers"),
-                    storage.with_name(f"{storage.name}.usage.jsonl"),
-                }
-            )
-        profile = self.incremental.profile_logger
-        if profile is not None:
-            paths.add(profile.path)
-        return tuple(sorted(paths, key=lambda item: str(item).casefold()))
-
 
 class _WatchdogChangeHandler(FileSystemEventHandler):
     def __init__(
@@ -233,14 +220,34 @@ class _WatchdogChangeHandler(FileSystemEventHandler):
         changed: Event,
         *,
         ignored_paths: tuple[Path, ...] = (),
+        storage_path: str | Path | None = None,
+        diagnostics_path: str | Path | None = None,
         on_change: ChangeFn | None = None,
     ) -> None:
+        """Own the operational output policy shared by API, CLI, and MCP watchers."""
         super().__init__()
         self.changed = changed
-        self.ignored_paths = tuple(path.expanduser().resolve(strict=False) for path in ignored_paths)
+        paths = set(ignored_paths)
+        self.storage_path = Path(storage_path).expanduser().resolve(strict=False) if storage_path is not None else None
+        if self.storage_path is not None:
+            storage = self.storage_path
+            paths.add(storage)
+            paths.update(storage.with_name(f"{storage.name}{suffix}") for suffix in (
+                ".wal", ".tmp", ".lock", ".readers", ".usage.jsonl", ".usage.jsonl.lock", ".watch.lock",
+            ))
+            paths.add(watch_state_path(storage))
+        if diagnostics_path is not None:
+            paths.add(Path(diagnostics_path))
+        self.ignored_paths = tuple(path.expanduser().resolve(strict=False) for path in paths)
         self.on_change = on_change
 
     def on_any_event(self, event: object) -> None:
+        """Signal tree changes while ignoring reads and redundant parent notifications."""
+        kind = getattr(event, "event_type", None)
+        if kind not in {"created", "deleted", "modified", "moved", "closed"}:
+            return
+        if kind == "modified" and getattr(event, "is_directory", False):
+            return
         event_paths = [
             Path(value).expanduser().resolve(strict=False)
             for attribute in ("src_path", "dest_path")
@@ -253,4 +260,12 @@ class _WatchdogChangeHandler(FileSystemEventHandler):
             self.on_change()
 
     def _is_ignored(self, path: Path) -> bool:
-        return any(path == ignored or path.is_relative_to(ignored) for ignored in self.ignored_paths)
+        """Include atomic state-write and usage-pruning files in their owned namespaces."""
+        if any(path == ignored or path.is_relative_to(ignored) for ignored in self.ignored_paths):
+            return True
+        storage = self.storage_path
+        if storage is None or path.parent != storage.parent:
+            return False
+        return (
+            path.name.startswith(f"{watch_state_path(storage).name}.") and path.name.endswith(".tmp")
+        ) or path.name.startswith(f".{storage.name}.usage.jsonl.prune-")

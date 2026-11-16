@@ -11,7 +11,7 @@ from pathlib import Path, PurePosixPath
 import re
 import hashlib
 import json
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 from memory.domain.ids import stable_id
 from memory.domain.models import MemoryNode
@@ -21,6 +21,7 @@ from memory.extraction.normalization import tokenize
 
 KINDS = frozenset({"goal", "task", "decision", "constraint", "failure", "question", "change", "observation", "checkpoint"})
 STATUSES = frozenset({"active", "open", "in_progress", "blocked", "done", "resolved", "superseded", "invalidated", "abandoned"})
+OBSOLETE_STATUSES = frozenset({"superseded", "invalidated", "abandoned"})
 TERMINAL = frozenset({"done", "resolved", "superseded", "invalidated", "abandoned"})
 RELATIONS = ("parent", "depends_on", "contradicts", "supersedes", "summarizes")
 RECORD_TYPE = "work_record"
@@ -84,7 +85,7 @@ class CoordinationStore:
                 "created_at": node.created_at, "updated_at": node.updated_at}
 
     def put(
-        self, kind: str, content: str, *, agent_id: str, session_id: str | None,
+        self, kind: str | None = None, content: str | None = None, *, agent_id: str, session_id: str | None,
         session_title: str = "", key: str | None = None, record_id: str | None = None,
         expected_revision: int | None = None, status: str | None = None,
         rationale: str | None = None, files: list[str] | None = None,
@@ -96,17 +97,21 @@ class CoordinationStore:
     ) -> dict[str, Any]:
         """Upsert one identity atomically; reject stale revisions and invalid links.
 
-        Omitted fields survive updates. An explicit empty list clears a relation.
+        Omitted fields, including kind/content, survive updates by id and revision.
+        Creation requires kind/content. An explicit empty list clears a relation.
         Updating by id requires a revision, preventing silent cross-agent overwrite.
         """
-        if not isinstance(kind, str) or not isinstance(content, str):
+        if (kind is not None and not isinstance(kind, str)) or (content is not None and not isinstance(content, str)):
             raise ValueError("Record kind and content must be strings")
         if not isinstance(agent_id, str) or not agent_id.strip():
             raise ValueError("Record needs a nonempty agent identity")
+        if record_id is not None and (not isinstance(record_id, str) or not record_id.strip()):
+            raise ValueError("Assigned record id must be a nonempty string")
         if expected_revision is not None and (type(expected_revision) is not int or expected_revision < 0):
             raise ValueError("Expected revision must be a nonnegative integer")
-        kind, content = kind.strip().casefold(), content.strip()
-        if kind not in KINDS or not content or len(content) > 4000:
+        kind = kind.strip().casefold() if kind is not None else None
+        content = content.strip() if content is not None else None
+        if (kind is not None and kind not in KINDS) or (content is not None and (not content or len(content) > 4000)):
             raise ValueError("Record needs a supported kind and 1-4000 characters of content")
         if record_id and expected_revision is None:
             raise ValueError("Updating by id requires expected_revision; read agent show first")
@@ -128,13 +133,24 @@ class CoordinationStore:
         contradicts = list(dict.fromkeys(contradicts)) if contradicts is not None else None
         supersedes = list(dict.fromkeys(supersedes)) if supersedes is not None else None
         summarizes = list(dict.fromkeys(summarizes)) if summarizes is not None else None
-        with self._open() as store, store.transaction():
+        partial = kind is None or content is None
+        if record_id is None:
+            if kind is None or content is None:
+                raise ValueError("Creating work requires kind and content")
             implicit_key = (parent + "\n" if parent else "") + " ".join(content.casefold().split())
             identity = stable_id("work", kind, workstream or "", key or implicit_key)
-            node = store.get_node(record_id or identity)
+        else:
+            identity = record_id
+        with self._open() as store, store.transaction():
+            node = store.get_node(identity)
             if record_id and (node is None or node.type != RECORD_TYPE):
                 raise ValueError(f"Work record not found: {record_id}")
             old = dict(node.properties) if node else {}
+            if partial:
+                kind = old.get("kind") if kind is None else kind
+                content = old.get("content") if content is None else content
+                if not isinstance(kind, str) or not isinstance(content, str):
+                    raise ValueError("Stored work record has invalid kind or content")
             if old:
                 old.setdefault("summarizes", [])
             if old and old["kind"] != kind:
@@ -173,7 +189,7 @@ class CoordinationStore:
                         raise ValueError(f"Already superseded: {target}; reconcile its current replacement {records[target]['replaced_by']}")
             records[item_id] = props
             self._validate_cycles(records, item_id, store=store)
-            if kind == "task" and props["status"] == "done":
+            if kind == "task" and props["status"] in {"done", "resolved"}:
                 # Completion depends on incoming conflicts as well as direct
                 # links, so it still requires the complete consistent snapshot.
                 records = {n.id: n.properties for n in store.find_nodes_by_types([RECORD_TYPE], clone=False)}
@@ -183,7 +199,11 @@ class CoordinationStore:
                     raise ValueError("Cannot complete task with waiting, obsolete or conflicting dependencies")
             changed = {name: value for name, value in props.items() if name not in {"history", "revision", "agent_id", "session_id", "session_title", "activity_id"}}
             previous = {name: value for name, value in old.items() if name in changed}
-            if node and changed == previous:
+            # Claiming active work transfers responsibility even when its text/status
+            # are unchanged. Ordinary repeated records retain their idempotence.
+            ownership_changed = record_id is not None and kind == "task" and status == "in_progress" and (
+                old.get("agent_id") != agent_id or old.get("session_id") != session_id)
+            if node and changed == previous and not ownership_changed:
                 return {"created": False, "changed": False, "node": self._payload(node)}
             if node and expected_revision is None:
                 raise ValueError(f"Record already exists: {node.id}; update with its revision")
@@ -238,42 +258,21 @@ class CoordinationStore:
                 visited.add(item_id)
             visit(start)
 
-    def show(self, record_id: str) -> dict[str, Any]:
-        """Retrieve a full record and its bounded revision evidence."""
+    def find(self, record_id: str) -> dict[str, Any] | None:
+        """Find one shared identity without scanning work or creating an absent store."""
         if self.path.exists() and self.path.stat().st_size:
             with self._open(read_only=True) as store:
                 node = store.get_node(record_id)
                 if node is not None and node.type == RECORD_TYPE:
                     return self._payload(node)
-        raise ValueError(f"Work record not found: {record_id}")
+        return None
 
-    @classmethod
-    def migrate(cls, target: BlockGraphStore, nodes: list[MemoryNode], agent_id: str) -> list[str]:
-        """Move legacy operational records, preserving ids and their provenance."""
-        moved = []
-        with target.transaction():
-            for node in nodes:
-                kind = {"rejected_approach": "failure", "finding": "observation"}.get(node.type, node.type)
-                if kind not in KINDS:
-                    continue
-                if target.get_node(node.id) is None:
-                    metadata = node.properties.get("metadata") or {}
-                    props = {"kind": kind, "content": node.properties.get("content") or node.text or node.label,
-                             "title": node.label, "status": node.status, "rationale": metadata.get("reason", ""),
-                             "files": [], "workstream": "", "parent": "", "depends_on": [], "contradicts": [],
-                             "supersedes": [], "summarizes": [], "next_action": "", "importance": 2, "revision": 1, "history": [],
-                             "agent_id": agent_id, "origin_agent_id": agent_id,
-                             "session_id": node.properties.get("session_id"), "session_title": node.properties.get("session_title"),
-                             "legacy": True}
-                    if node.type == "rejected_approach":
-                        props["status"] = "active"
-                    if node.status == "done":
-                        props["rationale"] = node.properties.get("completion_message", "")
-                    target.upsert_node(MemoryNode(id=node.id, type=RECORD_TYPE, canonical_key=node.id,
-                                                 label=node.label, text=node.text, properties=props,
-                                                 created_at=node.created_at, updated_at=node.updated_at))
-                moved.append(node.id)
-        return moved
+    def show(self, record_id: str) -> dict[str, Any]:
+        """Retrieve a full record and its bounded revision evidence."""
+        result = self.find(record_id)
+        if result is not None:
+            return result
+        raise ValueError(f"Work record not found: {record_id}")
 
     @staticmethod
     def _conflict_index(records: dict[str, dict[str, Any]]) -> dict[str, set[str]]:
@@ -300,9 +299,8 @@ class CoordinationStore:
                 obsolete.append(target)
             elif dependency["kind"] in {"task", "goal", "question"} and dependency["status"] not in {"done", "resolved"}:
                 waiting.append(target)
-            if dependency is not None and dependency["status"] not in TERMINAL:
-                if conflicts_by_id.get(target):
-                    obsolete.append(target)
+            if dependency is not None and dependency["status"] not in TERMINAL and conflicts_by_id.get(target):
+                obsolete.append(target)
         conflicts = conflicts_by_id.get(item["id"], set())
         state = item["status"]
         if state not in TERMINAL:
@@ -311,70 +309,121 @@ class CoordinationStore:
 
     def context(self, query: str = "", *, files: list[str] | None = None, workstream: str | None = None,
                 record_id: str | None = None, limit: int = 8, include_history: bool = False) -> dict[str, Any]:
-        """Rank lexical/file anchors, then expand two causal hops under a hard budget."""
+        """Prioritize current file contracts and causal prerequisites within bounded recovery."""
         if not 1 <= limit <= 40:
             raise ValueError("Context limit must be between 1 and 40")
         all_records = self.records()
         records = {item["id"]: item for item in all_records}
         conflicts_by_id = self._conflict_index(records)
+        incoming: dict[str, dict[str, set[str]]] = {relation: defaultdict(set) for relation in RELATIONS}
+        for item in all_records:
+            for relation in RELATIONS:
+                targets = [item[relation]] if relation == "parent" and item[relation] else ([] if relation == "parent" else item[relation])
+                for target in targets:
+                    incoming[relation][target].add(item["id"])
         if record_id and record_id not in records:
             raise ValueError(f"Work record not found: {record_id}")
+        anchor = records.get(record_id) if include_history else self._current_replacement(records, record_id)
+        anchor_id = anchor["id"] if anchor is not None else record_id
         tokens = _tokens(query)
         paths = _paths(files or [])
-        words = {item["id"]: _tokens(" ".join([item["content"], item["rationale"], item["next_action"], item["workstream"], *item["files"]])) for item in all_records}
+        # A known identity recovers linked work, not lexical matches in the backlog.
+        eligible = [item for item in all_records
+                    if (not record_id or item["id"] == anchor_id)
+                    and (workstream is None or item["workstream"] == workstream)
+                    and (include_history or item["status"] not in OBSOLETE_STATUSES)]
+        words = {item["id"]: _tokens(" ".join([item["content"], item["rationale"], item["next_action"], item["workstream"], *item["files"]])) for item in eligible} if tokens and not record_id else {}
         frequency = Counter(term for terms in words.values() for term in terms)
         denominator = sum(1 / frequency.get(term, 1) for term in tokens) or 1
         now = parse_dt(utcnow_iso())
         scores: dict[str, float] = {}
         reasons: dict[str, list[str]] = {}
-        for item in all_records:
-            if workstream is not None and item["workstream"] != workstream:
-                continue
-            if not include_history and item["status"] in {"superseded", "invalidated", "abandoned"}:
-                continue
-            overlap = sum(1 / frequency[term] for term in tokens & words[item["id"]]) / denominator
+        for item in eligible:
+            overlap = sum(1 / frequency[term] for term in tokens & words[item["id"]]) / denominator if words else 0.0
             path_match = any(path == evidence or path.startswith(evidence + "/") or evidence.startswith(path + "/") for path in paths for evidence in item["files"])
             anchors = []
             if overlap:
                 anchors.append("text")
             if path_match:
                 anchors.append("file")
-            if record_id == item["id"]:
+            if anchor_id == item["id"]:
                 anchors.append("task")
+                if anchor_id != record_id:
+                    anchors.append(f"replacement:{record_id}")
             if not tokens and not paths and not record_id:
                 anchors.append("overview")
             if not anchors:
                 continue
             age = max(0, (now.date() - parse_dt(item["updated_at"]).date()).days)
             priority = 0.18 if item["kind"] in {"decision", "constraint", "failure", "goal", "question"} else 0
-            score = overlap * 2 + path_match * 3 + (record_id == item["id"]) * 4 + priority + item["importance"] * 0.05 + 0.1 / (1 + age)
+            score = overlap * 2 + path_match * 3 + (anchor_id == item["id"]) * 4 + priority + item["importance"] * 0.05 + 0.1 / (1 + age)
             if item["status"] not in TERMINAL:
-                score += 0.25
+                # A current file-scoped obligation outranks even an exact lexical
+                # match in a completed summary for that file. History stays available.
+                score += 3 if path_match else 0.25
             scores[item["id"]], reasons[item["id"]] = score, anchors
         frontier = sorted(scores, key=lambda item_id: (-scores[item_id], item_id))[:4]
-        # Parents/goals orient a task but do not fan out into all sibling work.
-        for _ in range(2):
+        seed_ids = set(frontier)
+        expanded = set(frontier)
+        omitted_ids: set[str] = set()
+        expansion_truncated = False
+        # Inspect dependents/children of direct matches, not every shared prerequisite
+        # reached along the way: otherwise one contract broadcasts unrelated lanes.
+        for depth in range(2):
             next_frontier = []
             for item_id in frontier:
                 item = records[item_id]
-                related = set(item["depends_on"] + item["contradicts"] + item["summarizes"] + ([item["parent"]] if item["parent"] else []))
-                related.update(other["id"] for other in all_records if item_id in other["depends_on"] or item_id in other["contradicts"])
-                related.update(other["id"] for other in all_records if item_id in other["summarizes"])
-                related.update(other["id"] for other in all_records if item_id in other["supersedes"])
-                if item["kind"] == "task":
-                    related.update(other["id"] for other in all_records if other["parent"] == item_id)
+                # Preconditions and conflicts must reach the handoff before the
+                # potentially numerous consumers and historical summaries.
+                related = {target: 0.9 for target in item["depends_on"] + item["contradicts"]}
+                related.update({target: 0.9 for target in incoming["contradicts"].get(item_id, ())})
+                related.update({target: 0.9 for target in incoming["supersedes"].get(item_id, ())})
+                if item["parent"]:
+                    related.setdefault(item["parent"], 0.75)
+                for target in item["summarizes"]:
+                    related.setdefault(target, 0.65)
+                if item_id in seed_ids:
+                    dependency_anchors = {item_id}
+                    if item_id == anchor_id and record_id:
+                        dependency_anchors.add(record_id)
+                    for dependency_anchor in dependency_anchors:
+                        for target in incoming["depends_on"].get(dependency_anchor, ()):
+                            related.setdefault(target, 0.45)
+                for target in incoming["summarizes"].get(item_id, ()):
+                    related.setdefault(target, 0.35)
+                if item_id in seed_ids and item["kind"] == "task":
+                    for target in incoming["parent"].get(item_id, ()):
+                        related.setdefault(target, 0.65)
                 if include_history:
-                    related.update(item["supersedes"])
-                for target in sorted(related):
-                    if len(scores) >= 80:
-                        break
-                    candidate = records.get(target)
-                    if candidate is None or (not include_history and candidate["status"] in {"superseded", "invalidated", "abandoned"}):
+                    for target in item["supersedes"]:
+                        related.setdefault(target, 0.65)
+                for target in sorted(related, key=lambda target: (-related[target], target)):
+                    relation_score = scores[item_id] * related[target]
+                    candidate = records.get(target) if include_history else self._current_replacement(records, target)
+                    if candidate is None:
                         continue
-                    if target not in scores:
-                        scores[target], reasons[target] = scores[item_id] * 0.65, [f"related:{item_id}"]
+                    relation_reason = [f"related:{item_id}"]
+                    if candidate["id"] != target:
+                        relation_reason.append(f"replacement:{target}")
+                    target = candidate["id"]
+                    # Reserve half the traversal for second-hop assumptions and
+                    # conflicts, rather than exhausting it on direct fanout.
+                    if target not in expanded and len(expanded) >= 40 * (depth + 1):
+                        expansion_truncated = True
+                        if target not in scores:
+                            omitted_ids.add(target)
+                        continue
+                    if target not in expanded:
+                        expanded.add(target)
                         next_frontier.append(target)
-            frontier = next_frontier[:12]
+                    if target not in scores:
+                        scores[target], reasons[target] = relation_score, relation_reason
+                    else:
+                        scores[target] = max(scores[target], relation_score)
+                        reasons[target].extend(reason for reason in relation_reason if reason not in reasons[target])
+            if len(next_frontier) > 12:
+                expansion_truncated = True
+            frontier = sorted(next_frontier, key=lambda target: (-scores[target], target))[:12]
         ranked = sorted(scores, key=lambda item_id: (-scores[item_id], records[item_id]["updated_at"], item_id))
         selected = []
         for item_id in ranked[:limit]:
@@ -385,8 +434,22 @@ class CoordinationStore:
             compact.update(self._execution(item, records, conflicts_by_id), score=round(scores[item_id], 4), reasons=reasons[item_id])
             selected.append(compact)
         revision = hashlib.sha256(json.dumps(selected, sort_keys=True, ensure_ascii=True).encode()).hexdigest()
+        total_matches = len(ranked) + len(omitted_ids - scores.keys())
         return {"format": "reql-work-context-v1", "revision": revision, "query": query, "records": selected,
-                "total_matches": len(ranked), "omitted": max(0, len(ranked) - limit)}
+                "total_matches": total_matches, "omitted": max(0, total_matches - limit),
+                "expansion_truncated": expansion_truncated}
+
+    @staticmethod
+    def _current_replacement(records: dict[str, dict[str, Any]], record_id: str | None) -> dict[str, Any] | None:
+        """Follow explicit replacements without reviving obsolete work or changing links."""
+        visited: set[str] = set()
+        while record_id and record_id not in visited:
+            visited.add(record_id)
+            item = records.get(record_id)
+            if item is None or item["status"] not in OBSOLETE_STATUSES:
+                return item
+            record_id = item.get("replaced_by")
+        return None
 
     def overview(self, *, limit: int = 5) -> dict[str, Any]:
         """Project direction and execution from authoritative current records."""
@@ -446,27 +509,167 @@ class CoordinationStore:
             return len(expired)
 
 
-def render_work_context(payload: dict[str, Any], *, max_chars: int = 6000) -> str:
-    """Render bounded work context with ids for evidence/history drill-down."""
-    rows = ["## Engineering context"]
-    for item in payload.get("records", []):
-        line = f"- [{item['kind']}/{item['execution_state']}] {item['content'][:360]} ({item['id']}, r{item['revision']}, {item['agent_id']})"
-        if item["rationale"]:
-            line += f" — Why: {item['rationale'][:240]}"
-        if item["files"]:
-            line += "; files: " + ", ".join(item["files"][:4])
-        if item["next_action"]:
-            line += f"; next: {item['next_action'][:200]}"
-        if item.get("waiting_on"):
-            line += "; waiting: " + ", ".join(item["waiting_on"])
-        if item.get("obsolete_dependencies") or item.get("conflicts"):
-            line += "; reconcile: " + ", ".join(item.get("obsolete_dependencies", []) + item.get("conflicts", []))
-        if item["supersedes"]:
-            line += "; replaces: " + ", ".join(item["supersedes"])
-        if sum(len(row) + 1 for row in rows) + len(line) > max_chars:
-            rows.append("- More evidence available via agent show or project context --json.")
-            break
-        rows.append(line)
-    if not payload.get("records"):
-        rows.append("No matching engineering records.")
-    return "\n".join(rows)[:max_chars]
+def render_work_context(payload: dict[str, Any], *, max_chars: int = 6000, record_id: str | None = None) -> str:
+    """Render one independent response with bounded evidence and explicit omissions."""
+    return _WorkContextRenderer(payload.get("records", [])).render(payload, max_chars=max_chars, record_id=record_id)
+
+
+def render_work_overview(payload: dict[str, Any], *, max_chars_per_section: int = 1200) -> str:
+    """Render section membership while sharing only evidence already emitted in this overview."""
+    renderer = _WorkContextRenderer(item for items in payload["sections"].values() for item in items)
+    sections = []
+    for label, items in payload["sections"].items():
+        title = label.title()
+        count = payload["counts"][label]
+        text = renderer.render({"records": items, "omitted": max(0, count - len(items))},
+                               max_chars=max_chars_per_section, section=title, heading=False)
+        sections.append(f"### {title} ({count})\n{text}")
+    return "\n\n".join(sections)
+
+
+class _WorkContextRenderer:
+    """Own references to emitted text for one context response or composite overview."""
+
+    def __init__(self, records: Iterable[dict[str, Any]]) -> None:
+        """Start independent reference state without retaining prior responses."""
+        self.texts: dict[str, tuple[str, str, int]] = {}
+        self.records: dict[tuple[str, int], tuple[dict[str, Any], str, bool]] = {}
+        owners: dict[str, set[tuple[str, int]]] = defaultdict(set)
+        for item in records:
+            owners[item["agent_id"]].add((item["id"], item["revision"]))
+        self.owner_aliases: dict[str, str] = {}
+        alias_number = 1
+        for owner, identities in owners.items():
+            alias = f"owner{alias_number}"
+            while alias in owners:
+                alias_number += 1
+                alias = f"owner{alias_number}"
+            # Count the declaration once and every reference, including the first.
+            if len(identities) * len(owner) > len(owner) + 1 + len(identities) * len(alias):
+                self.owner_aliases[owner] = alias
+                alias_number += 1
+        self.declared_owners: set[str] = set()
+
+    def render(self, payload: dict[str, Any], *, max_chars: int = 6000, record_id: str | None = None,
+               section: str | None = None, heading: bool = True) -> str:
+        """Render full focused evidence when it fits, with explicit omissions and drill-down."""
+        if type(max_chars) is not int or max_chars < 1:
+            raise ValueError("Work context character budget must be a positive integer")
+        rows = ["## Engineering context"] if heading else []
+        records = list(payload.get("records", []))
+
+        def focused(item: dict[str, Any]) -> bool:
+            """Keep the requested outcome or its current replacement ahead of neighbors."""
+            return bool(record_id and (item["id"] == record_id or f"replacement:{record_id}" in item.get("reasons", [])))
+
+        records.sort(key=lambda item: not focused(item))
+        detailed = bool(record_id)
+        used = len(rows[0]) if rows else 0
+        rendered = 0
+        # Reserve one omission message before adding prose so it cannot be cut off.
+        footer_budget = 200 if payload.get("expansion_truncated") else 100
+        for item in records:
+            remaining = max_chars - used - footer_budget - 1
+            owner = item["agent_id"]
+            alias = self.owner_aliases.get(owner)
+            attribution = (alias if owner in self.declared_owners else f"{alias}={owner}") if alias else owner
+            header = f"- [{item['kind']}/{item['execution_state']}] {item['id']} r{item['revision']} ({attribution})"
+            identity = (item["id"], item["revision"])
+            previous = self.records.get(identity)
+            if previous is not None and previous[0] == item:
+                line = f"- [{item['kind']}/{item['execution_state']}] {item['id']} r{item['revision']}; see {previous[1]} above"
+                if previous[2]:
+                    line += " (truncated there)"
+                if len(line) > remaining:
+                    break
+                rows.append(line)
+                used += len(line) + 1
+                rendered += 1
+                continue
+            core = header
+            links = [("waiting", item.get("waiting_on", [])),
+                     ("reconcile", item.get("obsolete_dependencies", []) + item.get("conflicts", [])),
+                     ("replaces", item["supersedes"])]
+            if detailed:
+                links.extend((("parent", [item["parent"]] if item.get("parent") else []),
+                              ("depends", item.get("depends_on", []))))
+            if item.get("replaced_by"):
+                links.append(("replaced_by", [item["replaced_by"]]))
+            replacements = [reason.removeprefix("replacement:") for reason in item.get("reasons", [])
+                            if reason.startswith("replacement:")]
+            if replacements:
+                links.append(("replacement for", replacements))
+            roles: dict[str, list[str]] = {}
+            for label, targets in links:
+                for target in dict.fromkeys(targets):
+                    roles.setdefault(target, []).append(label)
+            groups: dict[str, list[str]] = {}
+            for target, labels in roles.items():
+                groups.setdefault("+".join(labels), []).append(target)
+            for label, targets in groups.items():
+                core += f"; {label}: " + ", ".join(targets)
+
+            truncated = False
+            details = []
+            available = dict(self.texts)
+            location = f"{section} item {rendered + 1}" if section else f"item {rendered + 1}"
+            fields = (("", "content", item["content"], 360), ("next", "next", item["next_action"], 200),
+                      ("Why", "rationale", item["rationale"], 240),
+                      ("Replacement reason", "replacement reason", item.get("replacement_reason", ""), 240))
+            for label, field, value, cap in fields:
+                if not value:
+                    continue
+                visible = len(value) if detailed else min(len(value), cap)
+                incomplete = visible < len(value)
+                display = value[:visible] + ("... [truncated]" if incomplete else "")
+                reference = available.get(value)
+                if reference is not None and reference[2] >= visible:
+                    source_location, source_field, coverage = reference
+                    pointer = f"same as {source_field} above" if source_location == location else f"same as {source_location} {source_field} above"
+                    if coverage < len(value):
+                        pointer += " [truncated]"
+                    if len(pointer) < len(display):
+                        display = pointer
+                        incomplete = coverage < len(value)
+                if reference is None or reference[2] < visible:
+                    available[value] = (location, field, visible)
+                truncated = truncated or incomplete
+                details.append(f"{label}: {display}" if label else display)
+            files = item["files"] if detailed else item["files"][:4]
+            if files:
+                details.append("files: " + ", ".join(files))
+            if len(files) < len(item["files"]):
+                details.append(f"{len(item['files']) - len(files)} files omitted [truncated]")
+                truncated = True
+            detail = "; ".join(details)
+            hint = f"... [truncated; reql agent show {item['id']} --json]"
+            suffix = " " + hint if truncated else ""
+            if len(core) + len(hint) + 2 > remaining:
+                # Never present a partially cut dependency/conflict identifier as complete.
+                line = header + "; coordination links omitted " + hint
+                if len(line) > remaining:
+                    break
+            elif len(core) + len(detail) + len(suffix) + 2 > remaining:
+                line = core + "; " + detail[:remaining - len(core) - len(hint) - 2] + hint
+            else:
+                line = core + "; " + detail + suffix
+                # References become valid only after every referenced field has
+                # actually been emitted. Budget-cut rows cannot seed later pointers.
+                self.texts = available
+                if section is not None:
+                    self.records[identity] = (item, section, truncated)
+            rows.append(line)
+            # Only emitted headers can establish attribution for later rows.
+            if alias:
+                self.declared_owners.add(owner)
+            used += len(line) + 1
+            rendered += 1
+        omitted = len(records) - rendered + int(payload.get("omitted", 0))
+        if omitted:
+            rows.append(f"- {omitted} matching record(s) omitted; refine context or increase --limit/budget.")
+        elif not records:
+            rows.append("No matching engineering records.")
+        if payload.get("expansion_truncated"):
+            rows.append("Causal expansion limited; inspect linked work with reql project context --task ID.")
+        text = "\n".join(rows)
+        return text if len(text) <= max_chars else "Work context truncated; increase budget."[:max_chars]

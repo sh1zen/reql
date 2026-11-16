@@ -18,6 +18,13 @@ The service layer should not assume any database-engine-specific behaviour.
 Pass the backend to `MemoryGraph(store)`; the bundled block adapter implements
 the same port.
 
+Adapters implement `lexical_search(..., clone=...)` and
+`find_nodes_by_types(..., clone=...)` as part of the storage port. These operations
+provide indexed search candidates and type scopes; `clone=False` returns borrowed
+records for internal read-only stages. Adapter errors propagate to callers.
+`count_nodes` and `count_edges` are also required port operations. `STATS` calls
+them directly; adapters must implement their filters and return integer counts.
+
 ## Extractors
 
 Implement `SemanticExtractor` from `memory.storage.extractor`.

@@ -49,7 +49,7 @@ def prune_project_data(
             "project_id",
             project_id,
             type_="ProjectRevision",
-            limit=retention_commits + 1,
+            limit=None,
             clone=False,
         ),
         key=_revision_order,
@@ -182,6 +182,12 @@ def _expired_project_edge(
 
 
 def _node_timestamp(node: MemoryNode) -> datetime:
+    # Usage and analysis update node.updated_at. Immutable history keeps the
+    # committed timestamp so reads cannot move the retention boundary.
+    if node.type in {"ProjectRevision", "GraphDelta"}:
+        committed = _safe_parse(node.properties.get("created_at"))
+        if committed is not None:
+            return committed
     for value in (
         node.properties.get("completed_at"),
         node.properties.get("updated_at"),

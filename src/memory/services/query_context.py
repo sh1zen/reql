@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import replace
 from typing import Any
 from pathlib import Path
 
@@ -43,6 +44,7 @@ class QueryContextService:
                 max_items=request.budget.max_items,
                 query_mode=request.mode.value,
                 query_scopes=tuple(sorted(request.scopes)),
+                include_source=request.include_source,
             )
         )
         confidence_payload = payload.pop("confidence", None)
@@ -56,11 +58,20 @@ class QueryContextService:
             }
         )
         source_revision, freshness = _source_revision_and_freshness(subgraph, self.retrieval.store)
+        stale_paths = {item.get("path") for item in payload.get("snippets", []) if item.get("source_status") == "stale"}
+        if stale_paths:
+            freshness = replace(freshness, status="refreshing" if freshness.status == "refreshing" else "stale",
+                                pending_paths=max(freshness.pending_paths, len(stale_paths)))
         storage_path = getattr(self.retrieval.store, "path", None)
         if storage_path is not None:
             work = CoordinationStore(Path(storage_path).with_name("agent-dashboard.reql"))
-            files = list(dict.fromkeys(str(item.node.properties["relative_path"]) for item in subgraph.ranked_nodes
-                                       if item.node.properties.get("relative_path")))[:8]
+            # The code projection already selected the relevant owners. Incidental
+            # ranked neighbors must not pull unrelated work into that working set.
+            if payload.get("kind") == "code":
+                files = list(dict.fromkeys(str(row["path"]) for row in payload.get("working_set", []) if row.get("path")))[:8]
+            else:
+                files = list(dict.fromkeys(str(item.node.properties["relative_path"]) for item in subgraph.ranked_nodes
+                                           if item.node.properties.get("relative_path")))[:8]
             payload["engineering_context"] = work.context(request.text, files=files, limit=min(8, request.budget.max_items))
         return ContextResult(
             schema_version=CONTEXT_RESULT_SCHEMA_VERSION,
@@ -77,7 +88,7 @@ class QueryContextService:
         rendered = self.retrieval.render_context_payload(payload)
         work = payload.get("engineering_context")
         if work and work["records"]:
-            rendered += "\n\n" + render_work_context(work)
+            rendered += "\n\n" + render_work_context(work, max_chars=2400)
         source = result.source_revision.id if result.source_revision else "unknown"
         return f"Graph freshness: {result.freshness.status}; source_revision={source}\n\n{rendered}"
 
@@ -157,12 +168,13 @@ def _ranked_revision_payload(item: RankedNode) -> dict[str, Any]:
 
 
 def _canonical_json_value(value: Any) -> Any:
+    """Normalize non-JSON values; the revision encoder sorts the resulting keys."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
     if isinstance(value, dict):
-        return {str(key): _canonical_json_value(item) for key, item in sorted(value.items(), key=lambda row: str(row[0]))}
+        return {str(key): _canonical_json_value(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return [_canonical_json_value(item) for item in value]
     if isinstance(value, (set, frozenset)):
         return sorted([_canonical_json_value(item) for item in value], key=lambda item: json.dumps(item, ensure_ascii=True, sort_keys=True, default=str))
-    if value is None or isinstance(value, (str, int, float, bool)):
-        return value
     return str(value)

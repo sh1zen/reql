@@ -58,18 +58,27 @@ Compiled symbol nodes carry deterministic source spans as both
 `source_path`. Query and context retrieval use these fields interchangeably so
 agents can request precise symbol spans without opening whole files.
 
+`inspect` and `query_context --code --source` can return verified current bodies
+for these spans without changing parser output or compiling the project. See
+[CLI context retrieval](CLI.md#retrieval-commands) for previews, verification,
+source limits, statuses and provider fields.
+
 The Tree-sitter extraction layer is structured directly under
 `memory.code_analysis`. `TreeSitterCodeParser` and shared AST primitives live in
 `memory.code_analysis.base`, while
 language cataloging, extension detection, aliases, and Tree-sitter grammar
-loading live in `memory.code_analysis.catalog`. `TreeSitterExtractorBase` owns shared state
-and result assembly, but it does not contain language walkers or fallback AST
+loading live in `memory.code_analysis.catalog`. `TreeSitterExtractorBase` owns shared state,
+result assembly and common call/reference recording, but no language walkers or fallback AST
 profiles. Language-specific classes live one file per language under
 `memory.code_analysis.languages` and are registered in the extractor
 factory. Languages without a handwritten walker still have their own class and
 declare a language-specific `AstProfile` in that file while inheriting the
 reusable `GenericProfileTreeSitterExtractor`. Classes for languages with direct
 Tree-sitter wheels declare the corresponding grammar module.
+
+`JavaScriptTreeSitterExtractor` owns the shared ECMAScript walker. TypeScript
+inherits those extraction rules, and TSX inherits TypeScript; each class selects
+its corresponding grammar through the existing factory registration.
 
 Tree-sitter is a mandatory runtime dependency. REQL does not fall back to the
 standard-library Python `ast` parser, regex parsing, or any other code parser.
@@ -142,6 +151,11 @@ non-builtin unresolved call targets are stored as `unresolved_calls`
 summaries on the owning function or method. Language builtins and calls through
 names imported by the artifact, such as `os.getcwd` after `import os`, are
 filtered out as low-signal graph noise.
+Computed receivers such as `super().execute()`, `factory().execute()` and
+`items[0].execute()` do not establish a local target by method name alone. Their
+full targets remain in unresolved-call summaries, including builtin receiver
+expressions; REQL does not fabricate same-named local call/wrapper links or infer
+dynamic dispatch. Existing indexed override/inheritance links remain separate evidence.
 
 Compile also records deterministic local static-analysis findings for dead-code
 signals that are useful during repository queries. These findings are stored as
@@ -219,6 +233,10 @@ checkout can install them with:
 ```bash
 python -m pip install -e .
 ```
+
+Parser construction uses the declared Tree-sitter 0.25 API: `Parser(language)`.
+Grammar providers return a capsule or a constructed `Language` object. Invalid
+provider values and constructor errors propagate.
 
 ## Example Queries
 

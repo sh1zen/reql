@@ -9,7 +9,8 @@ scan:
   exclude:
     - .git/
     - .reql/
-    - .codex/skills/reql-agent/
+    - skills/reql-agent/
+    - skills/reql-context-compact/
     - .cache/
     - .venv/
     - venv/

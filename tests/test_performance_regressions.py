@@ -2,16 +2,25 @@
 from __future__ import annotations
 
 from pathlib import Path
+from contextlib import redirect_stdout
+import io
+import json
+import os
 import random
 import tempfile
 import unittest
 from unittest.mock import patch
 
-from memory.domain.models import MemoryNode
-from memory.explanation.service import _workflow_documentation_evidence
-from memory.extraction.normalization import canonicalize, identifier_expanded_text, tokenize
+from api import MemoryGraph
+from mcp.tools import reql_project_status
+from memory.cli import main as cli_main
+from memory.domain.models import MemoryEdge, MemoryNode
+from memory.explanation.service import _capability_key, _is_test_path, _workflow_documentation_evidence
 from memory.services.coordination import CoordinationStore, STATUSES, TERMINAL
 from memory.storage import BlockGraphStore
+from memory.services.query_context import _canonical_json_value
+from memory.services.retrieval.common import _canonical_token_overlap
+from memory.extraction.normalization import singular_source_variants
 
 
 def reference_execution(item: dict, records: dict) -> dict:
@@ -134,12 +143,114 @@ class PerformanceRegressionTests(unittest.TestCase):
         refreshed = _workflow_documentation_evidence(docs, {"payment", "validation"}, tokens_by_id={})
         self.assertEqual([item.node_id for item in refreshed], ["doc:one"])
 
-    def test_normalization_preserves_unicode_and_returns_independent_tokens(self) -> None:
-        self.assertEqual(canonicalize("  Città\n‘Invoice’ — PayMéNT_42  "), "citta invoice payment_42")
-        self.assertEqual(identifier_expanded_text("src/HTTPServer.invoice_total"), "src HTTP Server invoice total")
-        tokens = tokenize("Invoice Payment")
-        tokens.clear()
-        self.assertEqual(tokenize("Invoice Payment"), ["invoice", "payment"])
+    def test_degree_ranking_copies_selected_nodes_and_preserves_isolation(self) -> None:
+        scratch = Path(".tmp")
+        scratch.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            store = BlockGraphStore(Path(directory) / "degree.reql")
+            try:
+                for index in range(12):
+                    store.upsert_node(MemoryNode(id=f"node:{index}", type="Function", salience=index / 12,
+                                                 properties={"nested": {"names": [str(index)]}}))
+                for index in range(1, 12):
+                    store.upsert_edge(MemoryEdge(id=f"edge:{index}", from_id="node:0", to_id=f"node:{index}",
+                                                 type="CALLS", weight=index / 12, confidence=0.5))
+                store.upsert_edge(MemoryEdge(id="self", from_id="node:0", to_id="node:0", type="OTHER"))
+                reference = store.top_nodes_by_degree(limit=None, ignored_edge_types={"OTHER"})
+                expected = [(node.id, degree, weight) for node, degree, weight in reference[:2]]
+                with patch.object(store, "_clone_node", wraps=store._clone_node) as copy:
+                    selected = store.top_nodes_by_degree(limit=2, ignored_edge_types={"OTHER"})
+                    self.assertEqual(copy.call_count, 2)
+                self.assertEqual([(node.id, degree, weight) for node, degree, weight in selected], expected)
+                self.assertEqual(selected[0][1], 11)
+                self.assertEqual(store.top_nodes_by_degree(limit=0), [])
+                selected[0][0].properties["nested"]["names"].append("changed")
+                self.assertEqual(store.get_node("node:0").properties["nested"]["names"], ["0"])
+                with patch.object(store, "_clone_node", side_effect=AssertionError("borrowed ranking copied nodes")):
+                    borrowed = store.top_nodes_by_degree(limit=None, clone=False)
+                self.assertIs(borrowed[0][0], store.get_node("node:0", clone=False))
+                self.assertEqual(borrowed[0][1], 12)
+            finally:
+                store.close()
+
+    def test_metadata_cli_and_mcp_skip_unused_lexical_loading_but_search_loads_it(self) -> None:
+        scratch = Path(".tmp")
+        scratch.mkdir(exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            root = Path(directory).resolve()
+            (root / "invoice.py").write_text("def invoice_total(amount):\n    return amount\n", encoding="utf-8")
+            storage = root / ".reql" / "memory.reql"
+            graph = MemoryGraph.open(storage)
+            try:
+                graph.compile_project(root)
+                expected = graph.project_status(root)
+                graph.store.checkpoint_if_needed(wal_bytes_threshold=0)
+            finally:
+                graph.close()
+            original_bytes = storage.read_bytes()
+            old_cwd = Path.cwd()
+            try:
+                os.chdir(root)
+                with patch.object(BlockGraphStore, "_ensure_lexical_index_loaded",
+                                  side_effect=AssertionError("metadata loaded the lexical index")):
+                    for command in (["stats", "--json"], ["project", "status", "--json"], ["locate", "invoice.py", "--json"]):
+                        with redirect_stdout(io.StringIO()) as out:
+                            self.assertEqual(cli_main(command), 0)
+                        result = json.loads(out.getvalue())
+                        if command[:2] == ["project", "status"]:
+                            self.assertEqual(result, expected)
+                    self.assertEqual(reql_project_status(storage_path=str(storage), path=str(root)), {**expected, "found": True})
+                loads = []
+                ensure_loaded = BlockGraphStore._ensure_lexical_index_loaded
+
+                def load(store):
+                    """Count actual lazy loads while running the normal search implementation."""
+                    loads.append(store.path)
+                    return ensure_loaded(store)
+
+                with patch.object(BlockGraphStore, "_ensure_lexical_index_loaded", new=load):
+                    with redirect_stdout(io.StringIO()) as out:
+                        self.assertEqual(cli_main(["query_context", "--query", "invoice_total", "--code", "--json"]), 0)
+                self.assertTrue(loads)
+                self.assertEqual(json.loads(out.getvalue())["confidence"]["status"], "sufficient")
+                self.assertEqual(storage.read_bytes(), original_bytes)
+            finally:
+                os.chdir(old_cwd)
+
+    def test_overlap_keeps_plural_and_boundary_semantics_with_repeated_tokens(self) -> None:
+        rng = random.Random(92512)
+        words = ["policy", "policies", "class", "classes", "__edge__", "_tail-", "x", "retrieval", "stores", "store", "--", "42"]
+        for _ in range(1000):
+            value = " \t\n".join(rng.choices(words, k=rng.randrange(150)))
+            query = set(rng.choices(words, k=5))
+            source = {token for raw in value.split() if len(token := raw.strip("_-")) >= 2}
+            expected = {token for token in query if token in source or any(variant in source for variant in singular_source_variants(token))}
+            self.assertEqual(_canonical_token_overlap(value, query), expected)
+
+    def test_revision_canonicalization_preserves_encoded_bytes_and_stringified_key_collisions(self) -> None:
+        def reference(value):
+            """Retain the original canonical-encoding algorithm as an independent oracle."""
+            if isinstance(value, dict):
+                return {str(key): reference(item) for key, item in sorted(value.items(), key=lambda row: str(row[0]))}
+            if isinstance(value, (list, tuple)):
+                return [reference(item) for item in value]
+            if isinstance(value, (set, frozenset)):
+                return sorted([reference(item) for item in value], key=lambda item: json.dumps(item, ensure_ascii=True, sort_keys=True, default=str))
+            return value if value is None or isinstance(value, (str, int, float, bool)) else str(value)
+
+        values = [{3: "number", "3": "string", None: [True, 2.5]},
+                  {"z": (1, {"é", "beta"}), "a": {"path": Path("src/a.py"), "frozen": frozenset({2, 1})}},
+                  {"1": "first", 1: "last", "bool": {True: False}}]
+        for value in values:
+            encode = lambda item: json.dumps(item, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+            self.assertEqual(encode(_canonical_json_value(value)), encode(reference(value)))
+
+    def test_cached_path_classification_includes_dominant_root_and_returns_immutable_values(self) -> None:
+        self.assertEqual(_capability_key("src/platform/billing/service.py", "platform"), "billing")
+        self.assertEqual(_capability_key("src/platform/billing/service.py", None), "platform")
+        self.assertTrue(_is_test_path("src/billing/tests/test_invoice.py"))
+        self.assertTrue(_is_test_path("web/invoice.spec.ts"))
+        self.assertFalse(_is_test_path("src/billing/invoice.py"))
 
 
 if __name__ == "__main__":

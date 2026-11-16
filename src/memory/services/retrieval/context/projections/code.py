@@ -23,6 +23,7 @@ from ...common import (
     _expanded_tokens,
 )
 from ..models import QueryProfile
+from ..source import _read_bounded_source, capture_source_excerpts
 
 
 class CodeContextProjectionMixin:
@@ -32,6 +33,7 @@ class CodeContextProjectionMixin:
         *,
         query_mode: str,
         max_items: int,
+        include_source: bool = False,
     ) -> dict[str, Any]:
         compact_items = min(max_items, 6)
         ranked = [item for item in subgraph.ranked_nodes if self._is_code_context_node(item.node)]
@@ -64,15 +66,17 @@ class CodeContextProjectionMixin:
         if query_mode == "cleanup":
             cleanup_reads = self._code_cleanup_targeted_reads(cleanup_candidates, subgraph, working_paths, max_items=compact_items)
             targeted_reads = self._merge_targeted_reads(cleanup_reads, max_items=max(compact_items * 4, 12))
-            snippets = self._code_snippet_payload(targeted_reads, subgraph, max_items=max_items)
+            snippets = [] if include_source else self._code_snippet_payload(targeted_reads, subgraph, max_items=max_items)
         else:
             targeted_reads = self._code_targeted_reads(display_ranked, subgraph, working_paths, query_text=subgraph.query.text, max_items=compact_items)
-            snippets = self._code_informative_snippet_payload(
+            snippets = [] if include_source else self._code_informative_snippet_payload(
                 targeted_reads,
                 subgraph,
                 path_rows=path_rows,
                 max_items=max_items,
             )
+        if include_source:
+            snippets = capture_source_excerpts(self.store, targeted_reads)
         cleanup_plan = self._code_cleanup_plan_lines(cleanup_candidates, path_rows, max_items=compact_items) if query_mode == "cleanup" else []
         contracts = self._code_contract_payload(display_ranked, subgraph, working_paths, max_items=compact_items)
         impact = self._code_impact_payload(subgraph, owner_candidates, working_paths, max_items=compact_items)
@@ -119,6 +123,7 @@ class CodeContextProjectionMixin:
             "impact": impact,
             "targeted_reads": targeted_reads,
             "snippets": snippets,
+            **({"source_mode": "verified"} if include_source else {}),
             "edit_plan": [],
             "cleanup_plan": cleanup_plan,
             "test_targets": test_targets,
@@ -140,6 +145,10 @@ class CodeContextProjectionMixin:
             subgraph.query.text,
         )
         if not matches:
+            return []
+        # A whole indexed path already has exact-file intent. Its extension is
+        # not a model field and must not launch another project-wide source search.
+        if any(self._node_matches_exact_query_path(item.node, subgraph.query.text) for item in subgraph.ranked_nodes):
             return []
         family, field_name = matches[-1]
         family_folded = family.casefold()
@@ -278,10 +287,7 @@ class CodeContextProjectionMixin:
         snippets: list[dict[str, Any]],
         max_items: int,
     ) -> list[dict[str, Any]]:
-        snippet_spans = {
-            (item.get("path"), item.get("line_start"), item.get("line_end"))
-            for item in snippets
-        }
+        source_snippets = [item for item in snippets if item.get("text") and item.get("source") == "disk"]
         plan: list[dict[str, Any]] = []
         for item in targeted_reads[: min(max_items, 8)]:
             path = item.get("path")
@@ -296,7 +302,13 @@ class CodeContextProjectionMixin:
                 continue
             line_count = max(1, end - start + 1)
             node_id = str(item.get("node_id") or "")
-            span_key = (path, start, end)
+            node = self.store.get_node(node_id, clone=False) if node_id and source_snippets else None
+            artifact_id = node.properties.get("artifact_id") if node else None
+            snippet_embedded = any(
+                row.get("path") == path and row["line_start"] <= start and row["line_end"] >= end
+                and (row.get("artifact_id") == artifact_id if artifact_id else row.get("node_id") == node_id)
+                for row in source_snippets
+            )
             plan.append(
                 {
                     "path": path,
@@ -308,8 +320,8 @@ class CodeContextProjectionMixin:
                     "label": item.get("label"),
                     "reason": item.get("reason") or "graph match",
                     "source_span": self._format_path_bracket_span(path, start, end),
-                    "command": f"reql inspect --node-id {node_id} --json" if node_id else "",
-                    "snippet_embedded": span_key in snippet_spans,
+                    "command": f"reql inspect --node-id {node_id} --limit 1 --json" if node_id else "",
+                    "snippet_embedded": snippet_embedded,
                     "sufficiency": item.get("sufficiency")
                     or {
                         "status": "bounded",
@@ -355,7 +367,7 @@ class CodeContextProjectionMixin:
                 }
             )
         impact_items: list[dict[str, Any]] = []
-        for key in ("public_surface", "callers", "docs"):
+        for key in ("implementation_links", "callers", "public_surface", "docs"):
             for item in list(impact.get(key) or [])[:limit]:
                 impact_item = dict(item)
                 impact_item["impact_kind"] = key
@@ -750,12 +762,22 @@ class CodeContextProjectionMixin:
             nodes.setdefault(item.node.id, item.node)
         target_ids = {str(item.get("id")) for item in owner_candidates if item.get("id")}
         callers: list[dict[str, Any]] = []
+        implementation_links: list[dict[str, Any]] = []
         public_surface: list[dict[str, Any]] = []
         docs: list[dict[str, Any]] = []
         seen_callers: set[str] = set()
         seen_surface: set[str] = set()
         seen_docs: set[str] = set()
+        seen_links: set[tuple[str, str, str]] = set()
         for edge in subgraph.edges:
+            if edge.type in {"OVERRIDES", "WRAPS", "INHERITS"} and (edge.from_id in target_ids or edge.to_id in target_ids):
+                source, target = nodes.get(edge.from_id), nodes.get(edge.to_id)
+                identity = (edge.from_id, edge.to_id, edge.type)
+                if source is not None and target is not None and identity not in seen_links:
+                    seen_links.add(identity)
+                    implementation_links.append({"source": self._compact_node_ref(source), "target": self._compact_node_ref(target),
+                                                 "edge_id": edge.id, "edge_type": edge.type,
+                                                 "reason": "indexed implementation relation; verify the behavior owner in current source"})
             if edge.type in CALLER_EDGE_TYPES and edge.to_id in target_ids and edge.from_id not in seen_callers:
                 caller = nodes.get(edge.from_id)
                 target = nodes.get(edge.to_id)
@@ -800,6 +822,7 @@ class CodeContextProjectionMixin:
         if target_ids and not callers:
             notes.append("No static CALLS/INSTANTIATES caller was present in the retrieved subgraph; treat dynamic or public entry points as unknown until verified.")
         return {
+            "implementation_links": implementation_links[: min(max_items, 4)],
             "callers": callers[: min(max_items, 4)],
             "public_surface": public_surface[: min(max_items, 4)],
             "docs": docs,
@@ -966,6 +989,7 @@ class CodeContextProjectionMixin:
         nodes = {item.node.id: item.node for item in subgraph.ranked_nodes}
         nodes.update({node.id: node for node in subgraph.nodes})
         path_index = self._absolute_path_index(list(nodes.values()))
+        source_cache: dict[Path, list[str] | None] = {}
         snippets: list[dict[str, Any]] = []
         seen: set[tuple[str, int | None, int | None]] = set()
         primary_types = {"Function", "Method", "Class", "Interface", "Module", "Endpoint", "Schema", "StaticAnalysisFinding"}
@@ -988,30 +1012,47 @@ class CodeContextProjectionMixin:
                 end = int(line_end) if line_end is not None else start
             except (TypeError, ValueError):
                 continue
-            key = (path, start, end)
+            node = nodes.get(str(item.get("node_id") or "")) or self.store.get_node(str(item.get("node_id") or ""))
+            artifact_id = node.properties.get("artifact_id") if node else None
+            key = (str(artifact_id or path), start, end)
             if key in seen:
                 continue
             seen.add(key)
             read_path_index = path_index
-            raw_source_path = item.get("source_path")
+            artifact = self.store.get_node(str(artifact_id), clone=False) if artifact_id else None
+            raw_source_path = item.get("source_path") or (node.properties.get("source_path") if node else None) or (artifact.properties.get("path") if artifact else None)
             if raw_source_path:
                 candidate_path = Path(str(raw_source_path))
                 if candidate_path.is_absolute():
                     read_path_index = {**path_index, path: candidate_path}
-            text = self._read_source_span(path, start, end, path_index=read_path_index)
+            text = self._read_source_span(path, start, end, path_index=read_path_index, source_cache=source_cache)
             source = "disk"
             if not text:
-                node = nodes.get(str(item.get("node_id") or ""))
                 text = node.text if node and node.text else ""
                 source = "graph"
-            text = self._bounded_multiline_text(text, max_lines=16, max_chars=900)
+            source_lines = str(text).splitlines()
+            selected_lines: list[str] = []
+            used_chars = 0
+            for line in source_lines[:16]:
+                cost = len(line) + bool(selected_lines)
+                if used_chars + cost > 900:
+                    break
+                selected_lines.append(line)
+                used_chars += cost
+            text = "\n".join(selected_lines)
             if not text:
                 continue
+            actual_end = start + len(selected_lines) - 1
+            truncated = len(selected_lines) < len(source_lines) or (source == "disk" and actual_end < end)
             snippets.append(
                 {
                     "path": path,
                     "line_start": start,
-                    "line_end": end,
+                    "line_end": actual_end if source == "disk" else end,
+                    "requested_line_end": end,
+                    "truncated": truncated,
+                    **({"next_line": actual_end + 1} if truncated and source == "disk" else {}),
+                    "artifact_id": artifact_id,
                     "node_id": item.get("node_id"),
                     "type": item.get("type"),
                     "label": item.get("label"),
@@ -1042,31 +1083,25 @@ class CodeContextProjectionMixin:
         line_end: int,
         *,
         path_index: dict[str, Path],
+        source_cache: dict[Path, list[str] | None],
     ) -> str:
+        """Slice one bounded file snapshot, reused by all previews in this request."""
         if line_start <= 0 or line_end < line_start:
             return ""
         candidate = path_index.get(path, Path(path))
         if not candidate.is_absolute():
             candidate = Path.cwd() / candidate
-        try:
-            lines = candidate.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError:
-            return ""
-        if line_start > len(lines):
+        if candidate not in source_cache:
+            try:
+                content = _read_bounded_source(candidate)
+            except OSError:
+                source_cache[candidate] = None
+            else:
+                source_cache[candidate] = content.decode("utf-8-sig", errors="replace").splitlines() if content is not None else None
+        lines = source_cache[candidate]
+        if not lines or line_start > len(lines):
             return ""
         return "\n".join(lines[line_start - 1 : min(line_end, len(lines))])
-
-    @staticmethod
-    def _bounded_multiline_text(text: str, *, max_lines: int, max_chars: int) -> str:
-        source_lines = str(text).splitlines()
-        rendered = "\n".join(source_lines[:max_lines]).strip()
-        if not rendered:
-            return ""
-        if len(source_lines) > max_lines:
-            rendered = rendered.rstrip() + "\n..."
-        if len(rendered) > max_chars:
-            rendered = rendered[: max_chars - 3].rstrip() + "..."
-        return rendered
 
     def _code_test_targets(self, subgraph: MemorySubgraph, path_rows: list[dict[str, Any]], *, query_text: str, max_items: int) -> list[dict[str, Any]]:
         ranked_by_id = {item.node.id: item for item in subgraph.ranked_nodes}
@@ -1112,7 +1147,7 @@ class CodeContextProjectionMixin:
             if not path:
                 continue
             normalized = path.replace("\\", "/")
-            if normalized.startswith("tests/"):
+            if self._is_test_context_path(normalized):
                 kind = "test"
             elif normalized.startswith("docs/") or normalized == "README.md":
                 kind = "docs"

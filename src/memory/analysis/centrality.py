@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import combinations
 
 from ..domain.models import MemoryEdge, MemoryNode
 from ..storage.graph_store import GraphStore
@@ -78,16 +79,15 @@ class CentralityCalculator:
         return out
 
     def _bridge_score(self, node_id: str, neighbors: dict[str, set[str]]) -> float:
-        adjacent = list(neighbors.get(node_id, set()))
+        """Measure disconnected neighbor pairs without materializing list slices."""
+        adjacent = neighbors.get(node_id, set())
         if len(adjacent) < 2:
             return 0.0
-        disconnected_pairs = 0
-        total_pairs = 0
-        for i, left in enumerate(adjacent):
-            for right in adjacent[i + 1 :]:
-                total_pairs += 1
-                if right not in neighbors.get(left, set()):
-                    disconnected_pairs += 1
+        disconnected_pairs = sum(
+            1 for left, right in combinations(adjacent, 2)
+            if right not in neighbors.get(left, ())
+        )
+        total_pairs = len(adjacent) * (len(adjacent) - 1) // 2
         return disconnected_pairs / total_pairs
 
     def _community_bridge_score(self, node_id: str, neighbors: dict[str, set[str]], community_by_node: dict[str, str]) -> float:

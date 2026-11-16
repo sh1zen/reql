@@ -13,7 +13,7 @@ from ..code_analysis.catalog import detect_code_language
 from ..code_analysis.models import CodeCall, CodeImport, CodeModule, CodeParseResult, CodeSymbol, CodeText
 from ..code_analysis.parser_base import CodeParserRegistry, default_code_parser_registry
 from ..code_analysis.surface import CssDeclaration, analyze_css
-from ..code_analysis.symbol_table import SymbolTable
+from ..code_analysis.symbol_table import SymbolTable, is_computed_reference
 from ..document_ingestion.base import ParserRegistry, default_parser_registry
 from ..document_ingestion.metadata import make_fragment
 from ..document_ingestion.models import DocumentFragment, DocumentLink, DocumentParseResult
@@ -24,8 +24,9 @@ from ..extraction.document_processor import DocumentProcessingResult, DocumentPr
 from ..extraction.normalization import canonicalize
 from ..storage.graph_store import GraphStore
 from .context_scope import artifact_context_scope
+from .fingerprint import compilation_fingerprint, options_hash
 from .models import ArtifactCompilationResult, SourceArtifact
-from .options import CompilationOptions, DocumentPolicy
+from .options import CompilationOptions, normalize_compilation_options
 
 
 DOCUMENT_CODE_LINK_NODE_TYPES = {"Module", "Function", "Class", "Interface", "Method", "Endpoint", "Schema"}
@@ -241,35 +242,18 @@ class ArtifactCompiler:
         parser_registry: ParserRegistry | None = None,
         code_parser_registry: CodeParserRegistry | None = None,
         enable_pdf: bool = True,
-        ingest_documents: bool = True,
-        document_policies: list[dict[str, object]] | tuple[DocumentPolicy, ...] | None = None,
         document_processor: DocumentProcessor | None = None,
         options: CompilationOptions | None = None,
     ) -> None:
-        if options is None:
-            policies = tuple(
-                item if isinstance(item, DocumentPolicy) else DocumentPolicy.from_mapping(item)
-                for item in (document_policies or ())
-            )
-            options = CompilationOptions(
-                ingest_documents=ingest_documents,
-                document_policies=policies,
-            )
+        options = normalize_compilation_options(options)
         self.options = options
+        self.compilation_fingerprint = compilation_fingerprint(options_hash(options.cache_payload()))
         self.enable_pdf = enable_pdf and options.format_ingest_enabled("pdf")
         self.document_processor = document_processor or DocumentProcessor()
         self.parser_registry = parser_registry or default_parser_registry(
             enable_pdf=enable_pdf,
         )
         self.code_parser_registry = code_parser_registry or default_code_parser_registry()
-
-    @property
-    def ingest_documents(self) -> bool:
-        return self.options.ingest_documents
-
-    @property
-    def document_policies(self) -> tuple[DocumentPolicy, ...]:
-        return self.options.document_policies
 
     def compile_artifact(self, store: GraphStore, artifact: SourceArtifact) -> ArtifactCompilationResult:
         content = self._read_verified_content(artifact)
@@ -330,10 +314,10 @@ class ArtifactCompiler:
             if node.id in persisted_fragment_ids or node.status == "archived":
                 continue
             for concept in _concepts_for_fragment(store, node):
-                _archive_concept(store, concept)
+                _archive_node(store, concept)
                 result.archived_nodes.add(concept.id)
                 result.affected_node_ids.add(concept.id)
-            _archive_fragment(store, node)
+            _archive_node(store, node)
             result.archived_nodes.add(node.id)
             result.affected_node_ids.add(node.id)
             for edge in _fragment_related_edges(store, node):
@@ -341,7 +325,7 @@ class ArtifactCompiler:
                 result.archived_edges.add(edge.id)
                 result.affected_edge_ids.add(edge.id)
 
-        _mark_artifact_compiled(store, artifact, parse_result)
+        _mark_artifact_compiled(store, artifact, parse_result, self.compilation_fingerprint)
         result.affected_node_ids.add(artifact.id)
         result.updated_nodes.add(artifact.id)
         return result
@@ -365,12 +349,6 @@ class ArtifactCompiler:
         parser = self.parser_registry.parser_for(artifact)
         return parser.parse(artifact, content)
 
-    def parse_code_artifact(self, artifact: SourceArtifact) -> CodeParseResult:
-        return self.parse_code_text(artifact, self.read_code_artifact_text(artifact))
-
-    def read_code_artifact_text(self, artifact: SourceArtifact) -> str:
-        return Path(artifact.path).read_text(encoding="utf-8-sig", errors="replace")
-
     def parse_code_text(self, artifact: SourceArtifact, text: str) -> CodeParseResult:
         language = detect_code_language(artifact)
         parser = self.code_parser_registry.parser_for(artifact)
@@ -382,7 +360,7 @@ class ArtifactCompiler:
         return parser.parse_artifact(artifact, text)
 
     def document_ingest_enabled(self, artifact: SourceArtifact) -> bool:
-        if not self.ingest_documents or not _is_document_artifact(artifact):
+        if not self.options.ingest_documents or not _is_document_artifact(artifact):
             return False
         if _is_application_surface_path(artifact.relative_path):
             return True
@@ -548,7 +526,7 @@ class ArtifactCompiler:
             for node in _find_nodes_by_property(store, "artifact_id", artifact.id, type_=node_type, limit=100000):
                 if node.properties.get("extractor") != "document_processor" or node.id in current_node_ids or node.status == "archived":
                     continue
-                _archive_concept(store, node)
+                _archive_node(store, node)
                 result.archived_nodes.add(node.id)
                 result.affected_node_ids.add(node.id)
 
@@ -897,7 +875,7 @@ class ArtifactCompiler:
         stale_nodes = [old_node for old_node in _code_nodes_for_artifact(store, artifact) if old_node.id not in current_ids and old_node.status != "archived"]
         stale_edges = _code_related_edges_for_nodes(store, stale_nodes)
         for old_node in stale_nodes:
-            _archive_code_node(store, old_node)
+            _archive_node(store, old_node)
             result.archived_nodes.add(old_node.id)
             result.affected_node_ids.add(old_node.id)
         for edge in stale_edges:
@@ -914,7 +892,7 @@ def archive_artifact_fragments(store: GraphStore, artifact: SourceArtifact | Mem
     result = ArtifactCompilationResult(artifact_id=artifact_id)
     for node in _fragments_for_artifact_id(store, project_id, artifact_id):
         if node.status != "archived":
-            _archive_fragment(store, node)
+            _archive_node(store, node)
             result.archived_nodes.add(node.id)
         result.affected_node_ids.add(node.id)
         for edge in _fragment_related_edges(store, node):
@@ -924,7 +902,7 @@ def archive_artifact_fragments(store: GraphStore, artifact: SourceArtifact | Mem
     code_nodes = [node for node in _code_nodes_for_artifact(store, artifact) if node.status != "archived"]
     code_edges = _code_related_edges_for_nodes(store, code_nodes)
     for node in code_nodes:
-        _archive_code_node(store, node)
+        _archive_node(store, node)
         result.archived_nodes.add(node.id)
         result.affected_node_ids.add(node.id)
     for edge in code_edges:
@@ -935,7 +913,7 @@ def archive_artifact_fragments(store: GraphStore, artifact: SourceArtifact | Mem
         for node in _find_nodes_by_property(store, "artifact_id", artifact_id, type_=node_type, limit=100000):
             if node.status == "archived" or node.properties.get("extractor") != "document_processor":
                 continue
-            _archive_concept(store, node)
+            _archive_node(store, node)
             result.archived_nodes.add(node.id)
             result.affected_node_ids.add(node.id)
             for edge in _incident_edges(store, [node.id], limit=10000):
@@ -1605,7 +1583,7 @@ def refresh_project_css_surface_findings(store: GraphStore, project_id: str) -> 
     stale_ids = {node.id for node in existing_findings if node.id not in expected_node_ids and node.status != "archived"}
     for node in existing_findings:
         if node.id in stale_ids:
-            _archive_code_node(store, node)
+            _archive_node(store, node)
             result.archived_nodes.add(node.id)
             result.affected_node_ids.add(node.id)
     for edge in _find_edges_by_property(store, "extractor", APPLICATION_SURFACE_LINKER, limit=100000):
@@ -1842,9 +1820,12 @@ def _useful_code_link_term(value: str, node: MemoryNode) -> bool:
         return False
     if len(stripped) < 5 and not any(separator in stripped for separator in ("/", "\\", ".", "_", "-")):
         return False
-    if node.type in {"Module", "Function", "Method", "Class", "Interface"} and stripped == str(node.properties.get("name") or ""):
-        if len(stripped) < 6 or stripped.casefold() in DOCUMENT_CODE_LINK_STOP_TERMS:
-            return False
+    if (
+        node.type in {"Module", "Function", "Method", "Class", "Interface"}
+        and stripped == str(node.properties.get("name") or "")
+        and len(stripped) < 6
+    ):
+        return False
     return any(char.isalpha() for char in stripped)
 
 
@@ -1992,14 +1973,8 @@ def _int_or_none(value: object) -> int | None:
         return None
 
 
-def _archive_fragment(store: GraphStore, node: MemoryNode) -> None:
-    properties = dict(node.properties)
-    properties["status"] = "archived"
-    properties["updated_at"] = utcnow_iso()
-    store.update_node_fields(node.id, status="archived", properties=properties)
-
-
-def _archive_concept(store: GraphStore, node: MemoryNode) -> None:
+def _archive_node(store: GraphStore, node: MemoryNode) -> None:
+    """Archive a compiled node while retaining its properties and timestamp semantics."""
     properties = dict(node.properties)
     properties["status"] = "archived"
     properties["updated_at"] = utcnow_iso()
@@ -2014,7 +1989,10 @@ def _archive_edge(store: GraphStore, edge: MemoryEdge) -> None:
     store.update_edge_fields(edge.id, properties=properties)
 
 
-def _mark_artifact_compiled(store: GraphStore, artifact: SourceArtifact, parse_result: DocumentParseResult) -> None:
+def _mark_artifact_compiled(
+    store: GraphStore, artifact: SourceArtifact, parse_result: DocumentParseResult, fingerprint: str,
+) -> None:
+    """Persist content and compiler provenance only after artifact compilation finishes."""
     node = _get_node(store, artifact.id)
     if node is None:
         return
@@ -2030,6 +2008,8 @@ def _mark_artifact_compiled(store: GraphStore, artifact: SourceArtifact, parse_r
     properties.update(
         {
             "last_compiled_at": now,
+            "compiled_sha256": artifact.sha256,
+            "compilation_fingerprint": fingerprint,
             "status": status,
             "context_scope": artifact_context_scope(artifact),
             "parser_name": parse_result.parser_name,
@@ -2972,6 +2952,9 @@ def _solidity_base_is_interface(code_result: CodeParseResult, base: str, target:
 
 
 def _should_record_unresolved_call(target: str | None, *, imported_names: set[str] | None = None) -> bool:
+    """Keep computed dispatch visible even when its receiver starts with a builtin."""
+    if target and is_computed_reference(target):
+        return True
     clean = _clean_call_target(target)
     if clean is None:
         return False
@@ -3502,10 +3485,3 @@ def _code_related_edges_for_nodes(store: GraphStore, nodes: list[MemoryNode]) ->
     if not nodes:
         return []
     return _incident_edges(store, [node.id for node in nodes], edge_types=CODE_GRAPH_EDGE_TYPES, limit=max(10000, len(nodes) * len(CODE_GRAPH_EDGE_TYPES) * 10))
-
-
-def _archive_code_node(store: GraphStore, node: MemoryNode) -> None:
-    properties = dict(node.properties)
-    properties["status"] = "archived"
-    properties["updated_at"] = utcnow_iso()
-    store.update_node_fields(node.id, status="archived", properties=properties)

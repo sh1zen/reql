@@ -21,7 +21,7 @@ from ..ast import (
     VerifyFinding,
 )
 from ..errors import REQLSyntaxError
-from .clauses import RESERVED_EXPRESSION_ENDS, SYMBOL_NODE_TYPES, ClauseParserMixin
+from .clauses import RESERVED_EXPRESSION_ENDS, ClauseParserMixin
 
 
 class CommandParserMixin(ClauseParserMixin):
@@ -300,8 +300,7 @@ class CommandParserMixin(ClauseParserMixin):
         order_by: SortSpec | None = None
         while self.current.kind != "EOF":
             if allow_type and (self.match_keyword("TYPE") or self.match_keyword("TYPES")):
-                requested = self._parse_ident_list()
-                node_types = tuple(value for value in requested if value in SYMBOL_NODE_TYPES) or requested
+                node_types = self._parse_ident_list()
             elif self.match_keyword("WHERE"):
                 where = self._parse_condition_until({"RETURN", "ORDER", "LIMIT", "TOP"})
             elif self.match_keyword("RETURN"):

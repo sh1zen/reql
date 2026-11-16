@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
+from itertools import combinations, pairwise
 import math
 import unicodedata
 from typing import TYPE_CHECKING, Any
@@ -80,24 +81,22 @@ class DocumentProcessor:
 
         term_counts: Counter[str] = Counter()
         term_labels: dict[str, str] = {}
-        term_fragments: dict[str, set[str]] = defaultdict(set)
-        term_first_fragment: dict[str, str] = {}
         term_evidence: dict[str, str] = {}
-        term_fragment_counts: dict[tuple[str, str], float] = defaultdict(float)
+        # Per-term insertion order retains the first contributing fragment.
+        term_fragment_counts: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
 
         for item in indexed:
             fragment = item["fragment"]
             terms = item["terms"]
+            evidence = short_label(str(fragment.text or ""), 220)
             for term, count in terms.items():
                 key = _document_key(term)
                 if not _useful_document_term(key):
                     continue
                 term_counts[key] += count
                 term_labels.setdefault(key, term)
-                term_fragments[key].add(fragment.id)
-                term_first_fragment.setdefault(key, fragment.id)
-                term_evidence.setdefault(key, short_label(str(fragment.text or ""), 220))
-                term_fragment_counts[(fragment.id, key)] += count
+                term_evidence.setdefault(key, evidence)
+                term_fragment_counts[key][fragment.id] += count
 
         if not term_counts:
             return DocumentProcessingResult(terms=[], relations=[], raw_events=[], signature={"term_count": 0, "relation_count": 0})
@@ -106,7 +105,8 @@ class DocumentProcessor:
         fragment_total = len(indexed)
         ranked_terms: list[DocumentTerm] = []
         for key, count in term_counts.items():
-            fragment_count = len(term_fragments[key])
+            fragments_for_term = term_fragment_counts[key]
+            fragment_count = len(fragments_for_term)
             score = _term_rank(key, count, max_count=max_count, fragment_count=fragment_count, fragment_total=fragment_total)
             ranked_terms.append(
                 DocumentTerm(
@@ -115,7 +115,7 @@ class DocumentProcessor:
                     rank=score,
                     term_frequency=float(count),
                     fragment_count=fragment_count,
-                    first_fragment_id=term_first_fragment[key],
+                    first_fragment_id=next(iter(fragments_for_term)),
                     evidence=term_evidence[key],
                     term_type="phrase" if " " in key else "token",
                 )
@@ -125,13 +125,11 @@ class DocumentProcessor:
         ranked_keys = {term.key for term in ranked_terms}
 
         raw_events: list[DocumentRawEvent] = []
-        event_map: dict[str, list[DocumentRawEvent]] = defaultdict(list)
         fragment_by_id = {item["fragment"].id: item["fragment"] for item in indexed}
         for term in ranked_terms:
             fragment_counts = [
                 (count, fragment_id)
-                for (fragment_id, key), count in term_fragment_counts.items()
-                if key == term.key
+                for fragment_id, count in term_fragment_counts[term.key].items()
             ]
             fragment_counts.sort(key=lambda item: (-item[0], item[1]))
             for count, fragment_id in fragment_counts[: self.max_events_per_term]:
@@ -149,22 +147,7 @@ class DocumentProcessor:
                     end_line=fragment.end_line,
                 )
                 raw_events.append(event)
-                event_map[term.key].append(event)
-
-        ranked_terms = [
-            DocumentTerm(
-                key=term.key,
-                label=term.label,
-                rank=term.rank,
-                term_frequency=term.term_frequency,
-                fragment_count=term.fragment_count,
-                first_fragment_id=term.first_fragment_id,
-                evidence=term.evidence,
-                term_type=term.term_type,
-                raw_events=event_map.get(term.key, []),
-            )
-            for term in ranked_terms
-        ]
+                term.raw_events.append(event)
 
         relations = self._relations(indexed, ranked_keys, ranked_terms)
         signature = {
@@ -188,24 +171,24 @@ class DocumentProcessor:
         for item in indexed:
             fragment = item["fragment"]
             present = sorted(key for key in item["terms"] if key in ranked_keys)
-            for index, source in enumerate(present):
-                for target in present[index + 1 :]:
-                    pair = (source, target)
-                    pair_counts[pair] += 1
-                    pair_fragments[pair].add(fragment.id)
-                    pair_evidence.setdefault(pair, short_label(str(fragment.text or ""), 260))
+            evidence = short_label(str(fragment.text or ""), 260)
+            for pair in combinations(present, 2):
+                pair_counts[pair] += 1
+                pair_fragments[pair].add(fragment.id)
+                pair_evidence.setdefault(pair, evidence)
         if not pair_counts:
             return []
         max_count = max(pair_counts.values())
         relations: list[DocumentTermRelation] = []
         for pair, count in pair_counts.items():
             source, target = pair
-            rank = clamp((count / max_count) * 0.55 + ((term_rank.get(source, 0.0) + term_rank.get(target, 0.0)) / 2.0) * 0.45)
+            source_rank, target_rank = term_rank[source], term_rank[target]
+            rank = clamp((count / max_count) * 0.55 + ((source_rank + target_rank) / 2.0) * 0.45)
             if rank < 0.18:
                 continue
-            if term_rank.get(target, 0.0) > term_rank.get(source, 0.0):
+            if target_rank > source_rank:
                 source, target = target, source
-            fragment_ids = sorted(pair_fragments.get(pair, set()))
+            fragment_ids = pair_fragments[pair]
             relations.append(
                 DocumentTermRelation(
                     source_key=source,
@@ -214,8 +197,8 @@ class DocumentProcessor:
                     rank=rank,
                     cooccurrence_count=float(count),
                     fragment_count=len(fragment_ids),
-                    evidence_fragment_id=fragment_ids[0],
-                    evidence=pair_evidence.get(pair, ""),
+                    evidence_fragment_id=min(fragment_ids),
+                    evidence=pair_evidence[pair],
                 )
             )
         relations.sort(key=lambda item: (item.rank, item.cooccurrence_count), reverse=True)
@@ -226,7 +209,7 @@ def _fragment_terms(fragment: DocumentFragment) -> dict[str, Any]:
     text = normalize_text(str(fragment.text or ""))
     tokens = _document_tokens(text)
     counts: Counter[str] = Counter(token for token in tokens if _useful_document_term(token))
-    for left, right in zip(tokens, tokens[1:]):
+    for left, right in pairwise(tokens):
         if token_signal_score(left) >= 0.5 and token_signal_score(right) >= 0.5:
             counts[f"{left} {right}"] += 1.4
     for first, second, third in zip(tokens, tokens[1:], tokens[2:]):
@@ -278,7 +261,8 @@ def _has_non_latin_alnum(value: str) -> bool:
 
 
 def _term_rank(term: str, count: float, *, max_count: float, fragment_count: int, fragment_total: int) -> float:
-    specificity = sum(token_signal_score(part) for part in term.split()) / max(1, len(term.split()))
+    parts = term.split()
+    specificity = sum(token_signal_score(part) for part in parts) / max(1, len(parts))
     phrase_boost = 0.14 if " " in term else 0.0
     distribution = math.log1p(fragment_count) / math.log1p(fragment_total)
     frequency = math.log1p(count) / math.log1p(max_count)

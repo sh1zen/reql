@@ -74,7 +74,7 @@ class HubAnalyzer:
                 continue
             specificity = self.specificity.score(node)
             score = _hub_score(node, metrics, specificity)
-            reasons = _hub_reasons(node, metrics, specificity, score)
+            reasons = _hub_reasons(metrics, specificity, score)
             scores.append(
                 HubScore(
                     node_id=node.id,
@@ -127,7 +127,7 @@ class HubAnalyzer:
             return None
         spec = self.specificity.score(node)
         score = _hub_score(node, metrics, spec)
-        return HubScore(node.id, node.type, _hub_label(node), score, (metrics.degree_centrality + metrics.weighted_degree) / 2, spec.specificity, metrics.community_bridge_score, spec.generic_penalty, 0, False, _hub_reasons(node, metrics, spec, score))
+        return HubScore(node.id, node.type, _hub_label(node), score, (metrics.degree_centrality + metrics.weighted_degree) / 2, spec.specificity, metrics.community_bridge_score, spec.generic_penalty, 0, False, _hub_reasons(metrics, spec, score))
 
     def _candidate_nodes(self, *, project_id: str | None, node_types: set[str] | None, limit: int) -> list[MemoryNode]:
         blocked = {"Community", "CompilationRun", "GraphDelta", "ArtifactCacheEntry", "RetrievalTrace"}
@@ -189,7 +189,8 @@ def _hub_score(node: MemoryNode, metrics: CentralityMetrics, spec: SpecificitySc
     return max(0.0, min(1.0, score))
 
 
-def _hub_reasons(node: MemoryNode, metrics: CentralityMetrics, spec: SpecificityScore, score: float) -> list[str]:
+def _hub_reasons(metrics: CentralityMetrics, spec: SpecificityScore, score: float) -> list[str]:
+    """Describe the metrics and penalties used to rank a hub."""
     reasons = [
         f"degree={metrics.degree_centrality:.2f}",
         f"weighted_degree={metrics.weighted_degree:.2f}",

@@ -5,12 +5,13 @@ import argparse
 import json
 import os
 import sys
+from contextlib import AbstractContextManager, nullcontext
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from threading import Event
-from typing import Any
+from typing import Any, TextIO
 
 from api.memory_graph import MemoryGraph
 
@@ -42,6 +43,7 @@ from .storage.maintenance import clear_project_storage
 DEFAULT_STORAGE_DIR = ".reql"
 DEFAULT_STORAGE_FILE = "memory.reql"
 LOCKED_FOR_WRITE_PREFIX = "REQL block store is locked for write: "
+MAX_AGENT_BATCH_CHARS = 512000
 
 
 class _PromptInterrupted(Exception):
@@ -553,6 +555,48 @@ def _print_agent_node(payload: dict[str, Any]) -> None:
     print(f"{node['id']}\t{node_type}\t{node.get('status') or ''}\t{node.get('title') or node.get('content') or ''}")
 
 
+def _agent_batch_rows(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return actionable write receipts without repeating record text or history."""
+    return [{"ref": item["ref"], "id": item["node"]["id"], "revision": item["node"]["revision"],
+             "kind": item["node"]["kind"], "status": item["node"]["status"],
+             "created": item["created"], "changed": item["changed"]} for item in records]
+
+
+def _print_agent_batch(payload: dict[str, Any], *, as_json: bool) -> None:
+    """Render success or partial receipts, retaining an explicit error status."""
+    if as_json:
+        _print_json(payload)
+        return
+    for row in payload["records"]:
+        print(f"{row['ref'] or '-'}\t{row['id']}\t{row['kind']}\t{row['status']}\tr{row['revision']}")
+    if finish := payload.get("finish"):
+        print(f"Agent finished: {finish['agent_id']}\tclosed_session={finish['closed_session_id']}")
+        print(f"Checkpoint: {finish['checkpoint']['id']}\tr{finish['checkpoint']['revision']}")
+    if error := payload.get("error"):
+        print(error["message"], file=sys.stderr)
+        print("Applied records remain saved. Reconcile their current revisions before retrying.", file=sys.stderr)
+
+
+def _read_agent_batch(filename: str) -> Any:
+    """Read bounded JSON from stdin or a file inside the current project."""
+    try:
+        source: AbstractContextManager[TextIO]
+        if filename == "-":
+            source = nullcontext(sys.stdin)
+        else:
+            path = Path(filename).expanduser().resolve()
+            if not path.is_relative_to(Path.cwd().resolve()):
+                raise ValueError("Batch input must be inside the project, or use stdin")
+            source = path.open(encoding="utf-8")
+        with source as stream:
+            text = stream.read(MAX_AGENT_BATCH_CHARS + 1)
+        if len(text) > MAX_AGENT_BATCH_CHARS:
+            raise ValueError(f"Batch input exceeds {MAX_AGENT_BATCH_CHARS} characters")
+        return json.loads(text.removeprefix("\ufeff"))
+    except (OSError, UnicodeError, json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError(f"Cannot read batch JSON: {exc}") from exc
+
+
 def _print_agent_dashboard(payload: dict[str, Any]) -> None:
     """Render the public dashboard followed by the selected private dashboard."""
     public = payload.get("public", payload)
@@ -595,7 +639,7 @@ def _configure_project_overview_parser(parser: argparse.ArgumentParser) -> None:
     """Configure the working-directory project overview command."""
     parser.add_argument("--json", action="store_true", help="Print structured JSON result")
     parser.add_argument("--limit", type=int, default=5, help="Maximum items per overview section (1-20)")
-    parser.add_argument("--details", action="store_true", help="Include full architecture and legacy private history")
+    parser.add_argument("--details", action="store_true", help="Include full architecture and operational history")
 
 
 def _handle_project_overview(context: CommandContext) -> int:
@@ -608,7 +652,7 @@ def _handle_project_overview(context: CommandContext) -> int:
     if args.json:
         _print_json({"format": "reql-project-overview-v1", "project": explanation.to_dict(), "operational": operational})
         return 0
-    from memory.services.coordination import CoordinationStore, render_work_context
+    from memory.services.coordination import render_work_overview
     work = operational["work"]
     if args.details:
         print(explanation.to_markdown())
@@ -617,9 +661,7 @@ def _handle_project_overview(context: CommandContext) -> int:
         print(architecture)
         print("Architecture evidence: reql project explain; focused history: reql project context --query TERMS")
     print("Workstreams: " + json.dumps(work["workstreams"], ensure_ascii=False))
-    for label, items in work["sections"].items():
-        print(f"\n### {label.title()} ({work['counts'][label]})")
-        print(render_work_context({"records": items}, max_chars=1200))
+    print("\n" + render_work_overview(work))
     if args.details:
         for section, label in (("rejected_approaches", "Rejected approaches"), ("done_tasks", "Done"), ("open_tasks", "Open")):
             print(f"\n### {label}")
@@ -654,7 +696,7 @@ def _handle_project_context(args: argparse.Namespace) -> int:
     if args.json:
         _print_json(payload)
     else:
-        print(render_work_context(payload))
+        print(render_work_context(payload, record_id=args.record_id))
     return 0
 
 
@@ -716,6 +758,7 @@ def _handle_project_pipeline(context: CommandContext) -> int:
 
 
 def _configure_project_compile_parser(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--if-stopped", action="store_true", help="Compile only when no watcher is running; report uncertain watcher state")
     parser.add_argument("--max-file-size-mb", type=float, default=None)
     parser.add_argument("--watch", action="store_true", help="Monitor the project filesystem and compile dirty artifacts automatically")
     parser.add_argument("--watch-interval", type=float, default=0.5, help="Maximum seconds to wait between bounded watchdog checks")
@@ -837,7 +880,14 @@ def _handle_detached_project_watch(
         write_watch_state(storage, status="stale", pending_paths=1)
 
     observer = Observer()
-    observer.schedule(_WatchdogChangeHandler(changed, ignored_paths=ignored, on_change=mark_stale), str(root), recursive=True)
+    observer.schedule(
+        _WatchdogChangeHandler(
+            changed, ignored_paths=ignored, storage_path=storage,
+            diagnostics_path=profile_logger.path if profile_logger is not None else None,
+            on_change=mark_stale,
+        ),
+        str(root), recursive=True,
+    )
     print(f"Monitor mode: {root}")
     exit_code = 0
     with StoreLease(lease_target, timeout_seconds=0.0):
@@ -905,6 +955,15 @@ def _handle_project_status(context: CommandContext) -> int:
         print(f"Project: {project_node['label']}")
         print(f"Root: {project_node['properties'].get('root_path')}")
         print(f"Status: {project_node['status']}")
+        compilation = status.get("last_compilation")
+        if compilation is None:
+            print("Last compilation: none (registered project only)")
+        else:
+            print(f"Last compilation: {compilation['status']}")
+            if compilation["error_count"]:
+                print(f"Compilation errors: {compilation['error_count']}")
+                for error in compilation["errors"]:
+                    print(f"  {error}")
         print(f"Artifacts: {status['artifacts']}")
         for artifact_type, count in sorted(status["counts_by_type"].items()):
             print(f"  {artifact_type}: {count}")
@@ -1021,6 +1080,7 @@ def _handle_query_context(context: CommandContext) -> int:
             mode=_query_context_mode_from_args(args),
             scopes=_query_context_scopes_from_args(args),
             include_archived=args.include_archived,
+            include_source=args.source,
         )
         result = context.graph.query_context_result(request)
     except (TypeError, ValueError) as exc:
@@ -1177,12 +1237,45 @@ def _handle_export(context: CommandContext) -> int:
 
 
 def _handle_inspect(context: CommandContext) -> int:
+    """Render source and adjacent facts once, or preserve the complete JSON contract."""
     args = context.args
     result = context.graph.inspect_node(args.node_id, limit=args.limit)
     if not result["found"]:
         print("Node not found", file=sys.stderr)
         return 2
-    _print_json(result)
+    if args.json:
+        _print_json(result)
+        return 0
+    node = result["node"]
+    print(f"{node['id']} [{node['type']}] {node.get('label') or ''}")
+    if location := result.get("location"):
+        print("Location: " + json.dumps(location, ensure_ascii=False))
+    excerpt = result.get("source_excerpt")
+    if excerpt:
+        print(f"Source: {excerpt['source_status']}")
+        if excerpt.get("text"):
+            print(f"{excerpt['path']}:{excerpt['line_start']}-{excerpt['line_end']} sha256={excerpt['sha256']}")
+            print(excerpt["text"])
+            if excerpt.get("truncated"):
+                print(f"[truncated; read {excerpt['path']} lines {excerpt['next_line']}-{excerpt['requested_line_end']} directly]")
+        else:
+            print(f"{excerpt.get('reason', 'No verified source')}. Read the current file directly.")
+    elif node.get("text"):
+        # Non-code records still need their evidence, without dumping large documents.
+        text = node["text"]
+        print("Indexed text (not verified current source):")
+        print(text[:1200])
+        if len(text) > 1200:
+            print(f"[truncated; reql inspect --node-id {node['id']} --json]")
+    for source in result["sources"]:
+        print(f"Source link: {source['node_id']} " + json.dumps(source["location"], ensure_ascii=False))
+    for neighbor in result["neighbors"]:
+        label = str(neighbor.get("other_label") or "")
+        if len(label) > 160:
+            label = label[:160] + "... [truncated]"
+        print(f"{neighbor['direction']} {neighbor['edge_type']} {neighbor['other_id']} "
+              f"[{neighbor['other_type']}] {label}")
+    print("Relations are bounded by --limit. Use --json for full properties and edge provenance.")
     return 0
 
 
@@ -1225,7 +1318,7 @@ def _open(args: argparse.Namespace, config: REQLConfig, profile_logger: Performa
             profile_logger.event("storage.open.start", category="lifecycle", path=str(args.storage), read_only=True)
             try:
                 with profile_logger.span("storage.open", path=str(args.storage), read_only=True):
-                    return MemoryGraph.open(Path(args.storage), config=config, profile_logger=profile_logger, read_only=True, lock_timeout_seconds=0.05)
+                    return MemoryGraph.open(Path(args.storage), config=config, profile_logger=profile_logger, read_only=True, defer_lexical_index=True, lock_timeout_seconds=0.05)
             except StorageError as exc:
                 if "missing REQL storage" not in str(exc):
                     raise
@@ -1235,7 +1328,7 @@ def _open(args: argparse.Namespace, config: REQLConfig, profile_logger: Performa
                 _checkpoint_opened_store_if_needed(graph, profile_logger)
                 return graph
         try:
-            return MemoryGraph.open(Path(args.storage), config=config, read_only=True, lock_timeout_seconds=0.05)
+            return MemoryGraph.open(Path(args.storage), config=config, read_only=True, defer_lexical_index=True, lock_timeout_seconds=0.05)
         except StorageError as exc:
             if "missing REQL storage" not in str(exc):
                 raise
@@ -1350,6 +1443,7 @@ def _add_query_context_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--code", action="store_true", help="Limit context to code symbols and source files")
     parser.add_argument("--docs", action="store_true", help="Limit context to documentation and imported document content")
     parser.add_argument("--test", action="store_true", help="Limit context to tests")
+    parser.add_argument("--source", action="store_true", help="Embed bounded, hash-verified current source (requires --code or --test)")
     parser.add_argument("--json", action="store_true", help="Print structured JSON result")
 
 
@@ -1642,11 +1736,25 @@ def build_parser() -> argparse.ArgumentParser:
     agent_sub = agent.add_subparsers(dest="agent_command", required=True)
     agent_init = agent_sub.add_parser("init", help="Create or resume this agent's active session")
     agent_init.add_argument("--name", default=None, help="Name for a newly created session")
+    agent_init.add_argument("--task", dest="task_id", default=None, help="Claim an assigned task and return its scoped work context")
+    agent_init.add_argument("--revision", dest="expected_revision", type=int, default=None, help="Observed task revision for the claim")
     agent_init.add_argument("--json", action="store_true", help="Print structured JSON result")
+    agent_batch = agent_sub.add_parser("batch", help="Apply ordered shared records with compact receipts; stop on errors", epilog=(
+        "Input is a JSON array. Create with kind/content; update with record_id/expected_revision and changed fields. "
+        "Omitted kind/content stay unchanged inside the write transaction. Other fields use Python API names. "
+        "Use rationale for --why, record_id for --id, expected_revision for --revision, and next_action for --next. "
+        'An optional ref names an entry. Relation fields can use {"ref":"earlier-name"} for an earlier record id. '
+        "Each record is atomic. Earlier successful writes remain saved on failure. "
+        "--finish runs only after all writes succeed."
+    ))
+    agent_batch.add_argument("--file", default="-", help="Project-local JSON array file, or - for stdin")
+    agent_batch.add_argument("--name", default=None, help="Explicitly create or resume a named session before the batch")
+    agent_batch.add_argument("--finish", dest="finish_summary", default=None, help="Finish the session only after all records succeed")
+    agent_batch.add_argument("--json", action="store_true", help="Print compact structured receipts, including applied records on failure")
     agent_record = agent_sub.add_parser("record", help="Create or reconcile durable shared engineering work")
     from memory.services.coordination import KINDS, STATUSES
-    agent_record.add_argument("kind", choices=sorted(KINDS))
-    agent_record.add_argument("content")
+    agent_record.add_argument("kind", choices=sorted(KINDS), nargs="?", help="Required for creation. Omitted updates retain the stored kind.")
+    agent_record.add_argument("content", nargs="?", help="Required for creation. Omitted updates retain the stored content.")
     agent_record.add_argument("--key", default=None, help="Stable name for deduplication within kind/workstream")
     agent_record.add_argument("--id", dest="record_id", default=None, help="Existing shared record to update")
     agent_record.add_argument("--revision", dest="expected_revision", type=int, default=None)
@@ -1703,6 +1811,8 @@ def build_parser() -> argparse.ArgumentParser:
     agent_dashboard.add_argument("--json", action="store_true", help="Print structured JSON result")
     agent_finish = agent_sub.add_parser("finish", help="Publish final context, close the session, and mark this agent completed")
     agent_finish.add_argument("summary", help="Final message published to shared dashboard context")
+    agent_finish.add_argument("--task", dest="task_id", default=None, help="Complete an assigned task and clear its next action before finish")
+    agent_finish.add_argument("--revision", dest="expected_revision", type=int, default=None, help="Observed task revision for completion")
     agent_finish.add_argument("--json", action="store_true", help="Print structured JSON result")
     agent_terminate = agent_sub.add_parser("terminate", help="Force-terminate a stale agent and release its private store")
     agent_terminate.add_argument("agent_id")
@@ -1932,11 +2042,21 @@ def _main(argv: list[str] | None = None) -> int:
             _print_project_watch_status(payload)
         return 0
 
+    if args.command == "project" and args.project_command == "compile" and args.if_stopped:
+        if args.watch:
+            raise ValueError("--if-stopped cannot be combined with --watch")
+        watcher = _project_watch_status(args.storage, args.path)
+        if watcher["status"] == "running":
+            print("Watcher running; graph refresh remains with the watcher.")
+            return 0
+        if watcher["status"] != "stopped":
+            raise ValueError("Watcher state is uncertain. Check project watch-status and storage locks before refresh.")
+
     if args.command == "project" and args.project_command == "context":
         return _handle_project_context(args)
 
     if args.command == "agent":
-        from memory.agent import AgentIdentitySelectionError, AgentWorkspace
+        from memory.agent import AgentBatchError, AgentIdentitySelectionError, AgentWorkspace
 
         if args.agent_command == "list":
             result = AgentWorkspace.list_registered_agents(args.storage, include_all=args.all_agents, config=config)
@@ -1961,12 +2081,13 @@ def _main(argv: list[str] | None = None) -> int:
         if args.agent_command == "show":
             from memory.services.coordination import CoordinationStore
             shared = CoordinationStore(Path(args.storage).with_name("agent-dashboard.reql"))
-            matches = [item for item in shared.records() if item["id"] == args.id]
-            if matches:
+            item = shared.find(args.id)
+            if item is not None:
                 if args.json:
-                    _print_json({"kind": "node", "node": matches[0]})
+                    _print_json({"kind": "node", "node": item})
                 else:
-                    _print_json(matches[0])
+                    from memory.services.coordination import render_work_context
+                    print(render_work_context(shared.context(record_id=args.id, limit=1, include_history=True), record_id=args.id))
                 return 0
         if args.agent_command == "search":
             result = AgentWorkspace.search_dashboards(args.storage, args.query, limit=args.limit, config=config)
@@ -1990,7 +2111,7 @@ def _main(argv: list[str] | None = None) -> int:
         )
         try:
             if args.agent_command == "init":
-                result = workspace.init(name=args.name)
+                result = workspace.init(name=args.name, task_id=args.task_id, expected_revision=args.expected_revision)
                 if args.json:
                     _print_json(result)
                 else:
@@ -2000,6 +2121,17 @@ def _main(argv: list[str] | None = None) -> int:
                     if session := result.get("session"):
                         print(f"Started session: {session['title']}")
                     _print_agent_retention(result.get("retention") or {})
+                    if task := result.get("claimed_task"):
+                        from memory.services.coordination import render_work_context
+                        print(f"Claimed task: {task['id']}\tr{task['revision']}")
+                        print(render_work_context(result["work_context"], max_chars=4000, record_id=task['id']))
+                return 0
+            if args.agent_command == "batch":
+                result = workspace.record_many(_read_agent_batch(args.file), name=args.name, finish_summary=args.finish_summary)
+                payload: dict[str, Any] = {"records": _agent_batch_rows(result["records"])}
+                if finish := result.get("finish"):
+                    payload["finish"] = {key: finish[key] for key in ("agent_id", "status", "closed_session_id", "checkpoint")}
+                _print_agent_batch(payload, as_json=args.json)
                 return 0
             if args.agent_command == "record":
                 names = ("key", "record_id", "expected_revision", "status", "rationale", "files", "workstream", "parent", "depends_on", "contradicts", "supersedes", "summarizes", "next_action", "importance")
@@ -2007,7 +2139,9 @@ def _main(argv: list[str] | None = None) -> int:
                 if args.json:
                     _print_json(result)
                 else:
-                    _print_agent_node(result)
+                    # A write receipt reuses the submitted text instead of echoing it.
+                    node = result["node"]
+                    print(f"{node['id']}\t{node['kind']}\t{node['status']}")
                     print(f"Revision: {result['node']['revision']}")
                 return 0
             if args.agent_command == "status":
@@ -2087,7 +2221,7 @@ def _main(argv: list[str] | None = None) -> int:
                     _print_agent_dashboard(result)
                 return 0
             if args.agent_command == "finish":
-                result = workspace.finish(args.summary)
+                result = workspace.finish(args.summary, task_id=args.task_id, expected_revision=args.expected_revision)
                 if args.json:
                     _print_json(result)
                 else:
@@ -2096,11 +2230,19 @@ def _main(argv: list[str] | None = None) -> int:
                         f"\tclosed_session={result.get('closed_session_id') or 'none'}"
                     )
                     _print_agent_retention(result.get("retention") or {})
+                    if task := result.get("completed_task"):
+                        print(f"Completed task: {task['id']}\tr{task['revision']}")
+                    print(f"Checkpoint: {result['checkpoint']['id']}\tr{result['checkpoint']['revision']}")
                 return 0
             if args.agent_command == "export":
                 result = workspace.export(include_metadata=args.metadata)
                 _print_json(result)
                 return 0
+        except AgentBatchError as exc:
+            _print_agent_batch({"records": _agent_batch_rows(exc.records), "error": {
+                "code": "batch_incomplete", "message": str(exc), "failed_entry": exc.failed_entry,
+            }}, as_json=args.json)
+            return 1 if isinstance(exc.__cause__, StorageError) else 2
         except ValueError as exc:
             _print_agent_command_error(exc, args)
             return 2

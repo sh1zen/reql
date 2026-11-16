@@ -113,31 +113,6 @@ class QueryEvaluator:
     def _is_graph_layer_node(node: MemoryNode | None) -> bool:
         return node is not None
 
-    def _is_graph_layer_edge(self, edge: MemoryEdge) -> bool:
-        return self._is_graph_layer_node(self.store.get_node(edge.from_id)) and self._is_graph_layer_node(self.store.get_node(edge.to_id))
-
-    def _count_graph_nodes(self, node_types: set[str] | None = None, statuses: set[str] | None = None) -> int:
-        count_nodes = getattr(self.store, "count_nodes", None)
-        if callable(count_nodes):
-            return int(count_nodes(node_types=node_types, statuses=statuses))
-        return sum(
-            1
-            for node in self.store.all_nodes()
-            if self._is_graph_layer_node(node)
-            and (node_types is None or node.type in node_types)
-            and (statuses is None or node.status in statuses)
-        )
-
-    def _count_graph_edges(self, edge_types: set[str] | None = None) -> int:
-        count_edges = getattr(self.store, "count_edges", None)
-        if callable(count_edges):
-            return int(count_edges(edge_types=edge_types))
-        return sum(
-            1
-            for edge in self.store.all_edges()
-            if (edge_types is None or edge.type in edge_types) and self._is_graph_layer_edge(edge)
-        )
-
     def execute(self, source_or_statement: str | Statement) -> QueryResult:
         profile = getattr(self.graph, "profile_logger", None)
         if isinstance(source_or_statement, str):
@@ -188,129 +163,24 @@ class QueryEvaluator:
             return self._verify_finding(source, statement)
         raise REQLEvaluationError(f"Unsupported statement: {statement!r}")
 
-    def _indexed_node_candidates(
-        self,
-        condition: Condition | None,
-        node_types: Sequence[str],
-        include_archived: bool,
-        *,
-        limit: int,
-    ) -> list[MemoryNode] | None:
-        comparison = _simple_indexable_comparison(condition)
-        if comparison is None:
-            return None
-        field = _strip_default_alias(comparison.field, "node")
-        statuses = None if include_archived else sorted(ACTIVE_STATUSES)
-        if field == "id":
-            node = self.store.get_node(str(comparison.value))
-            return [node] if node and (include_archived or node.status in ACTIVE_STATUSES) else []
-        if field == "type":
-            types = [str(comparison.value)]
-            if node_types:
-                requested = {item.casefold() for item in node_types}
-                types = [item for item in types if item.casefold() in requested]
-            out: list[MemoryNode] = []
-            for type_ in types:
-                out.extend(self.store.find_nodes(type_=type_, status=statuses, limit=limit, order_by="salience"))
-            return out[:limit]
-        if field == "status":
-            out: list[MemoryNode] = []
-            scoped_types = tuple(node_types) if node_types else (None,)
-            for type_ in scoped_types:
-                out.extend(self.store.find_nodes(type_=type_, status=str(comparison.value), limit=limit, order_by="updated_at"))
-            return out[:limit]
-        out = []
-        scoped_types = tuple(node_types) if node_types else (None,)
-        for type_ in scoped_types:
-            out.extend(self.store.find_nodes_by_property(field, comparison.value, type_=type_, status=statuses, limit=limit))
-        return out[:limit]
+    def _node_candidates(self, condition: Condition | None, node_types: Sequence[str]) -> list[MemoryNode]:
+        """Use complete type scopes; exact property postings cannot implement REQL equality."""
+        types = _matching_types(self.store.node_type_counts(), node_types, condition, aliases=("node",))
+        return self.store.find_nodes_by_types(types, clone=False)
 
-    def _indexed_edge_candidates(
-        self,
-        condition: Condition | None,
-        edge_types: Sequence[str],
-        *,
-        limit: int,
-    ) -> list[MemoryEdge] | None:
-        comparison = _simple_indexable_comparison(condition)
-        if comparison is None:
-            return None
-        field = _strip_default_alias(comparison.field, "edge")
-        if field == "id":
-            edge = self.store.get_edge(str(comparison.value)) if hasattr(self.store, "get_edge") else None
-            return [edge] if edge else []
-        if field == "type":
-            types = [str(comparison.value)]
-            if edge_types:
-                requested = {item.casefold() for item in edge_types}
-                types = [item for item in types if item.casefold() in requested]
-            out: list[MemoryEdge] = []
-            for type_ in types:
-                out.extend(self.store.get_edges(type_=type_, limit=limit))
-            return out[:limit]
-        out = []
-        scoped_types = tuple(edge_types) if edge_types else (None,)
-        for type_ in scoped_types:
-            out.extend(self.store.find_edges_by_property(field, comparison.value, type_=type_, limit=limit))
-        return out[:limit]
+    def _edge_candidates(self, condition: Condition | None, edge_types: Sequence[str]) -> list[MemoryEdge]:
+        """Resolve case-insensitive types before loading their complete indexed edge union."""
+        types = _matching_types(self.store.edge_type_counts(), edge_types, condition, aliases=("edge", "r"))
+        return self.store.get_edges(type_=types, limit=None, clone=False) if types else []
 
     # ------------------------------------------------------------------
     # FIND
     # ------------------------------------------------------------------
     def _find_nodes(self, source: str, statement: FindNodes) -> QueryResult:
-        allowed_types = _casefold_set(statement.node_types)
-        indexed_nodes = self._indexed_node_candidates(statement.where, statement.node_types, statement.include_archived, limit=max(statement.limit * 20, 1000))
-        if indexed_nodes is not None:
-            row_objects: list[dict[str, Any]] = []
-            for node in indexed_nodes:
-                if not self._is_graph_layer_node(node):
-                    continue
-                if allowed_types and node.type.casefold() not in allowed_types:
-                    continue
-                if not statement.include_archived and node.status not in ACTIVE_STATUSES:
-                    continue
-                row = {"node": node}
-                if statement.where and not evaluate_condition(statement.where, row, default_alias="node"):
-                    continue
-                row_objects.append(row)
-            if statement.order_by:
-                row_objects.sort(
-                    key=lambda row: _sort_key(resolve_field(row, statement.order_by.field, default_alias="node")),
-                    reverse=statement.order_by.descending,
-                )
-            else:
-                row_objects.sort(key=lambda row: (row["node"].salience, row["node"].activation, row["node"].updated_at), reverse=True)
-            columns = _columns(statement.returns, DEFAULT_NODE_COLUMNS)
-            rows = [project_row(row, columns, default_alias="node") for row in row_objects[: statement.limit]]
-            return QueryResult(source, "FIND NODES", columns, rows, {"matched": len(row_objects), "indexed": True})
-        if statement.where is None and statement.order_by is None:
-            node_types = set(statement.node_types) if statement.node_types else None
-            statuses = None if statement.include_archived else set(ACTIVE_STATUSES)
-            status_filter = None if statuses is None else sorted(statuses)
-            if node_types:
-                nodes = [
-                    node
-                    for type_ in sorted(node_types)
-                    for node in self.store.find_nodes(type_=type_, status=status_filter, limit=statement.limit, order_by="salience")
-                ]
-                nodes.sort(key=lambda node: (node.salience, node.activation, node.updated_at), reverse=True)
-                nodes = nodes[: statement.limit]
-            elif statement.node_types:
-                nodes = []
-            else:
-                nodes = self.store.find_nodes(status=status_filter, limit=max(statement.limit * 20, 1000), order_by="salience")
-                nodes = [node for node in nodes if self._is_graph_layer_node(node)][: statement.limit]
-            columns = _columns(statement.returns, DEFAULT_NODE_COLUMNS)
-            rows = [project_row({"node": node}, columns, default_alias="node") for node in nodes]
-            matched = self._count_graph_nodes(node_types=node_types, statuses=statuses)
-            return QueryResult(source, "FIND NODES", columns, rows, {"matched": matched})
-        nodes = self.store.all_nodes()
-        rows: list[dict[str, Any]] = []
+        """Filter all eligible nodes, then order and limit the final rows."""
         row_objects: list[dict[str, Any]] = []
-        for node in nodes:
+        for node in self._node_candidates(statement.where, statement.node_types):
             if not self._is_graph_layer_node(node):
-                continue
-            if allowed_types and node.type.casefold() not in allowed_types:
                 continue
             if not statement.include_archived and node.status not in ACTIVE_STATUSES:
                 continue
@@ -326,35 +196,15 @@ class QueryEvaluator:
         else:
             row_objects.sort(key=lambda row: (row["node"].salience, row["node"].activation, row["node"].updated_at), reverse=True)
         columns = _columns(statement.returns, DEFAULT_NODE_COLUMNS)
-        for row in row_objects[: statement.limit]:
-            rows.append(project_row(row, columns, default_alias="node"))
+        rows = [project_row(row, columns, default_alias="node") for row in row_objects[:statement.limit]]
         return QueryResult(source, "FIND NODES", columns, rows, {"matched": len(row_objects)})
 
     def _find_edges(self, source: str, statement: FindEdges) -> QueryResult:
-        allowed_types = _casefold_set(statement.edge_types)
-        if statement.where is None and statement.order_by is None:
-            edge_types = set(statement.edge_types) if statement.edge_types else None
-            row_objects = []
-            for edge in self.store.get_edges(type_=sorted(edge_types) if edge_types else None, limit=max(statement.limit * 20, 1000)):
-                from_node = self.store.get_node(edge.from_id)
-                to_node = self.store.get_node(edge.to_id)
-                if not self._is_graph_layer_node(from_node) or not self._is_graph_layer_node(to_node):
-                    continue
-                row_objects.append({"edge": edge, "r": edge, "from": from_node, "to": to_node})
-                if len(row_objects) >= statement.limit:
-                    break
-            columns = _columns(statement.returns, DEFAULT_EDGE_COLUMNS)
-            rows = [project_row(row, columns, default_alias="edge") for row in row_objects]
-            return QueryResult(source, "FIND EDGES", columns, rows, {"matched": self._count_graph_edges(edge_types=edge_types)})
+        """Apply endpoint predicates and final ordering before limiting edge results."""
         row_objects: list[dict[str, Any]] = []
-        candidate_edges = self._indexed_edge_candidates(statement.where, statement.edge_types, limit=max(statement.limit * 20, 1000))
-        if candidate_edges is None:
-            candidate_edges = self.store.all_edges()
-        for edge in candidate_edges:
-            if allowed_types and edge.type.casefold() not in allowed_types:
-                continue
-            from_node = self.store.get_node(edge.from_id)
-            to_node = self.store.get_node(edge.to_id)
+        for edge in self._edge_candidates(statement.where, statement.edge_types):
+            from_node = self.store.get_node(edge.from_id, clone=False)
+            to_node = self.store.get_node(edge.to_id, clone=False)
             if not self._is_graph_layer_node(from_node) or not self._is_graph_layer_node(to_node):
                 continue
             row = {"edge": edge, "r": edge, "from": from_node, "to": to_node}
@@ -369,7 +219,7 @@ class QueryEvaluator:
         else:
             row_objects.sort(key=lambda row: (row["edge"].weight, row["edge"].confidence, row["edge"].updated_at), reverse=True)
         columns = _columns(statement.returns, DEFAULT_EDGE_COLUMNS)
-        rows = [project_row(row, columns, default_alias="edge") for row in row_objects[: statement.limit]]
+        rows = [project_row(row, columns, default_alias="edge") for row in row_objects[:statement.limit]]
         return QueryResult(source, "FIND EDGES", columns, rows, {"matched": len(row_objects)})
 
     # ------------------------------------------------------------------
@@ -447,14 +297,12 @@ class QueryEvaluator:
     # MATCH / PATH
     # ------------------------------------------------------------------
     def _match(self, source: str, statement: Match) -> QueryResult:
+        """Bind pattern variables once, then filter and rank the complete edge scope."""
         edge_types = _casefold_set(statement.edge.types)
         left_type = statement.left.type_.casefold() if statement.left.type_ else None
         right_type = statement.right.type_.casefold() if statement.right.type_ else None
         rows_objects: list[dict[str, Any]] = []
-        if statement.edge.types:
-            edge_iterable = self.store.get_edges(type_=sorted(statement.edge.types), limit=max(statement.limit * 50, 10000))
-        else:
-            edge_iterable = self.store.all_edges()
+        edge_iterable = self._edge_candidates(None, statement.edge.types)
         for edge in edge_iterable:
             if edge_types and edge.type.casefold() not in edge_types:
                 continue
@@ -467,14 +315,16 @@ class QueryEvaluator:
             candidates: list[tuple[MemoryNode, MemoryNode, MemoryEdge]] = []
             if statement.edge.direction in {"out", "both"}:
                 candidates.append((left, right, edge))
-            if statement.edge.direction in {"in", "both"}:
+            if statement.edge.direction == "in" or (statement.edge.direction == "both" and left.id != right.id):
                 candidates.append((right, left, edge))
             for a, b, r in candidates:
                 if left_type and a.type.casefold() != left_type:
                     continue
                 if right_type and b.type.casefold() != right_type:
                     continue
-                row = {statement.left.alias: a, statement.edge.alias: r, statement.right.alias: b, "a": a, "r": r, "b": b}
+                if statement.left.alias == statement.right.alias and a.id != b.id:
+                    continue
+                row = {statement.left.alias: a, statement.edge.alias: r, statement.right.alias: b}
                 if statement.where and not evaluate_condition(statement.where, row, default_alias=statement.left.alias):
                     continue
                 rows_objects.append(row)
@@ -485,7 +335,12 @@ class QueryEvaluator:
             )
         else:
             rows_objects.sort(key=lambda row: (row[statement.edge.alias].weight, row[statement.left.alias].salience, row[statement.right.alias].salience), reverse=True)
-        columns = _columns(statement.returns, DEFAULT_MATCH_COLUMNS)
+        aliases = {"a": statement.left.alias, "r": statement.edge.alias, "b": statement.right.alias}
+        defaults = []
+        for column in DEFAULT_MATCH_COLUMNS:
+            alias, field = column.split(".", 1)
+            defaults.append(f"{aliases[alias]}.{field}")
+        columns = _columns(statement.returns, defaults)
         rows = [project_row(row, columns, default_alias=statement.left.alias) for row in rows_objects[: statement.limit]]
         return QueryResult(source, "MATCH", columns, rows, {"matched": len(rows_objects), "left_alias": statement.left.alias, "edge_alias": statement.edge.alias, "right_alias": statement.right.alias})
 
@@ -596,25 +451,25 @@ class QueryEvaluator:
         return QueryResult(source, "EXPLAIN NODE", DEFAULT_EXPLAIN_NODE_COLUMNS, rows[: statement.limit], {"node": _node_brief(node), "degree": self.store.degree(node.id)})
 
     def _stats(self, source: str, statement: Stats) -> QueryResult:
+        """Apply the same case-insensitive type scope used by row queries."""
+        type_counts = self.store.node_type_counts()
+        node_types = (
+            set(_matching_types(type_counts, statement.node_types, None, aliases=("node",)))
+            if statement.node_types else None
+        )
         if not statement.group_by:
-            node_types = set(statement.node_types) if statement.node_types else None
-            rows = [{"nodes": self._count_graph_nodes(node_types=node_types), "edges": self._count_graph_edges()}]
+            rows = [{"nodes": self.store.count_nodes(node_types=node_types), "edges": self.store.count_edges()}]
             return QueryResult(source, "STATS", ["nodes", "edges"], rows)
         if len(statement.group_by) == 1 and statement.group_by[0] in {"type", "node.type"}:
-            allowed = set(statement.node_types) if statement.node_types else None
-            counts = self.store.node_type_counts()
             columns = [statement.group_by[0], "count"]
             rows = [
                 {statement.group_by[0]: type_, "count": count}
-                for type_, count in sorted(counts.items(), key=lambda item: item[1], reverse=True)
-                if allowed is None or type_ in allowed
+                for type_, count in sorted(type_counts.items(), key=lambda item: item[1], reverse=True)
+                if node_types is None or type_ in node_types
             ]
             return QueryResult(source, "STATS", columns, rows)
-        nodes = self.store.all_nodes()
+        nodes = self._node_candidates(None, statement.node_types)
         nodes = [node for node in nodes if self._is_graph_layer_node(node)]
-        if statement.node_types:
-            allowed = _casefold_set(statement.node_types)
-            nodes = [node for node in nodes if node.type.casefold() in allowed]
         counts: Counter[tuple[Any, ...]] = Counter()
         for node in nodes:
             row = {"node": node}
@@ -676,54 +531,9 @@ class QueryEvaluator:
         return QueryResult(source, "HUBS", columns, rows, {"warnings": report.warnings})
 
     def _typed_node_list(self, source: str, statement: TypedNodeList) -> QueryResult:
-        allowed = _casefold_set(statement.node_types)
-        indexed_nodes = self._indexed_node_candidates(statement.where, statement.node_types, include_archived=False, limit=max(statement.limit * 20, 1000))
-        if indexed_nodes is not None:
-            row_objects = []
-            for node in indexed_nodes:
-                if allowed and node.type.casefold() not in allowed:
-                    continue
-                if node.status not in ACTIVE_STATUSES:
-                    continue
-                if statement.command == "DELTAS" and node.properties.get("kind") not in {"compilation", None}:
-                    continue
-                row = _node_listing_row(node)
-                if statement.where and not evaluate_condition(statement.where, row, default_alias="node"):
-                    continue
-                row_objects.append(row)
-            default_order = _typed_node_default_order(statement.command)
-            row_objects = _sort_rows(row_objects, statement.order_by, default_order)
-            columns = _columns(statement.returns, DEFAULT_LIST_COLUMNS[statement.command])
-            rows = [project_row(row, columns, default_alias="node") for row in row_objects[: statement.limit]]
-            return QueryResult(source, statement.command, columns, rows, {"matched": len(row_objects), "node_types": list(statement.node_types), "indexed": True})
-        if statement.where is None:
-            default_order = _typed_node_default_order(statement.command)
-            fetch_limit = max(statement.limit * 50, 10000) if statement.command == "FINDINGS" else statement.limit
-            nodes = [
-                node
-                for type_ in sorted(statement.node_types)
-                for node in self.store.find_nodes(
-
-                    type_=type_,
-                    status=sorted(ACTIVE_STATUSES),
-                    limit=fetch_limit,
-                    order_by=default_order,
-                    descending=True,
-                )
-                if node.status in ACTIVE_STATUSES
-            ]
-            if statement.command == "DELTAS":
-                nodes = [node for node in nodes if node.properties.get("kind") in {"compilation", None}]
-            row_objects = [_node_listing_row(node) for node in nodes]
-            row_objects = _sort_rows(row_objects, statement.order_by, default_order)
-            columns = _columns(statement.returns, DEFAULT_LIST_COLUMNS[statement.command])
-            rows = [project_row(row, columns, default_alias="node") for row in row_objects[: statement.limit]]
-            matched = sum(self.store.count_nodes(node_types={type_}, statuses=set(ACTIVE_STATUSES)) for type_ in statement.node_types)
-            return QueryResult(source, statement.command, columns, rows, {"matched": matched, "node_types": list(statement.node_types)})
+        """Share complete candidate selection and apply the command's final row ordering."""
         row_objects: list[dict[str, Any]] = []
-        for node in self.store.all_nodes():
-            if allowed and node.type.casefold() not in allowed:
-                continue
+        for node in self._node_candidates(statement.where, statement.node_types):
             if node.status not in ACTIVE_STATUSES:
                 continue
             if statement.command == "DELTAS" and node.properties.get("kind") not in {"compilation", None}:
@@ -735,7 +545,7 @@ class QueryEvaluator:
         default_order = _typed_node_default_order(statement.command)
         row_objects = _sort_rows(row_objects, statement.order_by, default_order)
         columns = _columns(statement.returns, DEFAULT_LIST_COLUMNS[statement.command])
-        rows = [project_row(row, columns, default_alias="node") for row in row_objects[: statement.limit]]
+        rows = [project_row(row, columns, default_alias="node") for row in row_objects[:statement.limit]]
         return QueryResult(source, statement.command, columns, rows, {"matched": len(row_objects), "node_types": list(statement.node_types)})
 
     def _cache_status(self, source: str, statement: CacheStatus) -> QueryResult:
@@ -1201,7 +1011,7 @@ def _like(actual: str, pattern: str, *, case_sensitive: bool) -> bool:
 
 def _equal(actual: Any, expected: Any) -> bool:
     if isinstance(actual, (int, float)) and isinstance(expected, (int, float)):
-        return float(actual) == float(expected)
+        return actual == expected
     if isinstance(actual, bool) or isinstance(expected, bool):
         return bool(actual) is bool(expected)
     if actual is None or expected is None:
@@ -1210,6 +1020,8 @@ def _equal(actual: Any, expected: Any) -> bool:
 
 
 def _coerce_orderable(actual: Any, expected: Any) -> tuple[Any, Any]:
+    if isinstance(actual, (int, float)) and isinstance(expected, (int, float)):
+        return actual, expected
     try:
         if isinstance(actual, (int, float)) or isinstance(expected, (int, float)):
             return float(actual), float(expected)
@@ -1322,17 +1134,24 @@ def _columns(return_spec: Any, defaults: list[str]) -> list[str]:
     return list(return_spec.fields)
 
 
-def _simple_indexable_comparison(condition: Condition | None) -> Comparison | None:
-    if condition is None:
-        return None
-    if isinstance(condition, Comparison) and condition.operator in {"=", "=="}:
-        return condition
+def _matching_types(
+    available: Iterable[str], requested: Sequence[str], condition: Condition | None, *, aliases: Sequence[str],
+) -> list[str]:
+    """Restrict structural candidates only with predicates guaranteed by an AND branch."""
+    allowed = _casefold_set(requested)
+    constraints = _type_constraints(condition, aliases=aliases)
+    return [type_ for type_ in available if (not allowed or type_.casefold() in allowed)
+            and all(_equal(type_, constraint.value) for constraint in constraints)]
+
+
+def _type_constraints(condition: Condition | None, *, aliases: Sequence[str]) -> list[Comparison]:
+    """Other equality fields may use aliases, nulls or case folding absent from exact indexes."""
+    if isinstance(condition, Comparison) and condition.operator in {"=", "==", "IS"}:
+        if condition.field == "type" or condition.field in {f"{alias}.type" for alias in aliases}:
+            return [condition]
     if isinstance(condition, BooleanCondition) and condition.operator == "AND":
-        left = _simple_indexable_comparison(condition.left)
-        if left is not None:
-            return left
-        return _simple_indexable_comparison(condition.right)
-    return None
+        return [*_type_constraints(condition.left, aliases=aliases), *_type_constraints(condition.right, aliases=aliases)]
+    return []
 
 
 def _strip_default_alias(field: str, default_alias: str) -> str:
@@ -1346,8 +1165,8 @@ def _sort_key(value: Any) -> tuple[int, Any]:
     if value is None:
         return (0, "")
     if isinstance(value, (int, float)):
-        return (1, float(value))
-    return (1, str(value).casefold())
+        return (1, value)
+    return (2, str(value).casefold())
 
 
 def _casefold_set(values: Iterable[str]) -> set[str]:

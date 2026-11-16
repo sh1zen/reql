@@ -82,12 +82,12 @@ def _selected_token_weights(value: str, limit: int) -> dict[str, float]:
 
 
 def _select_tokens(ordered: list[str], counts: Counter[str], limit: int) -> list[str]:
-    """Balance rare, high-signal tokens with positional coverage."""
+    """Select from unique tokens under the caller's positive token budget."""
     if len(ordered) <= limit:
         return ordered
 
     priority_slots = max(1, int(limit * 0.75))
-    priority = sorted(
+    selected = sorted(
         ordered,
         key=lambda token: (
             token_signal_score(token),
@@ -96,34 +96,18 @@ def _select_tokens(ordered: list[str], counts: Counter[str], limit: int) -> list
         ),
         reverse=True,
     )[:priority_slots]
-    selected = list(priority)
     selected_set = set(selected)
 
     remaining = [token for token in ordered if token not in selected_set]
-    slots = max(0, limit - len(selected))
-    if not remaining or slots <= 0:
-        return selected[:limit]
-    if len(remaining) <= slots:
-        selected.extend(remaining)
-        return selected[:limit]
+    slots = limit - len(selected)
 
     # Preserve positional coverage as well as high-signal/rare terms.  This is
     # what prevents terms near the middle or tail of a long PDF page from being
     # systematically invisible to lexical retrieval.
-    for index in range(slots):
-        position = min(len(remaining) - 1, (index * len(remaining)) // slots)
-        token = remaining[position]
-        if token not in selected_set:
-            selected.append(token)
-            selected_set.add(token)
-    if len(selected) < limit:
-        for token in remaining:
-            if token in selected_set:
-                continue
-            selected.append(token)
-            if len(selected) >= limit:
-                break
-    return selected[:limit]
+    # There are more remaining unique tokens than slots, so these positions
+    # are distinct and cannot overlap the priority selection.
+    selected.extend(remaining[(index * len(remaining)) // slots] for index in range(slots))
+    return selected
 
 
 def _token_index_weight(token: str, count: int) -> float:

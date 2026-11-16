@@ -58,14 +58,7 @@ class RetrievalSearchMixin:
 
     def _nodes_for_types(self, node_types: Sequence[str]) -> list[MemoryNode]:
         """Load only indexed node types while preserving ``all_nodes`` order."""
-        find_many = getattr(self.store, "find_nodes_by_types", None)
-        if callable(find_many):
-            return find_many(node_types, clone=False)
-        nodes: dict[str, MemoryNode] = {}
-        for node_type in sorted(set(node_types)):
-            for node in self.store.find_nodes(type_=node_type, limit=2**63 - 1, clone=False):
-                nodes.setdefault(node.id, node)
-        return sorted(nodes.values(), key=lambda node: (node.created_at, node.id))
+        return self.store.find_nodes_by_types(node_types, clone=False)
 
     def _scoped_lexical_search(
         self,
@@ -79,23 +72,13 @@ class RetrievalSearchMixin:
     ) -> list[tuple[MemoryNode, float]]:
         allowed_types = set(lexical_node_types) if lexical_node_types is not None else None
         candidate_limit = max(top_k * (8 if scopes & {"docs", "test"} else 4), 160)
-        try:
-            indexed = self.store.lexical_search(
-                query.text,
-                top_k=candidate_limit,
-                node_types=allowed_types,
-                include_archived=query.include_archived,
-                clone=False,
-            )
-        except TypeError:
-            # Preserve compatibility with external GraphStore adapters that
-            # implement the pre-clone keyword signature.
-            indexed = self.store.lexical_search(
-                query.text,
-                top_k=candidate_limit,
-                node_types=allowed_types,
-                include_archived=query.include_archived,
-            )
+        indexed = self.store.lexical_search(
+            query.text,
+            top_k=candidate_limit,
+            node_types=allowed_types,
+            include_archived=query.include_archived,
+            clone=False,
+        )
         candidates = [node for node, _score in indexed]
         if not candidates:
             candidates = self._nodes_for_types(allowed_types) if allowed_types is not None else self.store.all_nodes()

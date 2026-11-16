@@ -2,19 +2,98 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 from api import MemoryGraph
 from memory.artifacts.models import SourceArtifact
+from memory.artifacts.cache import DiskArtifactCache, artifact_cache_path
 from memory.artifacts.structural_links import refresh_project_structural_links
 from memory.code_analysis import TreeSitterCodeParser
+from memory.code_analysis.base import _parser_for
 from memory.code_analysis.languages.generic import GenericProfileTreeSitterExtractor
 from memory.code_analysis.factory import EXTRACTOR_BY_LANGUAGE
 from memory.code_analysis.catalog import CODE_LANGUAGE_CATALOG, load_tree_sitter_language
 
 
 class CodeGraphCompilationTests(unittest.TestCase):
+
+    def test_tree_sitter_constructor_and_grammar_errors_are_not_retried(self) -> None:
+        """Use the current parser API and reject invalid grammar-provider values."""
+        capsule = object()
+
+        class Language:
+            """Stand in for the external grammar constructor at its input boundary."""
+
+            def __init__(self, raw: object) -> None:
+                if raw is not capsule:
+                    raise TypeError("invalid grammar capsule")
+
+        provider = SimpleNamespace(Language=Language)
+        with patch("memory.code_analysis.catalog._load_direct_language", return_value=capsule):
+            language = load_tree_sitter_language(provider, "python")
+        self.assertIsInstance(language, Language)
+        with patch("memory.code_analysis.catalog._load_direct_language", return_value=language):
+            self.assertIs(load_tree_sitter_language(provider, "python"), language)
+        with patch("memory.code_analysis.catalog._load_direct_language", return_value=object()):
+            with self.assertRaisesRegex(TypeError, "invalid grammar capsule"):
+                load_tree_sitter_language(provider, "python")
+        parser = Mock(side_effect=TypeError("parser rejected grammar"))
+        _parser_for.cache_clear()
+        self.addCleanup(_parser_for.cache_clear)
+        with patch("memory.code_analysis.base.import_module", return_value=SimpleNamespace(Parser=parser)), \
+                patch("memory.code_analysis.base.load_tree_sitter_language", return_value=language):
+            with self.assertRaisesRegex(TypeError, "parser rejected grammar"):
+                _parser_for("python")
+        parser.assert_called_once_with(language)
+
+    def test_computed_receivers_remain_unresolved_instead_of_inventing_local_calls(self) -> None:
+        """Computed receivers do not establish which same-named method is called."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "project"
+            root.mkdir()
+            (root / "dispatch.py").write_text(
+                "class Base:\n    def execute(self):\n        return 1\n\n"
+                "class Derived(Base):\n"
+                "    def execute(self):\n        return super().execute()\n"
+                "    def computed(self):\n        return factory().execute()\n"
+                "    def indexed(self, items):\n        return items[0].execute()\n"
+                "    def recursive(self):\n        return self.recursive()\n\n"
+                "def factory():\n    return Base()\n", encoding="utf-8")
+            graph = MemoryGraph.open(Path(td) / "memory.reql")
+            try:
+                self.assertFalse(graph.compile_project(root).run.errors)
+                nodes = {node.properties.get("qualified_name"): node for node in graph.store.all_nodes()
+                         if node.type in {"Function", "Method"}}
+                for method, target in (("execute", "super().execute"), ("computed", "factory().execute"),
+                                       ("indexed", "items[0].execute")):
+                    with self.subTest(method=method):
+                        owner = nodes[f"dispatch.Derived.{method}"]
+                        calls = graph.store.get_edges(from_id=owner.id, type_="CALLS", limit=20)
+                        self.assertFalse(any(edge.to_id in {nodes["dispatch.Derived.execute"].id, nodes["dispatch.Base.execute"].id}
+                                             for edge in calls))
+                        wraps = graph.store.get_edges(from_id=owner.id, type_="WRAPS", limit=20)
+                        self.assertFalse(any(edge.to_id in {nodes["dispatch.Derived.execute"].id, nodes["dispatch.Base.execute"].id}
+                                             for edge in wraps))
+                        self.assertIn(target, {item["target"] for item in owner.properties.get("unresolved_calls", [])})
+                recursive = nodes["dispatch.Derived.recursive"]
+                self.assertTrue(graph.store.get_edges(from_id=recursive.id, to_id=recursive.id, type_="CALLS", limit=1))
+                cached = graph.compile_project(root)
+                self.assertEqual(cached.run.files_changed, 0)
+                artifact = cached.scan.artifacts[0]
+                cache = DiskArtifactCache(artifact_cache_path(root))
+                entry = cache.get_entry(artifact.project_id, artifact.id)
+                if entry is None:
+                    self.fail("Compilation did not persist its artifact cache")
+                cache.upsert_entry(replace(entry, parser_version="project-scan-v10"))
+                refreshed = graph.compile_project(root)
+                self.assertFalse(refreshed.run.errors)
+                self.assertEqual(refreshed.run.files_changed, 1)
+                self.assertEqual(graph.compile_project(root).run.files_changed, 0)
+            finally:
+                graph.close()
 
     def test_each_supported_language_has_registered_extractor_class(self) -> None:
         self.assertEqual(set(CODE_LANGUAGE_CATALOG), set(EXTRACTOR_BY_LANGUAGE))
@@ -86,7 +165,7 @@ class CodeGraphCompilationTests(unittest.TestCase):
                         "        return main()",
                     ]
                 ),
-                encoding="utf-8",
+                encoding="utf-8-sig",
             )
             graph = MemoryGraph.open(Path(td) / "memory.reql")
             try:
@@ -95,6 +174,7 @@ class CodeGraphCompilationTests(unittest.TestCase):
                 node_types = {node.type for node in graph.store.all_nodes()}
                 edge_types = {edge.type for edge in graph.store.all_edges()}
 
+                self.assertFalse(first.run.errors)
                 self.assertEqual(first.run.files_changed, 1)
                 self.assertEqual(second.run.files_changed, 0)
                 self.assertIn("Module", node_types)
@@ -608,21 +688,6 @@ class CodeGraphCompilationTests(unittest.TestCase):
             finally:
                 graph.close()
 
-    def test_repeated_compile_does_not_duplicate_code_symbols(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "project"
-            root.mkdir()
-            (root / "app.py").write_text("def once():\n    return 1\n", encoding="utf-8")
-            graph = MemoryGraph.open(Path(td) / "memory.reql")
-            try:
-                for _ in range(3):
-                    graph.compile_project(root)
-                functions = [node for node in graph.store.all_nodes() if node.type == "Function"]
-                self.assertEqual(len(functions), 1)
-                self.assertEqual(functions[0].properties["name"], "once")
-            finally:
-                graph.close()
-
     def test_code_fragment_identity_survives_line_shifts(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "project"
@@ -647,20 +712,6 @@ class CodeGraphCompilationTests(unittest.TestCase):
                 }
 
                 self.assertEqual(before["app.stable"], after["app.stable"])
-            finally:
-                graph.close()
-
-    def test_compile_python_file_with_utf8_bom(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "project"
-            root.mkdir()
-            (root / "bom.py").write_text("def clean():\n    return 1\n", encoding="utf-8-sig")
-            graph = MemoryGraph.open(Path(td) / "memory.reql")
-            try:
-                result = graph.compile_project(root)
-                self.assertFalse(result.run.errors)
-                functions = [node for node in graph.store.all_nodes() if node.type == "Function"]
-                self.assertEqual([node.properties["name"] for node in functions], ["clean"])
             finally:
                 graph.close()
 

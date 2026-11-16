@@ -73,18 +73,6 @@ class SalienceEngine:
             - 0.08 * clamp(node.volatility)
         )
 
-    def recompute_node(self, node_id: str) -> MemoryNode | None:
-        node = self.store.get_node(node_id)
-        if node is None:
-            return None
-        return self.store.update_node_fields(node.id, salience=self.compute_node_salience(node))
-
-    def recompute_user(self, *, limit: int = 5000) -> int:
-        nodes = self.store.find_nodes(limit=limit, order_by="updated_at")
-        for node in nodes:
-            self.store.update_node_fields(node.id, salience=self.compute_node_salience(node))
-        return len(nodes)
-
     def recency_score(self, node: MemoryNode, *, half_life_days: float = 14.0) -> float:
         half_life = max(1.0, half_life_days * 86400.0)
         return clamp(0.5 ** (seconds_since(node.updated_at) / half_life))

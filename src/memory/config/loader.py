@@ -311,6 +311,8 @@ def _parse_basic_yaml(text: str, path: Path) -> dict[str, Any]:
             if not assign_match:
                 raise ConfigError(f"Invalid YAML syntax in {path} at line {line_number}: {raw_line.strip()}")
             key, value = assign_match.groups()
+            if key in container:
+                raise ConfigError(f"Duplicate YAML key {key!r} in {path} at line {line_number}")
             index += 1
             if value is not None:
                 container[key] = _parse_yaml_value(value.strip(), path, line_number)
@@ -345,12 +347,14 @@ def _parse_yaml_value(raw: str, path: Path, line_number: int) -> Any:
         except json.JSONDecodeError as exc:
             raise ConfigError(f"Invalid JSON value in {path} at line {line_number}: {exc}") from exc
         return value
-    if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+    if raw.startswith(('"', "'")):
         if raw.startswith('"'):
             try:
                 return json.loads(raw)
             except json.JSONDecodeError as exc:
                 raise ConfigError(f"Invalid string value in {path} at line {line_number}: {exc}") from exc
+        if len(raw) < 2 or not raw.endswith("'") or "'" in raw[1:-1].replace("''", ""):
+            raise ConfigError(f"Invalid string value in {path} at line {line_number}: invalid single quoting")
         return raw[1:-1].replace("''", "'")
     try:
         return float(raw) if "." in raw else int(raw)
@@ -359,20 +363,35 @@ def _parse_yaml_value(raw: str, path: Path, line_number: int) -> Any:
 
 
 def _strip_comment(line: str) -> str:
-    in_string = False
+    """Recognize comments outside quoted scalars, preserving YAML and JSON escapes."""
+    quote: str | None = None
     escaped = False
     result: list[str] = []
-    for char in line:
-        if char == "\\" and in_string and not escaped:
-            escaped = True
-            result.append(char)
-            continue
-        if char == '"' and not escaped:
-            in_string = not in_string
-        if char == "#" and not in_string:
-            break
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote == '"':
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == quote:
+                quote = None
+        elif quote == "'":
+            if char == quote:
+                if index + 1 < len(line) and line[index + 1] == quote:
+                    result.extend((quote, quote))
+                    index += 2
+                    continue
+                quote = None
+        else:
+            separated = index == 0 or line[index - 1].isspace()
+            if char == "#" and separated:
+                break
+            if char in {'"', "'"} and (separated or line[index - 1] in ":,[{"):
+                quote = char
         result.append(char)
-        escaped = False
+        index += 1
     return "".join(result)
 
 
