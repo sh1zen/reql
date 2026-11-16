@@ -148,7 +148,10 @@ class WatchEventPolicyTests(unittest.TestCase):
         """MCP must not mark freshly compiled output stale because its own sidecars changed."""
         project, storage, _ = self._project()
         observer = FakeObserver()
-        with patch("mcp.tools.Observer", return_value=observer):
+        with (
+            patch.dict("os.environ", {"REQL_MCP_ALLOWED_ROOTS": str(project)}),
+            patch("mcp.tools.Observer", return_value=observer),
+        ):
             result = reql_watch_project(storage_path=str(storage), path=str(project), max_iterations=1)
         self.assertFalse(result["summary"]["errors"])
         for path in (storage, watch_state_path(storage), storage.with_name(storage.name + ".watch.json.abcdef.tmp")):

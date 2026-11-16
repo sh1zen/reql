@@ -194,7 +194,8 @@ class QuerySemanticsTests(unittest.TestCase):
             os.chdir(previous)
         self.assertEqual(status, 0)
         self.assertEqual(json.loads(output.getvalue())["rows"], expected)
-        self.assertEqual(reql_query(storage_path=storage_path, statement=statement)["rows"], expected)
+        with patch.dict(os.environ, {"REQL_MCP_ALLOWED_ROOTS": self.temp.name}):
+            self.assertEqual(reql_query(storage_path=storage_path, statement=statement)["rows"], expected)
 
     def test_match_filters_all_edges_before_limiting(self) -> None:
         """A low-weight matching edge beyond the former window remains visible."""
