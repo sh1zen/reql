@@ -8,7 +8,7 @@ from typing import Any
 
 from ..domain.ids import stable_id
 
-DEFAULT_PARSER_VERSION = "project-scan-v11"
+DEFAULT_PARSER_VERSION = "project-scan-v13"
 DEFAULT_CHUNKING_VERSION = "uncompiled-v1"
 
 

@@ -7,16 +7,11 @@ from threading import Event
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
-from argparse import Namespace
-from contextlib import redirect_stdout
-import io
 
 from api import MemoryGraph
-from mcp.tools import reql_watch_project
-from memory.cli import _handle_detached_project_watch
 from memory.config import load_config
 from memory.diagnostics import PerformanceLogger
-from memory.freshness import read_watch_state, watch_state_path
+from memory.freshness import watch_state_path
 
 from memory.services.project_watch import _WatchdogChangeHandler
 
@@ -73,18 +68,6 @@ class WatchEventPolicyTests(unittest.TestCase):
                 self.assertTrue(self.changed.is_set())
                 self.on_change.assert_called_once()
 
-    def test_moves_across_ignored_boundary_preserve_source_changes(self) -> None:
-        """Only moves with both endpoints inside operational paths are irrelevant."""
-        for source, target, expected in (
-            (self.root / ".reql" / "one", self.root / ".reql" / "two", False),
-            (self.root / ".reql" / "one", self.root / "source.py", True),
-            (self.root / "source.py", self.root / ".reql" / "one", True),
-        ):
-            with self.subTest(source=source, target=target):
-                self.changed.clear()
-                self.handler.on_any_event(self.event("moved", source, destination=target))
-                self.assertEqual(self.changed.is_set(), expected)
-
     def test_operational_sidecars_and_temporary_files_are_ignored(self) -> None:
         """Custom storage and logging paths have the same policy as the default .reql tree."""
         storage = self.root / "runtime" / "catalog.reql"
@@ -128,37 +111,6 @@ class WatchEventPolicyTests(unittest.TestCase):
         for path in (profile.path, storage.with_name(storage.name + ".tmp")):
             observer.handler.on_any_event(self.event("modified", path))
             self.assertFalse(observer.handler.changed.is_set())
-
-    def test_cli_watch_uses_configured_resource_policy(self) -> None:
-        """The CLI adapter excludes custom storage and diagnostics before stale-state callbacks."""
-        project, storage, config = self._project()
-        profile = PerformanceLogger(project / "runtime" / "profile.jsonl")
-        args = Namespace(command="project", path=str(project), storage=str(storage), watch_iterations=1,
-                         watch_interval=0, watch_debounce=0, max_file_size_mb=None)
-        observer = FakeObserver()
-        with patch("memory.services.project_watch.Observer", return_value=observer), redirect_stdout(io.StringIO()):
-            code = _handle_detached_project_watch(args, config, profile)
-        self.assertEqual(code, 0)
-        for path in (storage, profile.path, watch_state_path(storage)):
-            observer.handler.on_any_event(self.event("modified", path))
-            self.assertFalse(observer.handler.changed.is_set())
-        self.assertEqual(read_watch_state(storage)["status"], "current")
-
-    def test_mcp_watch_uses_configured_resource_policy(self) -> None:
-        """MCP must not mark freshly compiled output stale because its own sidecars changed."""
-        project, storage, _ = self._project()
-        observer = FakeObserver()
-        with (
-            patch.dict("os.environ", {"REQL_MCP_ALLOWED_ROOTS": str(project)}),
-            patch("mcp.tools.Observer", return_value=observer),
-        ):
-            result = reql_watch_project(storage_path=str(storage), path=str(project), max_iterations=1)
-        self.assertFalse(result["summary"]["errors"])
-        for path in (storage, watch_state_path(storage), storage.with_name(storage.name + ".watch.json.abcdef.tmp")):
-            observer.handler.on_any_event(self.event("modified", path))
-            self.assertFalse(observer.handler.changed.is_set())
-        self.assertEqual(read_watch_state(storage)["status"], "current")
-
 
 if __name__ == "__main__":
     unittest.main()

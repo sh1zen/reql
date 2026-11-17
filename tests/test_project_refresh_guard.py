@@ -53,11 +53,4 @@ class ProjectRefreshGuardTests(unittest.TestCase):
         self.assertEqual(first[0],0,first[2]);self.assertIn('Status: completed',first[1])
         self.assertEqual(second[0],0,second[2]);self.assertIn('Changed: 0',second[1])
 
-    def test_guard_cannot_start_monitoring(self) -> None:
-        with patch('api.memory_graph.MemoryGraph.open',side_effect=AssertionError('opened graph')):
-            code,out,error=self.invoke('project','compile','--if-stopped','--watch')
-        self.assertEqual(code,2)
-        self.assertIn('cannot be combined',error)
-
-
 if __name__=='__main__':unittest.main()

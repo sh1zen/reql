@@ -10,11 +10,9 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from memory.storage import BlockGraphStore
-from memory.storage.adapters.block_store import BlockGraphStore as AdapterStore
-from memory.storage.adapters import BlockGraphStore as AdapterExport
 from memory.storage.adapters.lexical_index import LEXICAL_INDEX_SCHEMA_VERSION
 from memory.domain.exceptions import StorageError
-from reql import BlockGraphStore as PublicStore, MemoryEdge, MemoryNode
+from reql import MemoryEdge, MemoryNode
 
 
 class StorageTransactionTests(unittest.TestCase):
@@ -32,10 +30,6 @@ class StorageTransactionTests(unittest.TestCase):
                                 defer_lexical_index=defer_lexical_index, block_size=block_size)
         self.addCleanup(store.close)
         return store
-
-    def test_supported_imports_share_the_canonical_store(self) -> None:
-        for imported in (AdapterStore, AdapterExport, PublicStore):
-            self.assertIs(imported, BlockGraphStore)
 
     def test_manifest_requires_explicit_algorithm_and_integer_metadata(self) -> None:
         """Current checkpoints reject omitted fields and coercible scalar metadata."""

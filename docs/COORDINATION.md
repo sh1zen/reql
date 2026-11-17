@@ -241,6 +241,28 @@ interruption. Query and reconcile before creating another record. Do not persist
 secrets, personal data, source dumps or repetitive tool output. Use private notes
 for scratch, shared records for knowledge a later agent needs.
 
+Before switching direction after a failed or discarded approach, record what was
+tried and the observed failing checks or broken contract. Keep affected source and
+test paths on the shared failure so recovery does not depend on matching prose:
+
+```bash
+reql agent record failure "<approach>" --why "<observed failure and reason>" --file SOURCE_PATH --file TEST_PATH
+reql project context --file SOURCE_PATH --file TEST_PATH
+```
+
+Initialize a session before writing if none is active. Add `--parent TASK_ID` for
+an existing task. Use `agent reject "<approach>" "<reason>"` when no file scope is
+known. Reconcile an existing failure by id/revision rather than duplicating it.
+Keep failures active until evidence resolves or supersedes them; finishing a
+session or finding a successful alternative does not resolve a failed approach.
+
+Generated skills, rules and supported hooks instruct fresh or resumed sessions to
+read failures and decisions before edits. Reuse complete supplied engineering
+context; otherwise recover by the affected files and inspect marked omissions
+with `agent show ID --json`. Retry only when new evidence addresses the recorded
+reason. These instructions require the agent to capture the failure; REQL does
+not infer failed approaches from shell output or transcripts.
+
 ## Retention
 
 Live work and referenced causal evidence survive session retention. Finish keeps

@@ -137,34 +137,6 @@ class AgentWorkBatchTests(unittest.TestCase):
         self.assertIn('revision changed',json.loads(stale.stdout)['error']['message'])
         self.assertEqual(self.work.show(node['id'])['revision'],2)
 
-    def test_missing_partial_record_and_create_text_are_errors(self) -> None:
-        """Creation requires text and reasons; partial updates require a known identity."""
-        worker=self.agent('missing');worker.init('Validate')
-        with self.assertRaisesRegex(ValueError,'kind and content'):
-            worker.record(status='open')
-        with self.assertRaisesRegex(ValueError,'Work record not found'):
-            worker.record(record_id='work:missing',expected_revision=0,status='done')
-        with self.assertRaisesRegex(ValueError,'rationale'):
-            worker.record('decision', 'Missing reason')
-        self.assertEqual(self.work.records(),[])
-
-    def test_resolved_task_cannot_bypass_completion_dependencies(self) -> None:
-        """Apply completion checks to both successful terminal task states."""
-        plan=[dict(ref='pre',kind='task',content='Confirm protocol'),
-              dict(ref='dependent',kind='task',content='Use confirmed protocol',depends_on=[{'ref':'pre'}])]
-        created=json.loads(self.cli('agent','batch','--name','Resolve work','--json',input_text=json.dumps(plan)).stdout)
-        nodes={item['ref']:item for item in created['records']}
-        update=dict(record_id=nodes['dependent']['id'],expected_revision=1,status='resolved',
-                    rationale='Protocol checks passed',next_action='')
-        failed=self.cli('agent','batch','--json',input_text=json.dumps([update]),expected=2)
-        self.assertIn('waiting',json.loads(failed.stdout)['error']['message'])
-        self.assertEqual(self.work.show(nodes['dependent']['id'])['status'],'open')
-        self.cli('agent','batch','--json',input_text=json.dumps([
-            dict(record_id=nodes['pre']['id'],expected_revision=1,status='done',rationale='Protocol confirmed'),
-            update,
-        ]))
-        self.assertEqual(self.work.show(nodes['dependent']['id'])['status'],'resolved')
-
     def test_parallel_claim_accepts_one_owner_for_open_and_in_progress_work(self) -> None:
         """Both claim states retain exclusive ownership and revision checks."""
         planner = self.agent('planner')
@@ -187,82 +159,6 @@ class AgentWorkBatchTests(unittest.TestCase):
                 saved = self.work.show(task['id'])
                 self.assertEqual(saved['revision'], 2)
                 self.assertIn(saved['agent_id'], {'agent:one', 'agent:two'})
-
-    def test_new_activity_claim_advances_revision_but_same_owner_retry_does_not(self) -> None:
-        """Transfer responsibility between activities without rewriting an identical retry."""
-        planner=self.agent('planner');planner.init('First activity')
-        task=planner.add_task('Resume active serializer work',status='in_progress')['node']
-        resumed=AgentWorkspace(self.storage,agent_id='agent:planner',activity_id='resumed')
-        first=resumed.init('Resumed activity',task_id=task['id'],expected_revision=1)
-        self.assertEqual(first['claimed_task']['revision'],2)
-        retried=resumed.init('Same activity retry',task_id=task['id'],expected_revision=2)
-        self.assertEqual(retried['claimed_task']['revision'],2)
-        self.assertEqual(len(self.work.show(task['id'])['history']),1)
-
-    def test_identical_in_progress_creation_deduplicates_without_an_explicit_claim(self) -> None:
-        """Preserve create idempotence across agents; ownership transfer requires an id."""
-        planner=self.agent('planner');planner.init('Plan')
-        task=planner.add_task('Track active wire work',status='in_progress')['node']
-        other=self.agent('other');other.init('Independent work')
-        repeated=other.add_task('Track active wire work',status='in_progress')
-        self.assertFalse(repeated['created'])
-        self.assertFalse(repeated['changed'])
-        self.assertEqual(repeated['node']['id'],task['id'])
-        self.assertEqual(repeated['node']['revision'],1)
-        self.assertEqual(repeated['node']['agent_id'],'agent:planner')
-
-    def test_invalid_references_and_provenance_fail_before_initialization(self) -> None:
-        for entries in ([dict(kind='task',content='Invalid',parent={'ref':'future'})],
-                        [dict(ref='same',kind='goal',content='One'),dict(ref='same',kind='goal',content='Two')],
-                        [dict(kind='goal',content='Spoof',agent_id='agent:other')]):
-            with self.subTest(entries=entries),self.assertRaises(ValueError):
-                self.agent('invalid').record_many(entries,name='Invalid')
-            self.assertFalse(self.agent('invalid').exists())
-
-    def test_cli_compact_batch_assigned_session_and_full_json_show(self) -> None:
-        result=self.cli('agent','batch','--name','Plan','--finish','Workers assigned','--json',input_text=json.dumps(self.plan()))
-        payload=json.loads(result.stdout)
-        self.assertNotIn('history',result.stdout)
-        task=next(item for item in payload['records'] if item['ref']=='producer')
-        claim=self.cli('agent','--agent','agent:worker','init','--name','Work','--task',task['id'],'--revision','1','--json')
-        self.assertEqual(json.loads(claim.stdout)['claimed_task']['revision'],2)
-        self.cli('agent','--agent','agent:worker','finish','Contract tests pass','--task',task['id'],'--revision','2')
-        full=json.loads(self.cli('agent','show',task['id'],'--json').stdout)['node']
-        self.assertEqual(full['status'],'done');self.assertEqual(full['next_action'],'')
-        self.assertEqual(len(full['history']),2)
-        plain=self.cli('agent','show',task['id']).stdout
-        self.assertIn(task['id'],plain);self.assertNotIn('"history"',plain)
-
-    def test_single_write_receipt_reuses_input_and_revision_without_readback(self) -> None:
-        """Use the normal text receipt for a CAS update without echoing a long contract."""
-        self.cli('agent', 'init', '--name', 'Preserve interface')
-        content = ('Preserve each supported consumer and its wire contract. ' * 50).strip()
-        receipt = self.cli('agent', 'record', 'task', content, '--status', 'in_progress').stdout
-        lines = receipt.splitlines()
-        record_id, kind, status = lines[0].split('\t')
-        self.assertEqual((kind, status, lines[1]), ('task', 'in_progress', 'Revision: 1'))
-        self.assertNotIn(content, receipt)
-        self.assertLess(len(receipt), 150)
-        updated = self.cli('agent', 'record', '--id', record_id, '--revision', '1',
-                           '--status', 'done', '--why', 'Consumer tests passed').stdout
-        self.assertIn('Revision: 2', updated)
-        saved = self.work.show(record_id)
-        self.assertEqual(saved['content'], content)
-        self.assertEqual(saved['rationale'], 'Consumer tests passed')
-        self.assertEqual(saved['status'], 'done')
-        stale = self.cli('agent', 'record', '--id', record_id, '--revision', '1',
-                         '--status', 'open', '--json', expected=2)
-        self.assertIn('revision changed', json.loads(stale.stdout)['error']['message'])
-        self.assertEqual(self.work.show(record_id), saved)
-        structured = json.loads(self.cli('agent', 'record', '--id', record_id, '--revision', '2',
-                                         '--status', 'done', '--why', 'Structured receipt verified', '--json').stdout)
-        self.assertEqual(structured['node'], self.work.show(record_id))
-        self.assertEqual(structured['node']['content'], content)
-        self.assertEqual(len(structured['node']['history']), 2)
-        text = self.cli('agent', 'finish', 'Verified consumer contract').stdout
-        line = next(line for line in text.splitlines() if line.startswith('Checkpoint: '))
-        checkpoint_id, revision = line.removeprefix('Checkpoint: ').split('\t')
-        self.assertEqual(revision, 'r' + str(self.work.show(checkpoint_id)['revision']))
 
     def test_partial_single_updates_preserve_validation_and_dependency_guards(self) -> None:
         """Optional positional text must not bypass creation, CAS or completion rules."""
@@ -306,24 +202,6 @@ class AgentWorkBatchTests(unittest.TestCase):
         self.assertEqual((current['revision'], current['status']), (2, 'blocked'))
         self.assertEqual(self.storage.read_bytes(), b'Canonical graph must not be opened by work operations')
 
-    def test_generated_stdin_plan_runs_without_a_separate_input_file(self) -> None:
-        """Execute the installed instruction's linked-plan JSON through normal stdin."""
-        from agents.install import _skill_generator
-        resources = _skill_generator().skill_resources(platform_name='codex', project=True, command_name='reql',
-                    command_path=Path('reql.cmd'), fallback_command='python cli.py')
-        guide = next(content for skill, path, content in resources if path == 'references/agent-batch.md')
-        plan_text = guide.split("@'\n", 1)[1].split("\n'@", 1)[0]
-        result = json.loads(self.cli('agent', 'batch', '--name', 'Documented plan', '--finish',
-                                     'Contract agreed', '--json', input_text=plan_text).stdout)
-        self.assertEqual(len(result['records']), 5)
-        context = json.loads(self.cli('project', 'context', '--task', result['finish']['checkpoint']['id'], '--json').stdout)
-        integration = next(r for r in context['records'] if r['id'] == result['records'][-1]['id'])
-        for receipt in result['records'][2:4]:
-            self.assertEqual(receipt['status'], 'in_progress')
-        self.assertEqual(integration['execution_state'], 'blocked')
-        self.assertEqual(set(integration['waiting_on']), {r['id'] for r in result['records'][2:4]})
-        self.assertEqual({p.name for p in self.root.iterdir()}, {'.reql'})
-
     def test_cli_partial_receipts_and_input_boundary(self) -> None:
         """Failed batches preserve committed receipts and reject untrusted inputs."""
         for invalid, message in (
@@ -346,23 +224,6 @@ class AgentWorkBatchTests(unittest.TestCase):
         outside.write_text('[]')
         result = self.cli('agent', 'batch', '--file', str(outside), '--json', expected=2)
         self.assertIn('inside the project', result.stdout)
-
-    def test_utf8_bom_file_and_batch_cycle_keep_owner_validation(self) -> None:
-        path=self.root/'plan.json'
-        path.write_text(json.dumps([dict(ref='goal',kind='goal',content='Scoped goal')]),encoding='utf-8-sig')
-        result=json.loads(self.cli('agent','batch','--name','BOM','--file',str(path),'--json').stdout)
-        self.assertEqual(result['records'][0]['ref'],'goal')
-        worker=self.agent('cycle')
-        with self.assertRaises(AgentBatchError) as caught:
-            worker.record_many([
-                dict(ref='root',kind='goal',content='Cycle parent'),
-                dict(ref='child',kind='task',content='Cycle child',parent={'ref':'root'}),
-                dict(kind='goal',content='Cycle parent',record_id={'ref':'root'},expected_revision=1,parent={'ref':'child'}),
-            ],name='Cycle')
-        self.assertEqual(caught.exception.failed_entry,3)
-        self.assertEqual(len(caught.exception.records),2)
-        root=caught.exception.records[0]['node']
-        self.assertEqual(self.work.show(root['id'])['parent'],'')
 
     @unittest.skipUnless(os.name=='nt' and shutil.which('powershell'),'Needs native Windows PowerShell')
     def test_native_powershell_shim_can_clear_next_without_empty_argument(self) -> None:

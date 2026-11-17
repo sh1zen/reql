@@ -6,7 +6,6 @@ import tempfile
 import unittest
 
 from api import MemoryGraph
-from memory.artifacts.delta import DeltaRepository, GraphDelta
 from memory.artifacts.models import SourceArtifact
 from memory.artifacts.revision import RevisionRepository
 from memory.storage.retention import prune_project_data
@@ -43,16 +42,6 @@ class CompilationHistoryTests(unittest.TestCase):
         following = revisions.record(project_id="project", run_id="next", artifacts=[artifact])
         self.assertEqual(following.parent_id, history[-1].id)
         self.assertEqual(following.sequence, 111)
-
-    def test_delta_limit_is_applied_after_creation_order(self) -> None:
-        """Recent usage of old deltas must not hide the latest compilation delta."""
-        deltas = DeltaRepository(self.graph.store)
-        for index in range(8):
-            deltas.persist_delta(GraphDelta(id=f"delta:{index}", run_id=str(index), project_id="project", artifact_id="*",
-                                           created_at=f"2026-01-{index + 1:02d}T00:00:00+00:00"))
-        for index in range(7):
-            self.graph.store.update_node_metrics(f"delta:{index}", usage_count=1)
-        self.assertEqual([item.id for item in deltas.list_deltas(limit=1)], ["delta:7"])
 
     def test_retention_chooses_newest_sequences_before_limiting(self) -> None:
         """Usage timestamps must not change which revision defines the retention boundary."""

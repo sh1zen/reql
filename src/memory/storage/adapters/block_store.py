@@ -14,6 +14,7 @@ from datetime import datetime, timezone
 import errno
 import hashlib
 import heapq
+from io import BytesIO
 import mmap
 import os
 from pathlib import Path
@@ -855,6 +856,26 @@ def _encode_record(record: dict[str, Any]) -> bytes:
         payload = _encode_node_payload(value)
     elif kind in {"edge", "dense_edge"}:
         payload = _encode_edge_payload(value)
+    elif kind in {"lexical_index", "root_index"}:
+        # Indexes can dwarf individual records. Stream bounded JSON batches into
+        # the existing compressed-record codec instead of retaining a full JSON
+        # string, its UTF-8 copy, and an uncompressed multi-block payload together.
+        with BytesIO() as output:
+            output.write(_BINARY_RECORD_HEADER.pack(_BINARY_RECORD_MAGIC, _BINARY_RECORD_VERSION, kind_id, _BINARY_FLAG_COMPRESSED))
+            compressor = zlib.compressobj()
+            pending: list[str] = []
+            pending_chars = 0
+            for chunk in json.JSONEncoder(ensure_ascii=False, sort_keys=True, separators=(",", ":")).iterencode(value):
+                pending.append(chunk)
+                pending_chars += len(chunk)
+                if pending_chars >= DEFAULT_BLOCK_SIZE:
+                    output.write(compressor.compress("".join(pending).encode("utf-8")))
+                    pending.clear()
+                    pending_chars = 0
+            if pending:
+                output.write(compressor.compress("".join(pending).encode("utf-8")))
+            output.write(compressor.flush())
+            return output.getvalue()
     else:
         payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return _BINARY_RECORD_HEADER.pack(_BINARY_RECORD_MAGIC, _BINARY_RECORD_VERSION, kind_id, 0) + payload
@@ -1895,10 +1916,7 @@ class BlockGraphStore:
             "kind": "lexical_index",
             "value": {
                 "id": "lexical_index",
-                "node_terms": {
-                    term: dict(sorted(postings.items()))
-                    for term, postings in sorted(self._node_terms.items())
-                },
+                "node_terms": self._node_terms,
             },
         }
         base_encoded.append((lexical_record, _encode_record(lexical_record)))
@@ -1908,12 +1926,14 @@ class BlockGraphStore:
         root_record = {"kind": "root_index", "value": root_index}
         records = base_encoded
         records.append((root_record, _encode_record(root_record)))
+        del blocks
         blocks, locations, space_map = self._pack_blocks(records)
         root_index = self._build_root_index(locations=locations, space_map=space_map, generation_id=generation_id)
         root_record = {"kind": "root_index", "value": root_index}
         root_payload = _encode_record(root_record)
         if root_payload != records[-1][1]:
             records[-1] = (root_record, root_payload)
+            del blocks
             blocks, locations, space_map = self._pack_blocks(records)
         root_location = locations.get("root_index", {}).get("root_index")
         root_index_offset = self.block_size
@@ -1924,8 +1944,8 @@ class BlockGraphStore:
         lexical_location = root_index.get("lexical_index_location")
         self._lexical_index_location = dict(lexical_location) if isinstance(lexical_location, dict) and lexical_location else None
         self._data_offset = self.block_size
-        data_pages = list(self._iter_data_pages(blocks))
-        data_checksum = self._checksum_data_pages(data_pages)
+        del records, base_encoded, lexical_record, root_payload
+        data_checksum = self._checksum_data_pages(self._iter_data_pages(blocks))
         self._manifest = self._build_manifest(
             data_checksum=data_checksum,
             data_block_count=len(blocks),
@@ -1940,7 +1960,7 @@ class BlockGraphStore:
         self._close_mmap()
         with tmp.open("wb") as fh:
             fh.write(superblock)
-            self._write_data_pages(fh, data_pages)
+            self._write_data_pages(fh, self._iter_data_pages(blocks))
         tmp.replace(self.path)
         if self._wal_path.exists():
             self._wal_path.unlink()
@@ -1961,13 +1981,13 @@ class BlockGraphStore:
             )
             yield header + body + (b"\x00" * (self.block_size - _HEADER_SIZE - len(body)))
 
-    def _checksum_data_pages(self, pages: Sequence[bytes]) -> str:
+    def _checksum_data_pages(self, pages: Iterable[bytes]) -> str:
         digest = hashlib.sha256()
         for page in pages:
             digest.update(page)
         return digest.hexdigest()
 
-    def _write_data_pages(self, fh: Any, pages: Sequence[bytes]) -> None:
+    def _write_data_pages(self, fh: Any, pages: Iterable[bytes]) -> None:
         for page in pages:
             fh.write(page)
 

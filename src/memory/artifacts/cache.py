@@ -124,6 +124,9 @@ class ArtifactCache:
         return bool(
             props.get("last_compiled_at")
             and not props.get("parser_errors")
+            # An unavailable code parser did not establish a reusable symbol graph.
+            # Retry on the next compile so explicit grammar setup can take effect.
+            and props.get("parser_metadata", {}).get("module", {}).get("metadata", {}).get("parser_status") != "skipped"
             and props.get("project_id") == artifact.project_id
             and props.get("relative_path") == artifact.relative_path
             and props.get("sha256") == artifact.sha256

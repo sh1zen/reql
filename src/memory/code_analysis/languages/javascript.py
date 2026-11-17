@@ -57,7 +57,7 @@ class JavaScriptTreeSitterExtractor(TreeSitterExtractorBase):
                 self.symbols.append(symbol)
                 self._walk_javascript_children(node, [*scope, symbol])
                 return
-        if node_type in {"variable_declarator", "public_field_definition"}:
+        if node_type in {"variable_declarator", "public_field_definition", "assignment_expression"}:
             symbol = self._javascript_variable_function_symbol(node, scope)
             if symbol:
                 self.symbols.append(symbol)
@@ -103,14 +103,35 @@ class JavaScriptTreeSitterExtractor(TreeSitterExtractorBase):
         return _symbol(self.artifact, kind, _parent(self.module, scope), _node_text(self.source, name_node), _line(node), _end_line(node), args=_params(self.source, _field(node, "parameters")), returns=_clean_type_text(_node_text(self.source, _field(node, "return_type"))))
 
     def _javascript_variable_function_symbol(self, node: Any, scope: list[CodeSymbol]) -> CodeSymbol | None:
-        value = _field(node, "value")
+        """Extract function bindings, including static CommonJS/property assignments."""
+        assignment = str(getattr(node, "type", "")) == "assignment_expression"
+        value = _field(node, "right" if assignment else "value")
         if value is None or str(getattr(value, "type", "")) not in {"arrow_function", "function", "function_expression"}:
             return None
-        name_node = _field(node, "name")
+        name_node = _field(node, "left" if assignment else "name")
         if name_node is None:
             return None
+        name = _javascript_binding_name(self.source, name_node) if assignment else _node_text(self.source, name_node)
+        if not name:
+            return None
         kind: SymbolKind = "async_function" if _has_direct_child(value, "async") else "function"
-        return _symbol(self.artifact, kind, _parent(self.module, scope), _node_text(self.source, name_node), _line(node), _end_line(value), args=_params(self.source, _field(value, "parameters")), returns=_clean_type_text(_node_text(self.source, _field(value, "return_type"))))
+        return _symbol(self.artifact, kind, _parent(self.module, scope), name, _line(node), _end_line(value), args=_params(self.source, _field(value, "parameters")), returns=_clean_type_text(_node_text(self.source, _field(value, "return_type"))))
+
+
+def _javascript_binding_name(source: bytes, node: Any) -> str | None:
+    """Resolve a static assignment path without inventing computed receiver identities."""
+    node_type = str(getattr(node, "type", ""))
+    if node_type in {"identifier", "property_identifier", "this"}:
+        return _node_text(source, node)
+    if node_type == "member_expression":
+        receiver = _field(node, "object")
+        property_node = _field(node, "property")
+        if receiver is not None and property_node is not None:
+            owner = _javascript_binding_name(source, receiver)
+            name = _javascript_binding_name(source, property_node)
+            if owner and name:
+                return f"{owner}.{name}"
+    return None
 
 
 def _javascript_class_base(source: bytes, node: Any) -> str | None:

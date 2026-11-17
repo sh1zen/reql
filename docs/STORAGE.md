@@ -12,7 +12,7 @@ fixed-size block files directly instead of using a database engine.
 - block 0 is a superblock manifest;
 - every disk block has a fixed size, 64 KiB by default;
 - each block maps cleanly to the in-process page cache;
-- records are length-prefixed binary payloads with selective compression;
+- records are length-prefixed binary payloads, with compressed administrative indexes;
 - node records are packed near ordinary incident relationships to preserve
   graph-neighborhood locality;
 - relationships for dense nodes are written as dedicated dense-edge records so
@@ -49,8 +49,13 @@ ensures pending WAL frames are durable. Compile/update and normal CLI opens
 checkpoint automatically when the WAL is large or the base checkpoint is
 missing, so `reql storage compact` is maintenance, not a required post-compile
 step. Checkpoint flushes reuse encoded records across root-index stabilization
-passes and stream data pages directly to disk, avoiding repeated compression and
-full-file memory copies.
+passes. The lexical snapshot borrows the existing postings rather than copying
+and sorting all of them before JSON encoding. Root and lexical indexes stream
+sorted JSON in bounded batches into zlib using the existing compressed-record
+flag. Layout passes release their previous block buffers before repacking;
+checksum and file output each iterate pages without retaining another full
+padded file image. Full graph/index state and encoded node/edge records still
+reside in memory; checkpointing is not a constant-memory operation.
 
 Query usage signals are stored separately in `<store>.usage.jsonl`. Retrieval
 can update usage while the graph is opened read-only, and ranking loads that
@@ -127,13 +132,15 @@ indexes.
 
 ## Compression And Dynamic Records
 
-Fixed node and edge fields are
-encoded as typed binary values; dynamic `properties` and administrative records
-remain deterministic JSON payloads inside the binary frame. Payloads are
-compressed only when they are large enough and compression reduces size, which
-avoids paying zlib CPU for small records. If an encoded logical record is still
-larger than one block after compression, the checkpoint writes it as consecutive
-record-part frames and reconstructs the original record when the store opens.
+Fixed node and edge fields are encoded as typed binary values; dynamic
+`properties` and administrative records use deterministic JSON inside the binary
+frame. The writer compresses root and lexical index records while encoding them,
+without first creating a complete uncompressed JSON string or UTF-8 copy.
+Node/edge records and smaller administrative kinds retain their existing
+uncompressed encoding. The reader continues to accept both compressed and
+uncompressed records in the current format; no schema or codec version changes.
+If an encoded logical record is larger than one block, the checkpoint writes it
+as consecutive record-part frames and reconstructs it when the store opens.
 
 ## Inspection, Compaction, And Clean Rebuilds
 

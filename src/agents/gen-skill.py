@@ -26,8 +26,8 @@ PROJECT_SKILL_SOURCE = SkillSource(
     name="reql-agent",
     title="REQL Coding Workflow",
     description=(
-        "Use REQL to find source context and save shared work for {platform_name}. "
-        "Use this skill for changes, checks, and tasks that continue across sessions."
+        "Use REQL for repository context, shared work, and graph maintenance in {platform_name}. "
+        "Use it for code changes, repository questions, and work across sessions."
     ),
     summary=(
         "The graph stores facts. Shared records store intent."
@@ -35,11 +35,12 @@ PROJECT_SKILL_SOURCE = SkillSource(
     workflow_steps=(
         "Reuse a supplied working set and check current source. For missing context, run `{command_name} project status` once. For a missing graph, run `project compile --if-stopped`. Read `references/bootstrap.md` for setup failures.",
         "Retrieve only missing context with `{command_name} locate \"<path>\"` or `query_context --query \"<literal terms>\" --code`. Inspect missing source with `inspect --node-id ID --limit 1` and reuse complete verified excerpts. Use text output unless you need structured fields. For requirements, use `--docs`. Refine once or search exactly. Stop when the owner, effects, and tests are clear.",
-        "Change the behavior owner. Preserve supported extension points.",
+        "Read shared work before edits in a new or resumed session. Reuse complete engineering context from the handoff or `query_context`. Otherwise, use `{command_name} project context --file PATH`. Repeat `--file` for other affected files. Read marked omissions with `agent show ID --json`. Check recorded decisions and failures against current evidence before action.",
         "For managed parallel work, use one stdin batch for linked records. Workers reuse its context and return results. Independent agents use `agent init --name NAME --task ID --revision N`. It returns task context and the current revision. Recover with `project context --task ID` or `agent show ID --json` for marked omissions. Use `{command_name} project overview` for unknown goals, direction, workstreams, and blockers.",
         "Save each outcome once and use write receipts for ids and revisions. Read again for missing evidence, concurrent changes, or stale revisions. Update with `--revision`. Check dependencies and conflicts. Replace with `--supersedes ID --why REASON`. Keep the host's identity and activity.",
+        "Save decisions, failures, blockers, and results when they occur. Record failures before changing direction or ending the session. Use `{command_name} agent record failure \"<approach>\" --why \"<evidence>\" --file PATH`. Include affected source and tests with repeated `--file`. Use `agent reject \"<approach>\" \"<reason>\"` when file scope is unknown. Read `references/agent-workspace.md` for session setup and record fields.",
         "Workers run focused checks. The coordinator runs integration checks and refreshes once after parallel work. Use one full-suite run when it covers worker checks. Repeat focused checks only for failures or uncovered behavior. Refresh with `{command_name} project compile --if-stopped`. Skip refresh for read-only work.",
-        "Close only sessions started or continued here. Use `agent finish SUMMARY --task ID --revision N` for assigned work. It completes the task, clears its next action, and returns the checkpoint id. Otherwise, use `agent finish`. Pass that id instead of writing another handoff."
+        "Close only sessions started or continued here. Use `agent finish SUMMARY --task ID --revision N` for assigned work. It completes the task, clears its next action, and returns the checkpoint id. Otherwise, use `agent finish SUMMARY`. Pass that id instead of writing another handoff."
     ),
     rule_points=(
         (
@@ -50,8 +51,7 @@ PROJECT_SKILL_SOURCE = SkillSource(
         (
             "For missing context, use `{command_name} locate \"<path>\"` or `{command_name} query_context --query \"<short literal terms>\"`. "
             "Inspect missing source with `inspect --node-id ID --limit 1` and reuse complete verified bodies. "
-            "Check the owners, line ranges, callers, and tests in the current source. "
-            "Change the implementation that owns the behavior. Preserve supported extension points. Avoid duplicate wrappers and overrides."
+            "Check the owners, line ranges, callers, and tests in the current source."
         ),
         (
             "For insufficient context, try one narrower query or a specific source search. For unclear requirements, use `--docs`. "
@@ -60,6 +60,13 @@ PROJECT_SKILL_SOURCE = SkillSource(
         (
             "Keep source reads within the task. Stop when the owner, effects, and tests are clear. Reuse sufficient results. "
             "Read a reference only when necessary. Use JSON only for structured fields."
+        ),
+        (
+            "Read shared work before edits in a new or resumed session. "
+            "Reuse complete engineering context from the handoff or `query_context`. Otherwise, use "
+            "`{command_name} project context --file PATH`. Repeat `--file` for other affected files. "
+            "Read marked omissions with `agent show ID --json`. "
+            "Check recorded decisions and failures against current evidence before action."
         ),
         (
             "For managed parallel work, one coordinator owns shared records and workers return evidence. "
@@ -71,8 +78,15 @@ PROJECT_SKILL_SOURCE = SkillSource(
             "Pipe linked work records to `agent batch --name NAME --file - --finish SUMMARY`. "
             "Independent agents use `agent finish SUMMARY --task ID --revision N` to complete work and close its session. "
             "Update existing records with `--revision` and check dependencies and conflicts before changes. "
-            "Reuse write receipts for ids and revisions. Read again for missing evidence, concurrent changes, or stale revisions. "
-            "Save a failed approach with `agent reject \"<approach>\" \"<reason>\"`."
+            "Reuse write receipts for ids and revisions. Read again for missing evidence, concurrent changes, or stale revisions."
+        ),
+        (
+            "Save decisions, failures, blockers, and results when they occur. Record failures before changing direction or ending the session. "
+            "Use `{command_name} agent record failure \"<approach>\" --why \"<evidence>\" --file PATH`. "
+            "Repeat `--file` for affected source and tests. Link an existing task with `--parent TASK_ID`. "
+            "Use `agent reject \"<approach>\" \"<reason>\"` when no file scope is known. "
+            "Start a session with `agent init --name NAME` before writing if none is active. "
+            "Update existing records by id and revision. Keep failures active until evidence resolves or supersedes them."
         ),
         (
             "Run checks for changed behavior and reuse passing checks for unchanged code. "
@@ -81,6 +95,11 @@ PROJECT_SKILL_SOURCE = SkillSource(
             "After checks, refresh once with `{command_name} project compile --if-stopped`. "
             "Omit this update for read-only work. "
             "Start watch mode only if the user asks for continuous monitoring."
+        ),
+        (
+            "Use `{command_name} --help` to find other features. Use `<command> --help` for flags. "
+            "REQL also provides project explanation, pipeline views, history, reports, exports, configuration, storage tools, and MCP. "
+            "Use `reql-context-compact` only on explicit request and only when the host can export and replace a transcript."
         ),
     ),
     deterministic_requirement="Keep REQL local and deterministic. The graph stores source facts. Shared work records store plans and task status. Private notes are temporary.",
@@ -152,7 +171,7 @@ description: Use only when the user asks for /reql-context-compact. Remove large
 
 Run only when the user asks for `/reql-context-compact`. Do not start this skill during ordinary REQL use. Do not start it automatically before host compaction.
 
-First, check that the host can export a JSON transcript and accept a new message list. If it can, send the transcript to `python -m agents.context_compact` through stdin. Check stdout before the host uses the new list. The command uses no network or model. It writes no files.
+First, check that the host can export a JSON transcript and accept a new message list. Use Python from the active REQL environment. Send the transcript to `python -m agents.context_compact` through stdin. Check stdout before the host uses the new list. The command uses no network or model. It writes no files. Add `--stats` to report character savings on stderr.
 
 The input is a JSON message array or an object with a `messages` array. Each tool result must have `role: "tool"`, a nonempty `name`, and string `content`.
 
@@ -192,17 +211,18 @@ description: {source.description.format(platform_name=platform_name)}
 
 {reference_routing}
 
-Read only the necessary reference. Reuse it during the session.
+Read only the necessary reference. Reuse it during the session. Use `{command_name} --help` to find commands. Use `<command> --help` for flags.
 """
 
 
 def _reference_routing() -> str:
     return "\n".join(
         [
-            "- For setup or exclusions, read `references/bootstrap.md`.",
-            "- For queries, read `references/query.md`.",
-            "- For refresh failures, read `references/update-watch.md`.",
-            "- For reports or MCP, read `references/reports-exports.md`.",
+            "- For setup, configuration, or assistant installation, read `references/bootstrap.md`.",
+            "- For files, source, tests, or memory search, read `references/query.md`.",
+            "- For REQL statements, dependency views, or cleanup findings, read `references/query-advanced.md`.",
+            "- For refresh, watch mode, history, cache, or storage, read `references/update-watch.md`.",
+            "- For architecture, pipeline views, reports, exports, or MCP, read `references/reports-exports.md`.",
             "- For documents, read `references/document-semantics.md`.",
             "- For individual record formats or session recovery, read `references/agent-workspace.md`. Use `agent dashboard` only to recover a session.",
             "- For batch fields or recovery, read `references/agent-batch.md`.",
@@ -258,7 +278,7 @@ If status reports `Project not found` or no compilation result, run this command
 {command_name} project compile
 ```
 
-The installed instructions permit this initial compilation without further approval. Check for exit code zero and `Status: completed`. A failed compilation can leave file records and incomplete context. A successful status command does not prove that compilation succeeded.
+Use the existing task authorization for initial compilation. Check for exit code zero and `Status: completed`. A failed compilation can leave incomplete context. A successful status command does not prove that compilation succeeded.
 
 If a parser dependency is missing, repair the declared REQL dependencies in the launcher Python environment. Then try compilation again. Do not repeat the same failed compilation without a change. If compilation remains unavailable or fails again, report the problem. Continue with specific source checks. Do not report incomplete results as complete evidence.
 
@@ -276,7 +296,19 @@ Set additional compilation exclusions under `scan.exclude` in the project `reql.
 
 ## Configuration
 
-Project commands search for `reql.conf` from the target path through its parent directories. They combine its lists with protected internal defaults. Keep compilation deterministic and independent of model providers.
+Project commands search for `reql.conf` from the target path through its parent directories. Internal defaults apply first. Project settings, environment overrides, and explicit command overrides follow in that order. Lists merge by default. `scan.ignore_defaults: true` replaces the default scan lists. Check the effective configuration before changes:
+
+```bash
+{command_name} config show
+{command_name} config init
+{command_name} config set KEY VALUE
+```
+
+`config init` creates a template if absent. `config set` validates and saves one local option. `REQL_CONFIG` selects a configuration file. `REQL_CONFIG_OVERRIDES` supplies JSON overrides. Keep compilation independent of model providers.
+
+## Assistant installation
+
+Use `install <platform>` to update generated skills, rules, and supported hooks. Use `--user` for a user profile. The default scope is the current project. Use `--dry-run --json` to inspect planned files. `--no-hooks` omits hooks. `uninstall <platform>` removes REQL-owned files and sections. Preserve other instructions. Do not change personal profiles unless requested.
 
 Installation: {platform_name} ({scope}).
 """
@@ -295,9 +327,12 @@ Select the command for the missing information:
 - For missing current source, use the returned `inspect --node-id ID --limit 1` command. Reuse complete verified bodies.
 - For callers and owners, use `query_explore --query "<terms>" --view owners --view callers --view code`.
 - For graph edges, use `query_graph --query "<terms>" --max-depth 2`.
+- For ranked text, use `query_memories --query "<terms>" --limit 8`.
 - For custom columns, more views, or unused code, read `query-advanced.md`.
 
 Use `--json` for structured fields: `owner_candidates`, `read_plan`, `contracts`, `impact`, and `test_targets`.
+
+Use dotted field names for cross-layer data traces. The `data_trace` rows show observed field uses and transformations. Check current source to confirm static links. Source confidence and graph revision do not validate attached engineering claims.
 
 Add `--source` to `--code` or `--test` when you need source bodies. This reads current files and checks their hashes against the committed revision. It returns at most three files, six regions, 120 lines, and 6,000 source characters. Overlapping regions are merged. Files larger than 4 MiB are excluded.
 
@@ -305,13 +340,14 @@ Reuse complete verified excerpts. Read missing or truncated ranges directly. For
 
 Keep the selected files with the task. Stop queries when the owner, effects, and tests are clear.
 
-Check base implementations, wrappers, and callers before editing. Change the behavior owner and preserve supported extension points. Avoid replacement definitions or duplicate overrides.
+`query_context` includes bounded shared work. Use `project context --file PATH` for missing engineering history. Use `project context --task ID` for assigned work. Read marked omissions with `agent show ID --json`.
+
 """
     query_advanced = f"""# REQL reference: raw queries, graph relations, and unused code
 
 Read this reference for custom rows, missing relations, or unused-code checks. For ordinary queries, read `query.md`.
 
-For project records, use `query "PROJECTS"` or `query "ARTIFACTS LIMIT 20"`.
+For project records, use `query "PROJECTS LIMIT 20"` or `query "ARTIFACTS LIMIT 20"`.
 For analysis or cache records, use `query "HUBS LIMIT 20"` or `query "CACHE STATUS"`.
 `WHERE` permits LIKE, ILIKE, REGEX/MATCHES, BETWEEN, IN, IS NULL, and IS NOT NULL.
 
@@ -322,20 +358,30 @@ Use `{command_name} query "..."` for exact ids, custom columns, source locations
 For text search with specific columns, use `RETRIEVE ... RETURN ...`:
 
 ```bash
-{command_name} query "RETRIEVE 'office plant' LIMIT 8 RETURN id,type,text,score,relative_path,line_start,line_end"
-{command_name} query "RETRIEVE 'payment workflow' LIMIT 8 RETURN id,type,text,score,source_for,relation,direction,relative_path,line_start"
+{command_name} query "RETRIEVE '<literal terms>' LIMIT 8 RETURN id,type,text,score,relative_path,line_start,line_end"
+{command_name} query "RETRIEVE '<literal terms>' LIMIT 8 RETURN id,type,text,score,source_for,relation,direction,relative_path,line_start"
 ```
 
 For a known filter, id, file, symbol, or relation, use `FIND`, `SYMBOLS`, `FRAGMENTS`, or `MATCH`:
 
 ```bash
 {command_name} query "FIND nodes WHERE id IN [document_term:abc, document_term:def] RETURN id,type,label,text"
-{command_name} query "SYMBOLS WHERE relative_path = 'src/memory/services/retrieval.py' RETURN type,name,qualified_name,start_line,end_line LIMIT 50"
+{command_name} query "SYMBOLS WHERE relative_path = 'path/to/source.py' RETURN type,name,qualified_name,start_line,end_line LIMIT 50"
 {command_name} query "FRAGMENTS WHERE relative_path = 'README.md' RETURN id,text,line_start,line_end LIMIT 20"
 {command_name} query "MATCH (s)-[:REFERENCES]->(t) WHERE s.relative_path = 'README.md' RETURN s.id,s.text,t.type,t.name LIMIT 20"
 ```
 
 Set a `LIMIT` in each raw query. Request only the columns that the task needs. For source evidence, include location or relation fields. Examples are `relative_path`, `line_start`, `line_end`, `source_for`, `relation`, and `direction`.
+
+Other statement forms provide focused graph operations:
+
+- `SEARCH` returns ranked nodes. `RETRIEVE` also returns connected source text.
+- `ACTIVATE` follows weighted links from known node ids.
+- `PATH FROM ... TO ... DEPTH N LIMIT N` finds bounded paths.
+- `EXPLAIN NODE` shows neighbors. `EXPLAIN SEARCH` shows ranking evidence.
+- `STATS` and `STATS TYPE` return graph counts.
+
+Use `INCLUDE ARCHIVED` only when historical source records are needed. Filters, types, columns, and limits depend on the statement.
 
 First, use `query_context`, `query_explore`, `query_memories`, or `query_graph` to get ids or file paths. Do not use raw queries to scan the complete repository.
 
@@ -379,8 +425,11 @@ Use these steps:
 4. For unclear rows, get source evidence:
 
 ```bash
+{command_name} query "VERIFY FINDING FINDING_ID"
 {command_name} query "MATCH (s)-[:HAS_FINDING]->(f:StaticAnalysisFinding) RETURN s.type,s.name,s.qualified_name,f.finding_type,f.relative_path,f.line_start,f.reason LIMIT 100"
 ```
+
+`VERIFY FINDING` returns compiled snippets, known uses, checked scopes, and risks. It does not read current files.
 
 5. Check the selected files and their callers and importers. If necessary, search for entry points, tests, public exports, callbacks, reflection, and documentation examples.
 6. Separate safe removals, possible public API risks, directory checks, and incorrect findings.
@@ -429,7 +478,7 @@ The watcher first checks the cache. Then it compiles changed or deleted artifact
 
 The `{command_name} project watch-status` command reports `running`, `stopped`, `stale`, or `unknown`. When available, it includes the PID and process status. It reads the lock sidecar directly. Thus, it can operate while the watcher holds the graph write lock.
 
-If the user did not request `cache clear`, ask before this command.
+Use `cache clear` only when cache removal is authorized. It is not a normal refresh step.
 
 ## Cache and deltas
 
@@ -437,15 +486,36 @@ Check the cache and recent compilation changes:
 
 ```bash
 {command_name} cache status
+{command_name} project history --limit 10
+{command_name} project diff
 {command_name} query "DELTAS LIMIT 10"
 {command_name} query "DELTAS WHERE id = 'delta:...' LIMIT 1" --json
 ```
 
 Use `{command_name} project compile` for initial compilation and later graph updates.
+
+`project history` lists retained revisions. `project diff --revision ID` shows the saved delta for one revision. It does not show uncompiled source edits.
+
+## Storage
+
+Use `storage inspect` for block and index details. Use `storage locks` for current owners. `storage locks --recover-stale` removes only locks proven stale. Use it only for authorized lock recovery.
+
+`storage compact` rewrites storage without discarding graph history. It is maintenance, not a required refresh step. `storage clear` rebuilds the current project and discards historical graph state. Use it only for an authorized rebuild. Use `--help` for each operation before maintenance.
 """
     reports_exports = f"""# REQL reference: reports, exports, and MCP
 
 Read this reference for project reports, graph analysis, exports, or MCP setup.
+
+## Project views
+
+```bash
+{command_name} project explain
+{command_name} project pipeline --html --out reports/pipeline.html
+{command_name} project pipeline --code --out reports/pipeline.mmd
+{command_name} stats
+```
+
+`project explain` returns source-backed architecture and capabilities. `project overview` also includes shared engineering work. `project pipeline` writes observed execution flows as HTML or Mermaid. It requires a compiled project and does not infer runtime-only calls. `stats` reports graph counts.
 
 ## Reports
 
@@ -490,6 +560,17 @@ reql-mcp --config reql.conf --set project.id=agent-a --read-only
 If the package is installed but `reql-mcp` is unavailable, use `python -m mcp.server --read-only`. If necessary, use the same `--config` or `--set` options.
 
 Use read-only mode for context queries. Apply CLI approval rules to write tools, such as compilation, watch mode, and hubs.
+
+Use the tool schema for arguments and limits. CLI and MCP share retrieval and work semantics:
+
+- Use `query_context`, `query_explore`, `query_graph`, and `query_memories` for source context.
+- Use `inspect_node` for source and relations. Use `reql_query` for bounded REQL rows.
+- Use `reql_project_status` for compilation status.
+- Use `reql_work_context` for scoped work. Use `reql_work_overview` for project direction.
+- Use `reql_work_record` to save decisions, failures, and results with explicit agent and session ids.
+- Use `reql_compile_project`, `reql_watch_project`, and `reql_hubs` only for authorized writes.
+
+Read-only mode hides and rejects write tools. MCP-only clients save explicit checkpoints at session boundaries. No private CLI session is required for MCP work records.
 """
     document_semantics = f"""# REQL reference: document structure
 
@@ -497,7 +578,7 @@ Read this reference for document compilation or changes to document parsing and 
 
 ## Default behavior
 
-Project compilation is deterministic. REQL parses code structure. It registers Markdown, plain text, and PDF artifacts. It divides their content into source fragments.
+Project compilation is deterministic. REQL parses supported code. Enable required document formats with `compile.ingest_documents` and `compile.documents` in `reql.conf`. Use `config show` to check active formats. Document ingestion creates source fragments. PDF text extraction requires the optional PDF dependency.
 
 Compile the project:
 
@@ -633,6 +714,14 @@ For status or evidence updates, use `agent record --id ID --revision N` with the
 
 For read-only recovery, use `project context --task ID` or `--query TERMS --file PATH --workstream NAME`. The `project overview` command needs no path or agent id. Use `--history` for obsolete work. The `agent show ID --json` command includes the last eight revisions. Plain text omits full history.
 
+Read shared work before edits in a new or resumed session. Reuse complete engineering context from a handoff or `query_context`. Otherwise, recover by file:
+
+```bash
+{command_name} project context --file SOURCE_PATH --file TEST_PATH
+```
+
+Read marked omissions with `agent show ID --json`. Check the current source and tests against recorded decisions and failures. Retry a failed approach only when new evidence addresses its reason.
+
 Use `agent dashboard` only for session recovery. Use explicit `agent --agent ID --activity SESSION` when the host cannot select identity safely. For work without an assignment, use `agent init --name NAME` and plain `agent finish SUMMARY`. Plain finish does not complete unfinished tasks.
 
 Kinds are goal, task, decision, constraint, failure, question, change, observation, and checkpoint. States are active/open/in_progress/blocked, done/resolved, and superseded/invalidated/abandoned. Decisions, failures, blocked or obsolete work, and reopened work need a reason.
@@ -645,7 +734,27 @@ For individual updates, use the existing record id and revision:
 {command_name} agent reject "<approach>" "<failure and reason>"
 ```
 
+Save decisions, failures, blockers, and results when they occur. Record failures before changing direction or ending the session. Start a session if none is active. Attach known source and test paths:
+
+```bash
+{command_name} agent record failure "<approach>" --why "<evidence>" --file SOURCE_PATH --file TEST_PATH
+```
+
+Include observed failing checks or the broken contract in the reason. Add `--parent TASK_ID` for an existing task. Use `agent reject` when file scope is unknown. Save each failure once. Update existing records by id and revision. Keep failures active until evidence resolves or supersedes them. Session completion does not resolve a failed approach.
+
 Use `--next=` for an empty value in every shell. PowerShell can drop a separate empty quoted argument. Replacement keeps its reason and old id. Check affected tasks before more work. Use `--depends-on ID` for prerequisites and `--contradicts ID` for conflicts.
+
+Use `--key` for stable identity, `--workstream` for scope, and `--importance 1..3` for priority. Repeat `--file` for evidence paths. Use `--summarizes ID` to link checkpoint evidence. Links must name existing records. Updates require the observed revision.
+
+## Other session tools
+
+Use `agent --help` for the complete command list:
+
+- `agent status` shows the selected session. `agent list --all` includes closed agents.
+- `agent search TERMS` searches work and scratch. `agent export --json` exports the selected workspace.
+- `agent note TEXT` saves scratch. `--public` publishes a note. `--agent ID` sends a directed note when authorized.
+- `agent task add`, `agent task done`, and `agent task list` use the shared task owner.
+- `agent reset` discards private scratch. `agent terminate ID` releases another stale agent's private store. Use these only for authorized session recovery.
 
 Checkpoints describe earlier work. Check current linked statuses before action. Use private notes only for temporary information. Do not paste source files, broad search output, credentials, or personal data.
 

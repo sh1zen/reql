@@ -43,6 +43,11 @@ transaction journals, lazy loading and lexical-index lifecycle. Stateless term
 selection lives in `memory.storage.adapters.lexical_index`. Package exports
 resolve to the same store class.
 
+Checkpoint index serialization belongs to this adapter. It streams compressed
+JSON using the existing binary record flag and iterates padded pages for checksums
+and writes, avoiding redundant full index/file images while retaining format
+compatibility.
+
 Routine queries use indexed or bounded operations. Public results remain
 independent of mutable store state; internal read-only stages may borrow records
 and copy their final bounded results. Full graph reads are reserved for exports,
@@ -68,6 +73,10 @@ Each artifact phase returns `ArtifactCompilationResult`, with set-backed change
 collections merged by the orchestration service. Code and documents share source
 artifacts and fragments while retaining distinct parser results and graph facts.
 Technical edges retain deterministic confidence and source provenance.
+
+Code parser selection uses direct grammar wheels first, then the language pack's
+local inventory. Missing fallback grammars produce explicit skipped-module
+metadata; installing/downloading grammars belongs to setup, outside compilation.
 
 `IncrementalCompilationService` owns stage ordering and transaction boundaries.
 `ProjectRegistry` registers project structure; `ArtifactCompiler` parses and

@@ -16,15 +16,44 @@ depend on the host and workflow.
 
 ## Quick Start
 
-REQL requires Python 3.10 or newer:
+REQL requires Python 3.10 or newer. Install the CLI in an isolated environment
+with [uv](https://docs.astral.sh/uv/getting-started/installation/):
 
 ```bash
-python -m pip install reql
+uv tool install reql
+uv tool update-shell
+```
+
+Restart your shell after `uv tool update-shell` if `reql` is not on `PATH`.
+No virtual-environment activation is needed. Upgrade with `uv tool upgrade reql`.
+For optional watch/PDF support, install `"reql[all]"` instead.
+
+Then install the assistant instructions:
+
+```bash
 reql install codex
 ```
 
-For development from a checkout, use `python -m pip install -e .`. Replace
-`codex` with another supported agent platform, or run interactive installation
+With pip, create a virtual environment first. On Linux/macOS:
+
+```bash
+python3 -m venv .venv
+.venv/bin/python -m pip install reql
+.venv/bin/reql install codex
+```
+
+On Windows PowerShell:
+
+```powershell
+py -m venv .venv
+.venv/Scripts/python.exe -m pip install reql
+.venv/Scripts/reql.exe install codex
+```
+
+Use that environment's `reql` executable for subsequent commands. System Python
+installations may reject direct pip installs; do not bypass their protections.
+See [development setup](CONTRIBUTING.md#development-setup) for a checkout.
+Replace `codex` with another supported agent platform, or run interactive installation
 to detect one. Run project commands from the target repository root:
 
 ```bash
@@ -48,13 +77,21 @@ Use `project overview` when project direction is unknown. Multi-step or resumed
 work can use Agent Workspace to record decisions and verified outcomes; see
 [Engineering coordination](docs/COORDINATION.md).
 
+Generated agent guidance requires recording failed approaches with affected files
+and reading that history before edits in fresh or resumed sessions. Use
+`agent record failure "<approach>" --why "<reason>" --file <path>` to save a scoped
+failure and `project context --file <path>` to recover it across sessions.
+Failure capture remains an explicit agent action.
+The skill routes source queries, shared work, graph maintenance, project views,
+exports and MCP to focused references. Platform rules also route to command help.
+
 The installer also adds the explicit-only `reql-context-compact` skill for hosts
 that can export and replace a JSON transcript. It removes only large, exact
 duplicate tool results. It cannot replace the live context window in Codex or
 another host without that capability. See [assistant installs](docs/CLI.md#assistant-installs).
 
-From a checkout, `python cli.py ...` exposes the same CLI without an editable
-installation. Dependencies must still be installed. Start the optional MCP server
+From a development checkout, `uv run --no-sync python cli.py ...` exposes the
+same CLI using the environment described in CONTRIBUTING. Start the optional MCP server
 with `reql-mcp --read-only`; see [MCP setup](docs/MCP.md).
 
 ## Features
@@ -70,6 +107,11 @@ Supported languages, formats and parser requirements are listed in
 [Code analysis](docs/CODE_ANALYSIS.md) and [Artifact ingestion](docs/ARTIFACT_INGESTION.md).
 
 ## Runtime Model
+
+REQL is alpha software. Python owns orchestration, graph operations and storage;
+Tree-sitter provides native parsing. Language choice alone does not establish
+speed or memory efficiency. See [Contributing](CONTRIBUTING.md#development-setup)
+for test and coverage commands.
 
 ```text
 project files -> scan and compile -> canonical graph -> bounded source context
@@ -90,9 +132,11 @@ graph and discards history after a successful replacement; see
 
 ## Interactive Launcher
 
+From a development checkout:
+
 ```bash
-python launcher.py
-python launcher.py --storage .reql/memory.reql
+uv run --no-sync python launcher.py
+uv run --no-sync python launcher.py --storage .reql/memory.reql
 ```
 
 The launcher guides storage selection, compilation, queries, analysis, reports,
@@ -130,6 +174,9 @@ scratch have separate owners. See the [architecture guide](docs/ARCHITECTURE.md)
 The canonical import is `from reql import MemoryGraph`. The same package exposes
 `BlockGraphStore` for direct storage access and typed query-context models:
 
+For API use, add `reql` to your application's Python environment (for example,
+`uv add reql`). A CLI tool installation has its own isolated environment.
+
 ```python
 from reql import MemoryGraph, QueryContextRequest, QueryMode, RetrievalBudget
 
@@ -161,5 +208,5 @@ MIT. See [LICENSE](LICENSE).
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, tests, benchmarks and pull
-request expectations. Generated stores, caches and benchmark outputs stay local.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for setup, tests and pull request
+expectations. Generated stores and caches stay local.

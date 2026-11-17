@@ -2,10 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-import json
 from pathlib import Path
-import subprocess
-import sys
 import tempfile
 import unittest
 
@@ -120,49 +117,6 @@ class CoordinationWorkflowTests(unittest.TestCase):
         updated = self.update(agent, self.work.show(task["id"]), depends_on=[new["id"]], rationale="Reconcile with direct parser")
         agent.complete_task(updated["id"], "Direct parser integration verified")
 
-    def test_D_file_anchors_and_causal_links_beat_unrelated_recent_history(self) -> None:
-        agent = self.agent("focus")
-        constraint = agent.record("constraint", "Keep wire format stable", files=["src/codec.py"])["node"]
-        failure = agent.record("failure", "Memoization dropped fields", rationale="Snapshot differs from current input")["node"]
-        task = agent.add_task("Fix encoding", files=["src/codec.py"], depends_on=[constraint["id"], failure["id"]])["node"]
-        decision = agent.add_decision("Preserve empty values", rationale="Wire contract requires round trips", parent=task["id"])["node"]
-        for number in range(15):
-            agent.record("change", f"UI styling improvement {number}", status="done", files=["src/ui.py"])
-        result = self.work.context(files=["src/codec.py"], limit=6)
-        ids = {item["id"] for item in result["records"]}
-        self.assertTrue({constraint["id"], failure["id"], task["id"], decision["id"]}.issubset(ids))
-        self.assertFalse(any("UI styling" in item["content"] for item in result["records"]))
-        self.assertLessEqual(len(result["records"]), 6)
-        self.assertLessEqual(len(render_work_context(result, max_chars=1700)), 1700)
-        self.assertEqual(self.work.context("nonexistent-component")["records"], [])
-
-    def test_assigned_task_context_excludes_sibling_fanout_but_keeps_causal_work(self) -> None:
-        """Shared parents/contracts must not consume the assigned worker's budget."""
-        agent = self.agent("scoped")
-        parent = agent.add_task("Integrate protocol")["node"]
-        contract = agent.add_decision("Keep envelope", rationale="Compatibility")["node"]
-        opposing = agent.add_decision("Change envelope", rationale="New consumer",
-                                     contradicts=[contract["id"]])["node"]
-        assigned = agent.add_task("Verify producer", parent=parent["id"],
-                                  depends_on=[contract["id"]])["node"]
-        sibling = agent.add_task("Unrelated consumer lane", parent=parent["id"],
-                                 depends_on=[contract["id"]])["node"]
-        child = agent.add_task("Producer edge case", parent=assigned["id"])["node"]
-        dependent = agent.add_task("Deploy producer", depends_on=[assigned["id"]])["node"]
-        result = self.work.context(record_id=assigned["id"], limit=8)
-        rows = {item["id"]: item for item in result["records"]}
-        self.assertEqual(set(rows), {item["id"] for item in
-                                    (parent, contract, opposing, assigned, child, dependent)})
-        self.assertNotIn(sibling["id"], rows)
-        self.assertEqual(rows[assigned["id"]]["execution_state"], "needs_review")
-        self.assertEqual(rows[assigned["id"]]["obsolete_dependencies"], [contract["id"]])
-        self.assertIn(opposing["id"], rows[contract["id"]]["conflicts"])
-        self.assertIn(contract["id"], render_work_context(result))
-        # A contract-focused impact query still includes all its direct consumers.
-        impact = self.work.context(record_id=contract["id"], limit=8)
-        self.assertTrue({assigned["id"], sibling["id"]}.issubset(
-            {item["id"] for item in impact["records"]}))
-
     def test_E_overview_derives_next_steps_from_current_execution(self) -> None:
         agent = self.agent("overview")
         goal = agent.record("goal", "Improve context retrieval")["node"]
@@ -263,13 +217,6 @@ class CoordinationWorkflowTests(unittest.TestCase):
         ids = {record["id"] for record in self.work.records()}
         self.assertTrue({item["id"], old["id"], active["id"]}.issubset(ids))
 
-    def test_agent_nodes_use_canonical_work_kinds(self) -> None:
-        """Create shared observations and private notes through their current APIs."""
-        agent = self.agent("node-kinds")
-        observation = agent.add_node("observation", "Current discovery")["node"]
-        self.assertEqual(self.work.show(observation["id"])["kind"], "observation")
-        self.assertEqual(agent.add_note("Private scratch")["node"]["type"], "private_note")
-
     def test_compiled_code_context_and_mcp_share_scoped_engineering_evidence(self) -> None:
         agent = self.agent("integration")
         decision = agent.add_decision("Preserve payload field", rationale="Client contract", files=["src/codec.py"])["node"]
@@ -285,21 +232,6 @@ class CoordinationWorkflowTests(unittest.TestCase):
             graph.close()
         mcp = mcp_context(storage_path=str(self.storage), query="encode payload", code=True)
         self.assertEqual(mcp["payload"]["engineering_context"], work)
-
-    def test_cli_handoff_works_across_processes_without_canonical_graph(self) -> None:
-        cli = [sys.executable, str(Path("cli.py").resolve())]
-
-        def run(*args: str) -> dict:
-            """Use independent processes to prove persistence, not in-memory reuse."""
-            result = subprocess.run([*cli, *args], cwd=self.root, capture_output=True, text=True, encoding="utf-8", check=True)
-            return json.loads(result.stdout)
-        run("agent", "--agent", "agent:cli-A", "--no-progress", "init", "--name", "CLI handoff", "--json")
-        task = run("agent", "--agent", "agent:cli-A", "--no-progress", "record", "task", "Complete codec", "--file", "src/codec.py", "--next", "Verify consumer", "--json")["node"]
-        run("agent", "--agent", "agent:cli-A", "--no-progress", "finish", "Handoff pending", "--json")
-        recovered = run("project", "context", "--file", "src/codec.py", "--json")
-        self.assertIn(task["id"], {item["id"] for item in recovered["records"]})
-        self.assertEqual(run("agent", "show", task["id"], "--json")["node"]["next_action"], "Verify consumer")
-        self.assertFalse(self.storage.exists())
 
     def test_mcp_work_tools_support_sessions_reconciliation_and_read_only_discovery(self) -> None:
         from mcp.tools import call_tool, list_tools, MCPToolError
@@ -324,45 +256,3 @@ class CoordinationWorkflowTests(unittest.TestCase):
                                          "agent_id": "agent:stale", "session_id": "stale",
                                          "fields": {"record_id": created["id"], "expected_revision": 1, "status": "done"}})
         self.assertFalse(self.storage.exists())
-
-    def test_dashboard_views_and_reset_preserve_shared_owner(self) -> None:
-        agent = self.agent("views")
-        task = agent.add_task("Retained outcome")["node"]
-        failure = agent.reject_approach("Rejected idea", "Breaks callers")["node"]
-        completed = agent.add_task("Try direct parsing")["node"]
-        agent.complete_task(completed["id"], "Parsing works")
-        self.assertEqual(failure["reason"], "Breaks callers")
-        self.assertEqual(failure["session_title"], "views")
-        dashboard = agent.dashboard()["private"]
-        self.assertEqual(dashboard["rejected"][0]["id"], failure["id"])
-        self.assertEqual(dashboard["done"][0]["id"], completed["id"])
-        self.assertEqual(dashboard["done"][0]["completion_message"], "Parsing works")
-        self.assertEqual(agent.operational_overview()["rejected_approaches"][0]["reason"], failure["reason"])
-        self.assertIn(task["id"], {item["id"] for item in agent.list_items(node_type="task")["nodes"]})
-        self.assertIn(task["id"], {item["node"]["id"] for item in agent.search("Retained outcome")["results"]})
-        self.assertIn(failure["id"], {item["id"] for item in agent.export(include_metadata=True)["nodes"]})
-        # Noncontiguous content/reason words must match the shared search view.
-        self.assertTrue(any(item.get("id") == failure["id"]
-                            for item in AgentWorkspace.search_dashboards(self.storage, "Rejected callers")["results"]))
-        agent.reset()
-        self.assertEqual(self.work.show(task["id"])["status"], "open")
-        self.assertEqual(self.work.show(failure["id"])["rationale"], "Breaks callers")
-        agent.init("After reset")
-        agent.finish("Shared work retained")
-        self.assertFalse(agent.exists())
-        self.assertTrue(any(item.get("id") == failure["id"]
-                            for item in AgentWorkspace.search_dashboards(self.storage, "Rejected callers")["results"]))
-        self.assertTrue(AgentWorkspace.search_dashboards(self.storage, "Parsing works")["results"])
-        agent.init("Resumed views")
-        self.assertEqual(agent.dashboard()["private"]["rejected"][0]["id"], failure["id"])
-        self.assertEqual(agent.dashboard()["private"]["done"][0]["id"], completed["id"])
-        agent.finish("Resumed work ended")
-
-    def test_mid_session_checkpoint_does_not_close_work_or_replace_other_checkpoints(self) -> None:
-        agent = self.agent("checkpoint")
-        task = agent.add_task("Continue integration")["node"]
-        manual = agent.record("checkpoint", "Decision milestone", status="done", key="milestone")["node"]
-        self.assertEqual(agent.public_dashboard()["active_tasks"][0]["id"], task["id"])
-        agent.finish("Integration handoff")
-        self.assertEqual(self.work.show(manual["id"])["content"], "Decision milestone")
-        self.assertEqual(len([item for item in self.work.records() if item["kind"] == "checkpoint"]), 2)

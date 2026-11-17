@@ -223,7 +223,34 @@ as `list[str]` are ignored, and external symbols are excluded from default hub
 rankings and top-symbol report sections so they do not drown out real project
 functions, classes, and methods.
 
+## C syntax recovery
+
+C headers often contain storage/export macros and conditional `extern "C"`
+linkage that Tree-sitter cannot fully resolve without preprocessing. A syntax
+error in those constructs no longer erases every symbol in the file. The C
+extractor traverses translation-unit, declaration-list, linkage and preprocessor
+containers and retains intact declarations. A function with header recovery is
+accepted only when its declarator and body are intact and all error nodes occur
+before the declarator. Parameter names come from their declarators rather than
+from typedef names in the parameter types.
+
+The module keeps `parser_status: partial`, `tree_sitter_has_error` and its warning.
+Recovered function metadata includes `syntax_recovered: true`; an ambiguous
+return type remains unknown (`returns: null`). Missing/error nodes, broken function declarators and
+damaged bodies do not produce functions or calls. No macro values, active
+conditional branches or hidden function scopes are guessed, and no C compiler
+or preprocessor is executed. Other language extractors keep their previous
+whole-file syntax-error policy. The compiler fingerprint invalidates older
+cached results once.
+
 ## Tree-sitter Dependencies
+
+The JavaScript syntax walker, shared by TypeScript and TSX, records functions
+assigned to static bindings such as `app.handle = function (...) { ... }` and
+`exports.settle = async (...) => ...`. The binding name (for example,
+`app.handle`) owns the function's arguments, source span and calls. Computed
+receivers such as `factory().handle` or `items[index]` do not establish a static
+binding. Compiler fingerprints invalidate older cached extraction results.
 
 The package declares Tree-sitter, direct grammar packages for the recognized
 languages that publish Python wheels, and `tree-sitter-language-pack` as a
@@ -231,12 +258,32 @@ fallback for grammars that do not have a stable standalone wheel. A source
 checkout can install them with:
 
 ```bash
-python -m pip install -e .
+uv venv
+uv pip install -e .
 ```
 
 Parser construction uses the declared Tree-sitter 0.25 API: `Parser(language)`.
 Grammar providers return a capsule or a constructed `Language` object. Invalid
 provider values and constructor errors propagate.
+
+Compilation never downloads fallback grammars. Language-pack versions can fetch
+missing parsers from GitHub on `get_language`; REQL checks their local inventory
+first. A missing local grammar yields a module with `parser_status: skipped` and
+an actionable `parser_warning`, preserving file discovery without inventing
+symbols. Direct grammar wheels work offline immediately after installation.
+
+For a language without a direct wheel, explicitly prepare its grammar while
+online, using Python from the environment containing REQL. For example:
+
+```bash
+.venv/bin/python -c "import tree_sitter_language_pack as p; p.download(['dockerfile'])"
+```
+
+On Windows use `.venv/Scripts/python.exe`. Keep the language-pack version and
+cache available when moving to an offline machine. These explicit downloads are
+setup actions; parser construction and normal compilation remain local.
+Skipped code-parser results are retried on the next compilation, so preparing a
+grammar takes effect without editing source or clearing the graph.
 
 ## Example Queries
 

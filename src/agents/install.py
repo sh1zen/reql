@@ -825,31 +825,36 @@ def _gemini_hook() -> dict[str, object]:
 
 
 def _python_hook_command(platform_name: str) -> str:
+    """Quote the installed Python command so hooks emit valid context JSON."""
     message = (
-        f"{HOOK_ID}: REQL graph context may be available. "
-        "For repository context, run `reql project status`, then build a query from the user request's own feature, "
-        "behavior, file, command, error, field, endpoint, API, or symbol terms; preserve the user's language, "
-        "identifiers, and exact errors. Use commands such as "
-        "`reql query_memories --query \"<terms from user request>\"`, "
-        "`reql query_context --query \"<terms from user request>\"`, or "
-        "`reql query_explore --query \"<terms from user request>\"` for repository context; do not duplicate that context with broad "
-        "`rg`, recursive directory listings, or custom scanners. If status reports "
-        "`Project not found`, immediately run `reql project compile` before broad raw file exploration. "
-        "For resumed or substantial work, read `reql project overview`; query_context includes relevant shared engineering work. "
-        "Record durable outcomes/decisions with `reql agent record`, reconcile by id/revision, and finish the session for a checkpoint. "
-        "Start watch mode only when continuous monitoring was requested. "
-        "If no watch process is running, run `reql project compile` once after modifying project files before finishing."
+        f"{HOOK_ID}: Use REQL for repository context and shared work. Reuse a supplied working set. "
+        "For missing context, run `reql project status`. Compile a missing graph with `reql project compile --if-stopped`. "
+        "Use `reql locate PATH` for known files or `reql query_context --query \"<literal terms>\" --code` for code context. "
+        "Check current source and tests. Refine once or search exact names when context is insufficient. "
+        "Read shared work before edits in a new or resumed session. Use complete supplied engineering context "
+        "or `reql project context --file PATH`. Check recorded decisions and failures against current evidence. "
+        "Use `reql project overview` for unknown project direction. "
+        "Record failures before changing direction or ending the session. Use "
+        "`reql agent record failure \"<approach>\" --why \"<evidence>\" --file PATH`. "
+        "Repeat --file for affected source and tests. Start a session before writing if needed. "
+        "Save other outcomes with `reql agent record`. Update by id and revision. Finish owned sessions for a checkpoint. "
+        "After checks, refresh changed source once with `reql project compile --if-stopped`. Skip refresh for read-only work. "
+        "Start watch mode only on request. Use `reql --help` for other features."
     )
     if platform_name == "gemini":
         payload = {"decision": "allow", "additionalContext": message}
     else:
         payload = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": message}}
     encoded = json.dumps(payload, separators=(",", ":"))
-    return (
-        "python -c \"import json,pathlib,sys;"
+    script = (
+        "import pathlib,sys;"
         "e=pathlib.Path('.reql/memory.reql').exists() or pathlib.Path('reql.conf').exists();"
-        f"sys.stdout.write({encoded!r} if e else '')\""
+        f"sys.stdout.write({encoded!r} if e else '')"
     )
+    args = [sys.executable or "python", "-c", script]
+    if host_platform.system() == "Windows":
+        return subprocess.list2cmdline(args)
+    return " ".join(shlex.quote(arg) for arg in args)
 
 
 def _read_json_object(path: Path) -> dict[str, object]:

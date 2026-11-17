@@ -28,58 +28,44 @@ useful without mandatory LLM calls.
 
 ## Development Setup
 
-From a checkout:
+From a checkout, with [uv](https://docs.astral.sh/uv/getting-started/installation/):
 
 ```bash
-python -m pip install --upgrade pip
-python -m pip install -e .
+uv venv
+uv pip install -e ".[dev]"
 ```
 
 Run the test suite before opening a PR:
 
 ```bash
-PYTHONPATH=src python -m unittest discover -s tests -v
+uv run --no-sync python -m unittest discover -s tests -v
 ```
+
+Alternatively, create a venv with `python3 -m venv .venv` (`py -m venv .venv`
+on Windows), then use `.venv/bin/python -m pip install -e ".[dev]"` and
+`.venv/bin/python -m unittest discover -s tests -v`. On Windows use
+`.venv/Scripts/python.exe` in place of `.venv/bin/python`. An editable install
+provides the imports; no shell-specific `PYTHONPATH` assignment is required.
 
 On Windows, if tests cannot create temporary lock files under the default temp
 directory, point `TEMP` and `TMP` at a writable local directory before running
 the suite.
 
-## Benchmarks
+Collect statement and branch coverage, including Python CLI subprocesses:
 
-`tests/benchmark_performance.py` measures production graph, coordination, MCP,
-and CLI workloads locally. Timing stays separate from semantic regression tests;
-the suite has no wall-clock assertions or live provider dependencies.
-
-Before changing the implementation, snapshot `src/` and root `cli.py`, including
-working-tree changes, under `.tmp/benchmark-baseline/`. Use the same Python
-installation and run versions sequentially against one prepared fixture. For
-example, in PowerShell:
-
-```powershell
-$env:PYTHONPATH = 'src'
-$env:PYTHONHASHSEED = '0'
-New-Item -ItemType Directory -Force .tmp | Out-Null
-$env:TEMP = (Resolve-Path .tmp).Path
-$env:TMP = $env:TEMP
-python tests/benchmark_performance.py --root .tmp/benchmark --prepare --modules 96 --history 320
-$env:PYTHONPATH = '.tmp/benchmark-baseline/src'
-python tests/benchmark_performance.py --root .tmp/benchmark --repeats 7 --profile --cli .tmp/benchmark-baseline/cli.py --output .tmp/before.json
-$env:PYTHONPATH = 'src'
-python tests/benchmark_performance.py --root .tmp/benchmark --repeats 7 --profile --output .tmp/after.json --compare .tmp/before.json
+```bash
+uv run --no-sync coverage erase
+uv run --no-sync coverage run -m unittest discover -s tests -v
+uv run --no-sync coverage combine
+uv run --no-sync coverage report
+uv run --no-sync coverage html
+uv run --no-sync coverage json
 ```
 
-Preparation preserves source timestamps, artifact cache, and checkpointed stores.
-Each run restores those inputs; cold compilation disables the cache. Use
-`--modules 24 --history 80` for a smaller fixture. `--compare` checks meaningful
-outputs, including scores, ordering, ids, statuses, relations, revisions,
-confidence, and scopes, while excluding timestamps and trace ids. The fixed hash
-seed controls existing set-order ties. Profiles are separate from timed samples.
-
-To measure a real repository, copy its store and sidecars to an ignored directory
-and use `--root DIR --existing-project PROJECT --repeats 5 --profile`. This reads
-the copied graph without recompilation. Keep fixtures, profiles, and results out
-of source control.
+Reports stay in `.tmp/coverage/`. CI uploads them for each supported test
+environment; a passing suite is not a claim of complete coverage.
+The `dev` dependencies include coverage's `toml` extra so Python 3.10 can read
+the coverage configuration in `pyproject.toml`.
 
 ## Pull Requests
 

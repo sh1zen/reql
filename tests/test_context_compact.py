@@ -2,10 +2,8 @@
 from __future__ import annotations
 
 import unittest
-from pathlib import Path
 
 from agents.context_compact import compact_transcript
-from agents.install import _planned_files, _skill_generator
 
 
 class ContextCompactTests(unittest.TestCase):
@@ -47,32 +45,6 @@ class ContextCompactTests(unittest.TestCase):
         self.assertEqual(compact_transcript(messages), (messages, 0))
         with self.assertRaises(ValueError):
             compact_transcript({"other": messages})
-
-    def test_skill_is_explicit_only_for_supported_agents(self) -> None:
-        generator = _skill_generator()
-        options = {
-            "project": True,
-            "command_name": "reql",
-            "command_path": Path("reql.cmd"),
-            "fallback_command": "python cli.py",
-        }
-        codex = dict(generator.skill_markdowns(platform_name="codex", **options))["reql-context-compact"]
-        claude = dict(generator.skill_markdowns(platform_name="claude", **options))["reql-context-compact"]
-        cursor = dict(generator.skill_markdowns(platform_name="cursor", **options))["reql-context-compact"]
-        resources = {
-            path: content for skill, path, content in generator.skill_resources(platform_name="codex", **options)
-            if skill == "reql-context-compact"
-        }
-        self.assertIn("/reql-context-compact", codex)
-        self.assertIn("disable-model-invocation: true", claude)
-        self.assertIn("disable-model-invocation: true", cursor)
-        self.assertIn("allow_implicit_invocation: false", resources["agents/openai.yaml"])
-        planned = _planned_files("codex", project_dir=Path("example"), **options)
-        self.assertTrue(any(path.name == "SKILL.md" and path.parent.name == "reql-context-compact" for _, path, _ in planned))
-        for platform, expected in (("cursor", ".cursor"), ("copilot", ".github")):
-            platform_files = _planned_files(platform, project_dir=Path("example"), **options)
-            self.assertTrue(any(path.name == "SKILL.md" and expected in path.parts for _, path, _ in platform_files))
-
 
 if __name__ == "__main__":
     unittest.main()

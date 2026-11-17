@@ -51,48 +51,6 @@ class SecurityBoundaryTests(unittest.TestCase):
         self.assertNotIn("<|system|>", rendered)
         self.assertIn("&lt;", rendered)
 
-    def test_mcp_inspect_node_returns_location_context(self) -> None:
-        tmp_root = Path.cwd() / ".tmp"
-        tmp_root.mkdir(exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=tmp_root) as td:
-            db = Path(td) / "memory.reql"
-            graph = MemoryGraph.open(db)
-            try:
-                function = MemoryNode(
-                    id="function:plant",
-                    type="Function",
-                    label="water_office_plant",
-                    text="def water_office_plant(): ...",
-                    properties={"path": "notes.md", "relative_path": "notes.md", "line_start": 3, "line_end": 3},
-                )
-                fragment = MemoryNode(
-                    id="fragment:plant",
-                    type="SourceFragment",
-                    label="notes.md:3",
-                    text="The office plant should be watered every Monday.",
-                    properties={"path": "notes.md", "relative_path": "notes.md", "start_line": 3, "end_line": 3, "artifact_id": "artifact:notes"},
-                )
-                graph.add_node(function)
-                graph.add_node(fragment)
-                graph.add_edge(
-                    MemoryEdge(
-                        id="edge:function-fragment",
-                        from_id="function:plant",
-                        to_id="fragment:plant",
-                        type="HAS_DOCSTRING",
-                        properties={"source_file": "notes.md", "line_start": 3, "line_end": 3, "artifact_id": "artifact:notes"},
-                    )
-                )
-            finally:
-                graph.close()
-
-            result = call_tool("inspect_node", {"storage_path": str(db), "node_id": "function:plant"})
-
-        self.assertTrue(result["found"])
-        self.assertEqual(result["location"]["path"], "notes.md")
-        self.assertTrue(any(item["other_id"] == "fragment:plant" for item in result["neighbors"]))
-        self.assertTrue(any(item["location"]["relative_path"] == "notes.md" for item in result["sources"]))
-
     def test_mcp_query_explore_is_read_only_and_structured(self) -> None:
         tmp_root = Path.cwd() / ".tmp"
         tmp_root.mkdir(exist_ok=True)

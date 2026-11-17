@@ -13,6 +13,16 @@ rewriting unchanged project/file metadata. Effective policy is one immutable
 Code and document parsing are described in [Code analysis](CODE_ANALYSIS.md)
 and [Artifact ingestion](ARTIFACT_INGESTION.md).
 
+Parser loading remains offline: missing language-pack grammars yield skipped
+module metadata and setup guidance, without implicit downloads. See
+[Tree-sitter dependencies](CODE_ANALYSIS.md#tree-sitter-dependencies).
+Skipped code-parser results cannot establish a reusable cache entry; the next
+compilation retries them, including after explicit grammar installation.
+C syntax recovery can retain intact function definitions beneath preprocessor
+errors while preserving partial-parser diagnostics. It does not treat damaged
+declarators/bodies as reliable evidence. The parser/compiler fingerprints advance
+when these extraction rules change, causing one recompilation of older snapshots.
+
 ## Flow
 
 ```text

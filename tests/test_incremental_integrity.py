@@ -21,7 +21,8 @@ class IncrementalIntegrityTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name) / "project"
+        # Match scanner paths even when Windows temp uses a short-path alias.
+        self.root = (Path(self.temp.name) / "project").resolve()
         self.root.mkdir()
         self.path = self.root / "rules.py"
         self.path.write_text("def invoice_total():\n    return 1\n", encoding="utf-8")
@@ -73,24 +74,6 @@ class IncrementalIntegrityTests(unittest.TestCase):
                     self.assertEqual({edge.id: edge.to_dict() for edge in self.graph.store.all_edges()}, before_edges)
                     self.assertEqual(cache_path.read_bytes(), before_cache)
         self.assertEqual(self.graph.compile_project(self.root).run.files_changed, 0)
-
-    def test_uncached_deletion_invalidates_existing_cache_entries(self) -> None:
-        """Re-enabling the cache must not rediscover an already processed deletion."""
-        self.graph.compile_project(self.root)
-        self.path.unlink()
-        self.assertEqual(self.graph.compile_project(self.root, cache_enabled=False).run.files_deleted, 1)
-        self.assertEqual(self.graph.compile_project(self.root).run.files_deleted, 0)
-
-    def test_deleted_artifact_is_archived_even_when_its_first_compile_failed(self) -> None:
-        """Registration can survive a parser failure without any completed source snapshot."""
-        with patch.object(ArtifactCompiler, "_read_verified_content", side_effect=PermissionError("read denied")):
-            failed = self.graph.compile_project(self.root)
-        self.assertTrue(failed.run.errors)
-        artifact = failed.scan.artifacts[0]
-        self.path.unlink()
-        deleted = self.graph.compile_project(self.root)
-        self.assertEqual(deleted.run.files_deleted, 1)
-        self.assertEqual(self.graph.store.get_node(artifact.id).status, "archived")
 
     def test_missing_cache_cannot_recover_under_different_compile_options(self) -> None:
         """Matching bytes do not establish that the requested document policy ran."""

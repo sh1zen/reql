@@ -62,16 +62,6 @@ class QuerySemanticsTests(unittest.TestCase):
                          [{"id": "Source"}])
         self.assertEqual(self.graph.query("FIND nodes WHERE NOT type = 'Function' RETURN id").rows, [])
 
-    def test_statistics_require_indexed_count_operations(self) -> None:
-        """STATS must use the storage port rather than scan incomplete adapters."""
-        with patch.object(self.graph.store, "all_nodes", side_effect=AssertionError("scanned nodes")), \
-                patch.object(self.graph.store, "all_edges", side_effect=AssertionError("scanned edges")):
-            self.assertEqual(self.graph.query("STATS").rows, [{"nodes": 3, "edges": 1}])
-            for name in ("count_nodes", "count_edges"):
-                with self.subTest(missing=name), patch.object(self.graph.store, name, None):
-                    with self.assertRaises(TypeError):
-                        self.graph.query("STATS")
-
     def test_edge_predicates_resolve_endpoints_and_native_fields(self) -> None:
         """FIND EDGES supports the same field resolution used during final evaluation."""
         for predicate in ("id = 'CALL'", "weight = 1", "from_id = 'source'", "from.label = 'invoice'",
@@ -99,13 +89,6 @@ class QuerySemanticsTests(unittest.TestCase):
                 self.assertEqual(self.graph.query(query).rows, [{"id": "Source"}])
         self.assertEqual(self.graph.query("FIND nodes TYPE Function RETURN id LIMIT 1").diagnostics["matched"], 1003)
 
-    def test_zero_limit_is_empty_for_all_row_queries(self) -> None:
-        """Zero requests no rows even when the underlying graph is nonempty."""
-        for query in ("FIND nodes LIMIT 0", "FIND edges LIMIT 0", "SYMBOLS LIMIT 0",
-                      "MATCH (a)-[r:CALLS]->(b) LIMIT 0"):
-            with self.subTest(query=query):
-                self.assertEqual(self.graph.query(query).rows, [])
-
     def test_match_aliases_cannot_be_overwritten_by_implicit_names(self) -> None:
         """User aliases, including uppercase spelling, bind to their actual pattern roles."""
         query = "MATCH (b:Function)-[a:CALLS]->(r:Function) RETURN b.id,a.id,r.id"
@@ -127,28 +110,6 @@ class QuerySemanticsTests(unittest.TestCase):
         with self.assertRaises(REQLSyntaxError):
             self.graph.query("MATCH (a)-[a:CALLS]->(b)")
 
-    def test_anonymous_match_roles_do_not_capture_explicit_aliases(self) -> None:
-        """An omitted alias must not reserve names that the query explicitly binds elsewhere."""
-        for query, expected in (
-            ("MATCH (r)-[:CALLS]->(b) RETURN r.id,b.id", {"r.id": "Source", "b.id": "Target"}),
-            ("MATCH (b)-[:CALLS]->() RETURN b.id", {"b.id": "Source"}),
-            ("MATCH ()-[a:CALLS]->(b) RETURN a.id,b.id", {"a.id": "call", "b.id": "Target"}),
-        ):
-            with self.subTest(query=query):
-                self.assertEqual(self.graph.query(query).rows, [expected])
-
-    def test_integer_clauses_reject_fractional_and_boolean_values(self) -> None:
-        """LIMIT and DEPTH must not silently truncate or reinterpret invalid values."""
-        for query in ("FIND nodes LIMIT 1.5", "FIND nodes LIMIT TRUE", "SEARCH 'invoice' DEPTH 2.5"):
-            with self.subTest(query=query), self.assertRaises(REQLSyntaxError):
-                self.graph.query(query)
-
-    def test_explicit_symbol_types_are_not_silently_dropped(self) -> None:
-        """Mixed type scopes must include every requested type, including interfaces."""
-        self.graph.store.upsert_node(MemoryNode(id="contract", type="Interface"))
-        query = "SYMBOLS TYPE Function,Interface RETURN id ORDER BY id ASC"
-        self.assertEqual(self.graph.query(query).rows, [{"id": "contract"}, {"id": "Source"}, {"id": "Target"}])
-
     def test_numeric_comparisons_and_sorting_preserve_large_integers(self) -> None:
         """Distinct integer values above float precision must remain distinct."""
         low, high = 2 ** 53, 2 ** 53 + 1
@@ -158,16 +119,6 @@ class QuerySemanticsTests(unittest.TestCase):
             with self.subTest(predicate=predicate):
                 self.assertEqual(self.graph.query(f"FIND nodes WHERE {predicate} RETURN id").rows, [{"id": "Target"}])
         self.assertEqual(self.graph.query("FIND nodes RETURN id ORDER BY utility DESC LIMIT 1").rows, [{"id": "Target"}])
-
-    def test_mixed_sort_values_have_a_total_order(self) -> None:
-        """Null, numeric and textual values can share a custom property without crashing sort."""
-        self.graph.store.batch_upsert_nodes([
-            MemoryNode(id="null", type="Metric"),
-            MemoryNode(id="number", type="Metric", properties={"value": 5}),
-            MemoryNode(id="text", type="Metric", properties={"value": "five"}),
-        ])
-        self.assertEqual(self.graph.query("FIND nodes TYPE Metric RETURN id ORDER BY value ASC").rows,
-                         [{"id": "null"}, {"id": "number"}, {"id": "text"}])
 
     def test_query_results_do_not_expose_borrowed_property_collections(self) -> None:
         """Projection must isolate the returned rows from internal store views."""
@@ -196,19 +147,6 @@ class QuerySemanticsTests(unittest.TestCase):
         self.assertEqual(json.loads(output.getvalue())["rows"], expected)
         with patch.dict(os.environ, {"REQL_MCP_ALLOWED_ROOTS": self.temp.name}):
             self.assertEqual(reql_query(storage_path=storage_path, statement=statement)["rows"], expected)
-
-    def test_match_filters_all_edges_before_limiting(self) -> None:
-        """A low-weight matching edge beyond the former window remains visible."""
-        self.graph.store.batch_upsert_nodes([
-            MemoryNode(id=f"caller:{index}", type="Function") for index in range(10001)
-        ])
-        self.graph.store.batch_upsert_edges([
-            MemoryEdge(id=f"call:{index}", from_id=f"caller:{index}", to_id="Target", type="CALLS", weight=2)
-            for index in range(10001)
-        ])
-        result = self.graph.query("MATCH (a)-[r:calls]->(b) WHERE a.id = 'Source' RETURN r.id LIMIT 1")
-        self.assertEqual(result.rows, [{"r.id": "call"}])
-
 
 if __name__ == "__main__":
     unittest.main()

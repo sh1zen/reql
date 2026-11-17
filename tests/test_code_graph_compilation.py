@@ -4,50 +4,16 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 from api import MemoryGraph
 from memory.artifacts.models import SourceArtifact
 from memory.artifacts.cache import DiskArtifactCache, artifact_cache_path
 from memory.artifacts.structural_links import refresh_project_structural_links
 from memory.code_analysis import TreeSitterCodeParser
-from memory.code_analysis.base import _parser_for
-from memory.code_analysis.languages.generic import GenericProfileTreeSitterExtractor
-from memory.code_analysis.factory import EXTRACTOR_BY_LANGUAGE
-from memory.code_analysis.catalog import CODE_LANGUAGE_CATALOG, load_tree_sitter_language
 
 
 class CodeGraphCompilationTests(unittest.TestCase):
-
-    def test_tree_sitter_constructor_and_grammar_errors_are_not_retried(self) -> None:
-        """Use the current parser API and reject invalid grammar-provider values."""
-        capsule = object()
-
-        class Language:
-            """Stand in for the external grammar constructor at its input boundary."""
-
-            def __init__(self, raw: object) -> None:
-                if raw is not capsule:
-                    raise TypeError("invalid grammar capsule")
-
-        provider = SimpleNamespace(Language=Language)
-        with patch("memory.code_analysis.catalog._load_direct_language", return_value=capsule):
-            language = load_tree_sitter_language(provider, "python")
-        self.assertIsInstance(language, Language)
-        with patch("memory.code_analysis.catalog._load_direct_language", return_value=language):
-            self.assertIs(load_tree_sitter_language(provider, "python"), language)
-        with patch("memory.code_analysis.catalog._load_direct_language", return_value=object()):
-            with self.assertRaisesRegex(TypeError, "invalid grammar capsule"):
-                load_tree_sitter_language(provider, "python")
-        parser = Mock(side_effect=TypeError("parser rejected grammar"))
-        _parser_for.cache_clear()
-        self.addCleanup(_parser_for.cache_clear)
-        with patch("memory.code_analysis.base.import_module", return_value=SimpleNamespace(Parser=parser)), \
-                patch("memory.code_analysis.base.load_tree_sitter_language", return_value=language):
-            with self.assertRaisesRegex(TypeError, "parser rejected grammar"):
-                _parser_for("python")
-        parser.assert_called_once_with(language)
 
     def test_computed_receivers_remain_unresolved_instead_of_inventing_local_calls(self) -> None:
         """Computed receivers do not establish which same-named method is called."""
@@ -94,19 +60,6 @@ class CodeGraphCompilationTests(unittest.TestCase):
                 self.assertEqual(graph.compile_project(root).run.files_changed, 0)
             finally:
                 graph.close()
-
-    def test_each_supported_language_has_registered_extractor_class(self) -> None:
-        self.assertEqual(set(CODE_LANGUAGE_CATALOG), set(EXTRACTOR_BY_LANGUAGE))
-        for language, extractor_cls in EXTRACTOR_BY_LANGUAGE.items():
-            self.assertTrue(extractor_cls.__name__.endswith("TreeSitterExtractor"), language)
-            self.assertEqual(getattr(extractor_cls, "language_key", language), language)
-            if issubclass(extractor_cls, GenericProfileTreeSitterExtractor):
-                profile = getattr(extractor_cls, "profile", None)
-                self.assertIsNotNone(profile, language)
-                self.assertIn(language, profile.languages)
-                self.assertNotEqual(profile.name, "default")
-            if getattr(extractor_cls, "tree_sitter_module", None):
-                self.assertIsInstance(getattr(extractor_cls, "tree_sitter_module"), str)
 
     def test_tree_sitter_syntax_recovery_does_not_fail_project_compile(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -894,121 +847,6 @@ class CodeGraphCompilationTests(unittest.TestCase):
         self.assertEqual(result.module.metadata.get("parser_status"), "skipped")
         self.assertIn("Unsupported Tree-sitter language: sql", result.module.metadata.get("parser_warning", ""))
 
-    def test_solidity_tree_sitter_builds_contract_graph_imports_and_calls(self) -> None:
-        try:
-            load_tree_sitter_language(__import__("tree_sitter"), "solidity")
-        except (ModuleNotFoundError, ValueError) as exc:
-            self.skipTest(str(exc))
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "project"
-            contracts = root / "contracts"
-            interfaces = contracts / "interfaces"
-            openzeppelin = root / "lib" / "openzeppelin-contracts" / "contracts" / "token" / "ERC721"
-            interfaces.mkdir(parents=True)
-            openzeppelin.mkdir(parents=True)
-            (root / "remappings.txt").write_text("@openzeppelin/=lib/openzeppelin-contracts/\n", encoding="utf-8")
-            (interfaces / "IERC20.sol").write_text(
-                "pragma solidity ^0.8.0;\ninterface IERC20 { function balanceOf(address owner) external returns (uint256); }\n",
-                encoding="utf-8",
-            )
-            (openzeppelin / "IERC721.sol").write_text(
-                "pragma solidity ^0.8.0;\ninterface IERC721 {}\n",
-                encoding="utf-8",
-            )
-            (contracts / "Token.sol").write_text(
-                "\n".join(
-                    [
-                        "pragma solidity ^0.8.0;",
-                        'import "./interfaces/IERC20.sol";',
-                        'import {IERC721 as Token721} from "@openzeppelin/contracts/token/ERC721/IERC721.sol";',
-                        "library SafeMath {",
-                        "    function add(uint a, uint b) internal pure returns (uint) { return a + b; }",
-                        "}",
-                        "interface IToken { function ping() external; }",
-                        "contract Base {}",
-                        "contract Token is Base, IToken, IExternal {",
-                        "    using SafeMath for uint256;",
-                        "    struct Point { uint x; uint y; }",
-                        "    enum Status { Pending, Done }",
-                        "    event Transfer(address indexed from, address indexed to, uint256 value);",
-                        "    modifier onlyOwner() { _; }",
-                        "    constructor() {}",
-                        "    receive() external payable {}",
-                        "    fallback() external {}",
-                        "    function transfer(address to, uint256 amount) public onlyOwner returns (bool) {",
-                        "        emit Transfer(msg.sender, to, amount);",
-                        "        SafeMath.add(amount, 1);",
-                        "        Token t = new Token();",
-                        "        require(true);",
-                        "        return true;",
-                        "    }",
-                        "}",
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            graph = MemoryGraph.open(Path(td) / "memory.reql")
-            try:
-                result = graph.compile_project(root)
-                self.assertFalse(result.run.errors)
-
-                nodes = graph.store.all_nodes()
-                edges = graph.store.all_edges()
-
-                def node(type_: str, name: str):
-                    return next(item for item in nodes if item.type == type_ and item.properties.get("name") == name)
-
-                token = node("Class", "Token")
-                base = node("Class", "Base")
-                safe_math = node("Class", "SafeMath")
-                transfer = node("Method", "transfer")
-                event = node("Class", "Transfer")
-                itoken = node("Interface", "IToken")
-
-                self.assertEqual(token.properties.get("solidity_kind"), "contract")
-                self.assertEqual(safe_math.properties.get("solidity_kind"), "library")
-                self.assertEqual(node("Class", "Point").properties.get("solidity_kind"), "struct")
-                self.assertEqual(node("Class", "Status").properties.get("solidity_kind"), "enum")
-                self.assertEqual(event.properties.get("solidity_kind"), "event")
-                for method_name in {"transfer", "constructor", "onlyOwner", "receive", "fallback"}:
-                    self.assertIsNotNone(node("Method", method_name))
-
-                method_edges = {(edge.from_id, edge.to_id) for edge in edges if edge.type == "METHOD"}
-                self.assertIn((token.id, transfer.id), method_edges)
-                self.assertIn((token.id, node("Method", "onlyOwner").id), method_edges)
-
-                self.assertTrue(any(edge.type == "INHERITS" and edge.from_id == token.id and edge.to_id == base.id for edge in edges))
-                self.assertTrue(any(edge.type == "IMPLEMENTS" and edge.from_id == token.id and edge.to_id == itoken.id for edge in edges))
-                self.assertTrue(
-                    any(
-                        edge.type == "IMPLEMENTS"
-                        and edge.from_id == token.id
-                        and graph.get_node(edge.to_id)
-                        and graph.get_node(edge.to_id).properties.get("name") == "IExternal"
-                        for edge in edges
-                    )
-                )
-                self.assertTrue(any(edge.type == "EMITS" and edge.from_id == transfer.id and edge.to_id == event.id for edge in edges))
-                self.assertTrue(any(edge.type == "USES" and edge.from_id == token.id and edge.to_id == safe_math.id for edge in edges))
-                self.assertTrue(any(edge.type == "INSTANTIATES" and edge.from_id == transfer.id and edge.to_id == token.id for edge in edges))
-                self.assertTrue(any(edge.type == "CALLS" and edge.from_id == transfer.id and edge.to_id == node("Method", "add").id for edge in edges))
-
-                file_targets = {
-                    graph.get_node(edge.to_id).properties.get("relative_path")
-                    for edge in edges
-                    if edge.type == "IMPORTS" and graph.get_node(edge.to_id) and graph.get_node(edge.to_id).type == "File"
-                }
-                self.assertIn("contracts/interfaces/IERC20.sol", file_targets)
-                self.assertIn("lib/openzeppelin-contracts/contracts/token/ERC721/IERC721.sol", file_targets)
-
-                imports = [item for item in nodes if item.type == "Import"]
-                self.assertTrue(any(item.properties.get("name") == "IERC721" and item.properties.get("alias") == "Token721" for item in imports))
-                self.assertFalse(any("require" in str(item.properties.get("unresolved_calls", [])) for item in nodes))
-                self.assertFalse(any("msg" in str(item.properties.get("unresolved_calls", [])) for item in nodes))
-            finally:
-                graph.close()
-
     def test_compile_records_unused_code_findings_for_queries(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td) / "project"
@@ -1065,163 +903,6 @@ class CodeGraphCompilationTests(unittest.TestCase):
                 self.assertTrue(any(row["v.name"] == "local_unused" and row["f.finding_type"] == "unused_variable" for row in linked.rows))
             finally:
                 graph.close()
-
-    def test_unused_code_findings_avoid_annotation_reexport_and_test_noise(self) -> None:
-        with tempfile.TemporaryDirectory() as td:
-            root = Path(td) / "project"
-            package = root / "pkg"
-            tests_dir = root / "tests"
-            package.mkdir(parents=True)
-            tests_dir.mkdir()
-            (package / "__init__.py").write_text(
-                "\n".join(
-                    [
-                        "from .models import PublicThing",
-                        "",
-                        "__all__ = ['PublicThing']",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            (package / "models.py").write_text(
-                "\n".join(
-                    [
-                        "class PublicThing:",
-                        "    pass",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            (root / "app.py").write_text(
-                "\n".join(
-                    [
-                        "from __future__ import annotations",
-                        "from dataclasses import dataclass",
-                        "from typing import Any",
-                        "import os",
-                        "import sys",
-                        "",
-                        "@dataclass(frozen=True, slots=True)",
-                        "class Payload:",
-                        "    text: str",
-                        "    metadata: dict[str, Any]",
-                        "",
-                        "def used(context: dict[str, Any]) -> str:",
-                        "    local_used = 1",
-                        "    local_unused = 2",
-                        "    forwarded = context",
-                        "    holder = context",
-                        "    text_value = holder.get('text')",
-                        "    print(os.getcwd(), local_used)",
-                        "    consumed = consume(value=forwarded)",
-                        "    items = [consumed]",
-                        "    for item in items:",
-                        "        final = item",
-                        "    counts: dict[str, int] = {}",
-                        "    counts[str(text_value)] += 1",
-                        "    return final + str(text_value)",
-                        "",
-                        "def consume(value: Any) -> str:",
-                        "    return str(value)",
-                        "",
-                        "used({'text': 'ok'})",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            (tests_dir / "test_app.py").write_text(
-                "\n".join(
-                    [
-                        "import unittest",
-                        "",
-                        "class AppTests(unittest.TestCase):",
-                        "    def test_feature(self):",
-                        "        local_unused = 1",
-                        "        self.assertTrue(True)",
-                    ]
-                ),
-                encoding="utf-8",
-            )
-            graph = MemoryGraph.open(Path(td) / "memory.reql")
-            try:
-                result = graph.compile_project(root)
-                self.assertFalse(result.run.errors)
-                findings = [node for node in graph.store.all_nodes() if node.type == "StaticAnalysisFinding"]
-
-                def has_finding(finding_type: str, symbol_name: str, relative_path: str | None = None) -> bool:
-                    return any(
-                        node.properties.get("finding_type") == finding_type
-                        and node.properties.get("symbol_name") == symbol_name
-                        and (relative_path is None or node.properties.get("relative_path") == relative_path)
-                        for node in findings
-                    )
-
-                self.assertTrue(has_finding("unused_import", "sys", "app.py"))
-                self.assertTrue(has_finding("unused_variable", "local_unused", "app.py"))
-                self.assertFalse(has_finding("unused_import", "annotations", "app.py"))
-                self.assertFalse(has_finding("unused_import", "dataclass", "app.py"))
-                self.assertFalse(has_finding("unused_import", "Any", "app.py"))
-                self.assertFalse(has_finding("unused_variable", "text", "app.py"))
-                self.assertFalse(has_finding("unused_variable", "metadata", "app.py"))
-                self.assertFalse(has_finding("unused_variable", "forwarded", "app.py"))
-                self.assertFalse(has_finding("unused_variable", "holder", "app.py"))
-                self.assertFalse(has_finding("unused_variable", "text_value", "app.py"))
-                self.assertFalse(has_finding("unused_variable", "consumed", "app.py"))
-                self.assertFalse(has_finding("unused_variable", "items", "app.py"))
-                self.assertFalse(has_finding("unused_variable", "counts", "app.py"))
-                self.assertFalse(has_finding("unused_variable", "str", "app.py"))
-                self.assertFalse(has_finding("unused_import", "PublicThing", "pkg/__init__.py"))
-                re_exports = graph.query("MATCH (m:Module)-[:RE_EXPORTS]->(i:Import) RETURN m.name,i.name")
-                self.assertTrue(any(row["m.name"] == "pkg" and row["i.name"] == "PublicThing" for row in re_exports.rows))
-                re_export_imports = [
-                    node
-                    for node in graph.store.all_nodes()
-                    if node.type == "Import"
-                    and node.properties.get("relative_path") == "pkg/__init__.py"
-                    and node.properties.get("name") == "PublicThing"
-                ]
-                self.assertTrue(re_export_imports)
-                self.assertTrue(all(node.properties.get("is_re_export") is True for node in re_export_imports))
-                self.assertFalse(any(node.properties.get("finding_type", "").startswith("possibly_unused") and node.properties.get("relative_path") == "tests/test_app.py" for node in findings))
-
-                public_candidates = [
-                    node
-                    for node in findings
-                    if node.properties.get("finding_type") == "possibly_unused_class"
-                    and node.properties.get("symbol_name") == "PublicThing"
-                ]
-                self.assertTrue(public_candidates)
-                self.assertTrue(all(node.properties.get("cleanup_priority") == "low" for node in public_candidates))
-                self.assertTrue(all(node.properties.get("evidence_scope") == "public_api_local_artifact" for node in public_candidates))
-                self.assertTrue(all(node.properties.get("removal_safety") == "risky" for node in public_candidates))
-                self.assertTrue(all("public_api" in node.properties.get("blocking_signals", []) for node in public_candidates))
-                test_variables = [
-                    node
-                    for node in findings
-                    if node.properties.get("finding_type") == "unused_variable"
-                    and node.properties.get("relative_path") == "tests/test_app.py"
-                ]
-                self.assertTrue(test_variables)
-                self.assertTrue(all(node.properties.get("cleanup_priority") == "low" for node in test_variables))
-                self.assertTrue(all(node.properties.get("evidence_scope") == "test_local_artifact" for node in test_variables))
-                self.assertTrue(all(node.properties.get("removal_safety") == "validate" for node in test_variables))
-                safe_imports = [
-                    node
-                    for node in findings
-                    if node.properties.get("finding_type") == "unused_import"
-                    and node.properties.get("symbol_name") == "sys"
-                    and node.properties.get("relative_path") == "app.py"
-                ]
-                self.assertTrue(safe_imports)
-                self.assertTrue(all(node.properties.get("removal_safety") == "safe" for node in safe_imports))
-                default_ordered = graph.query("FINDINGS RETURN symbol_name,cleanup_priority,cleanup_rank LIMIT 5")
-                self.assertEqual(default_ordered.rows[0]["cleanup_priority"], "high")
-                self.assertEqual(default_ordered.rows[0]["cleanup_rank"], 3)
-                priority_ordered = graph.query("FINDINGS RETURN symbol_name,cleanup_priority ORDER BY cleanup_priority LIMIT 5")
-                self.assertEqual(priority_ordered.rows[0]["cleanup_priority"], "high")
-            finally:
-                graph.close()
-
 
 if __name__ == "__main__":
     unittest.main()

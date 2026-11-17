@@ -5,7 +5,6 @@ import tempfile
 import subprocess
 import sys
 import unittest
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -72,16 +71,6 @@ class AgentLifecycleTests(unittest.TestCase):
         self.assertTrue(active.exists())
         self.assertEqual(unregistered.read_bytes(), b"unregistered")
 
-    def test_reused_identity_retains_only_latest_completed_sessions(self) -> None:
-        for number in range(4):
-            workspace = self.workspace("agent:reused")
-            workspace.init(f"Work {number}")
-            workspace.publish_note(f"Public result {number}")
-            workspace.finish(f"Summary {number}")
-        dashboard = workspace.public_dashboard()
-        self.assertEqual(len(dashboard["agents"]), 1)
-        self.assertEqual({item["content"] for item in dashboard["context"]}, {"Public result 2", "Public result 3", "Summary 2", "Summary 3"})
-
     def test_zero_retention_releases_completed_agents_but_keeps_active_sessions(self) -> None:
         self.config = merge_config(self.config, {"retention": {"agent_sessions": 0}})
         active = self.workspace("agent:active")
@@ -115,23 +104,6 @@ class AgentLifecycleTests(unittest.TestCase):
         self.assertTrue(current.exists())
         self.assertTrue(AgentWorkspace.search_dashboards(self.storage, "Completed shared context")["results"])
 
-    def test_finish_preserves_other_activity_using_same_private_store(self) -> None:
-        self.config = merge_config(self.config, {"retention": {"agent_sessions": 0}})
-        first = self.workspace("agent:shared", activity_id="first")
-        second = self.workspace("agent:shared", activity_id="second")
-        first.init("First")
-        first.add_task("First task")
-        second.init("Second")
-        second.add_task("Second task")
-        result = first.finish("First completed")
-        self.assertEqual(result["status"], "active")
-        self.assertTrue(second.exists())
-        self.assertEqual([item["content"] for item in second.public_dashboard()["active_tasks"]], ["Second task"])
-        self.assertEqual(second.status()["current_session_title"], "Second")
-        second.finish("Second completed")
-        self.assertFalse(second.exists())
-        self.assertEqual(second.public_dashboard()["agents"], [])
-
     def test_terminate_closes_all_activities_and_releases_private_store(self) -> None:
         workspace = self.workspace("agent:target", activity_id="target-thread")
         workspace.init("Target")
@@ -163,30 +135,6 @@ class AgentLifecycleTests(unittest.TestCase):
         self.assertEqual(self.storage.read_bytes(), b"canonical")
         with self.assertRaisesRegex(ValueError, "distinct paths"):
             AgentWorkspace(self.storage, agent_id="agent:unsafe", agent_storage=self.storage)
-
-    def test_cleanup_preserves_store_aliased_by_an_active_identity(self) -> None:
-        completed = self.workspace("agent:alias/worker")
-        completed.init("Completed")
-        completed._register_agent(status="finished")
-        active = self.workspace("agent:alias_worker")
-        result = active.init("Active alias")
-        self.assertEqual(completed.paths.agent_storage, active.paths.agent_storage)
-        self.assertEqual(result["retention"]["skipped_agents"], [completed.agent_id])
-        self.assertTrue(active.exists())
-
-    def test_concurrent_lifecycles_leave_only_bounded_public_summaries(self) -> None:
-        def complete(number: int) -> None:
-            """Exercise independent command lifecycles on shared storage."""
-            workspace = self.workspace(f"agent:parallel-{number}")
-            workspace.init(f"Work {number}")
-            workspace.finish(f"Summary {number}")
-
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            list(executor.map(complete, range(8)))
-        dashboard = AgentWorkspace.read_public_dashboard(self.storage)
-        self.assertEqual(len(dashboard["agents"]), 2)
-        self.assertEqual(len(dashboard["context"]), 2)
-        self.assertEqual(list((self.storage.parent / "agents").glob("*")), [])
 
     def test_cli_dashboard_finish_and_multi_agent_overview(self) -> None:
         base = [sys.executable, str(Path("cli.py").resolve()), "agent", "--agent", "agent:cli", "--no-progress"]

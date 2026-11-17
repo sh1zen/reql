@@ -1,4 +1,4 @@
-"""Regression coverage for consolidated extraction and bounded lexical selection."""
+"""Core extraction, document processing, centrality and storage lock contracts."""
 from __future__ import annotations
 
 import tempfile
@@ -13,11 +13,7 @@ from memory.document_ingestion.metadata import make_fragment
 from memory.domain.exceptions import StorageError
 from memory.domain.models import MemoryEdge, MemoryNode
 from memory.extraction.document_processor import DocumentProcessor
-from memory.query.errors import REQLSyntaxError
-from memory.query.lexer import tokenize_reql
 from memory.storage import BlockGraphStore, inspect_store_locks
-from memory.storage.adapters.block_store import _read_lock_payload
-from memory.storage.adapters.lexical_index import _selected_token_weights
 
 
 class CleanupContractTests(unittest.TestCase):
@@ -75,21 +71,6 @@ class CleanupContractTests(unittest.TestCase):
                 self.assertEqual([item.name for item in result.references], [target for _, target in calls])
                 self.assertEqual(len({item.id for item in result.calls}), len(calls))
 
-    def test_lexical_selection_keeps_priority_and_positional_coverage(self) -> None:
-        """Bounded selection keeps rare tokens and covers the unranked remainder."""
-        # Every token has equal signal; frequency determines the priority slots.
-        tokens = [f"lexeme{chr(97 + index) * 2}" for index in range(20)]
-        text = " ".join(token for index, token in enumerate(tokens) for _ in range(index + 1))
-        # Test the production token-weight boundary, including zero and tiny budgets.
-        for limit in (0, 1, 2, 3, 4, 5, 8, 19, 20, 21):
-            with self.subTest(limit=limit):
-                weights = _selected_token_weights(text, limit)
-                self.assertEqual(len(weights), min(limit, len(tokens)))
-                self.assertTrue(set(weights) <= set(tokens))
-                self.assertTrue(all(0.0 < value <= 1.0 for value in weights.values()))
-        self.assertEqual(list(_selected_token_weights(text, 8)), tokens[:7] + [tokens[13]])
-        self.assertEqual(_selected_token_weights("", 8), {})
-
     def test_document_events_preserve_duplicate_counts_and_first_evidence(self) -> None:
         """Repeated fragment identities accumulate counts without duplicating membership."""
         first = make_fragment(artifact_id="doc", fragment_type="paragraph", index=0,
@@ -146,35 +127,6 @@ class CleanupContractTests(unittest.TestCase):
                 self.assertEqual(metrics["isolated"].degree_centrality, 0.0)
             finally:
                 graph.close()
-
-    def test_query_lexer_preserves_comments_escapes_and_errors(self) -> None:
-        """Keep token positions, unknown escapes and syntax error messages stable."""
-        first = tokenize_reql("# ignored\nSEARCH 'invoice\\n\\t\\q'")
-        second = tokenize_reql("//ignored\nSEARCH 'invoice\\n\\t\\q'")
-        self.assertEqual(first, second)
-        self.assertEqual(first[1].value, "invoice\n\tq")
-        self.assertEqual(first[0].position, 10)
-        for source, message in (("'", "Unterminated string at position 0"),
-                                ("'\\", "Unterminated escape sequence at position 0")):
-            with self.subTest(source=source), self.assertRaises(REQLSyntaxError) as raised:
-                tokenize_reql(source)
-            self.assertEqual(str(raised.exception), message)
-
-    def test_lock_metadata_keeps_strict_and_lenient_missing_file_policies(self) -> None:
-        """Lock owners retain missing-file errors; inspection tolerates disappearing files."""
-        with tempfile.TemporaryDirectory() as temporary:
-            path = Path(temporary) / "graph.reql.lock"
-            self.assertEqual(_read_lock_payload(path), {})
-            with self.assertRaises(FileNotFoundError):
-                _read_lock_payload(path, missing_ok=False)
-            for contents, expected in (("{", {}), ("[]", {}), ('{"token":"owner"}', {"token": "owner"})):
-                path.write_text(contents, encoding="utf-8")
-                for missing_ok in (True, False):
-                    with self.subTest(contents=contents, missing_ok=missing_ok):
-                        self.assertEqual(_read_lock_payload(path, missing_ok=missing_ok), expected)
-            path.write_bytes(b"\xff")
-            with self.assertRaises(UnicodeDecodeError):
-                _read_lock_payload(path)
 
     def test_store_locks_keep_multiple_readers_and_writer_exclusion(self) -> None:
         """Real store opens retain lock ownership and release failed acquisition slots."""

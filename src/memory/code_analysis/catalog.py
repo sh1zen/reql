@@ -134,13 +134,22 @@ def _load_direct_language(language: str) -> Any | None:
 
 
 def _load_language_pack_language(language: str) -> Any | None:
+    """Load only locally available fallback grammars; downloads require explicit setup."""
     try:
         language_pack = import_module("tree_sitter_language_pack")
     except ModuleNotFoundError:
         return None
     get_language = getattr(language_pack, "get_language")
+    available = set(language_pack.available_languages())
+    keys = tuple(key for key in _language_pack_keys(language) if key in available)
+    if not keys:
+        raise ValueError(
+            f"Tree-sitter grammar {language!r} is not available locally. "
+            "Install its direct grammar package or explicitly download it with "
+            "tree_sitter_language_pack.download before compiling."
+        )
     last_error: Exception | None = None
-    for key in _language_pack_keys(language):
+    for key in keys:
         try:
             return get_language(key)
         except Exception as exc:
